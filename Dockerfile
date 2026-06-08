@@ -2,8 +2,13 @@
 FROM golang:1.22-alpine AS builder
 
 WORKDIR /src
-COPY go.mod ./
-RUN go mod download || true
+
+# FIX 1: Copy both go.mod AND go.sum
+COPY go.mod go.sum ./
+
+# FIX 2: Remove '|| true' so failures aren't swallowed
+RUN go mod download
+
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /prestoback ./cmd/prestoback
 
