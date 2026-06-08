@@ -1,4 +1,4 @@
-# PrestoBack v1.0.1
+# PrestoBack 
 
 Self-hosted Docker config backup & restore manager for your Presto Pi stack.
 Single Go binary · embedded web UI · no external dependencies.
