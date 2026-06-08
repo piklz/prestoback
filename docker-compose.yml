@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  prestoback:
+    build: .
+    container_name: prestoback
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    volumes:
+      # READ-WRITE — restore must write files back into app config dirs
+      - ../volumes:/volumes:rw
+      # PrestoBack data: config.json + backup archives + history
+      - ../volumes/prestoback:/data
+      # Docker socket — required for container stop/start and self-update
+      - /var/run/docker.sock:/var/run/docker.sock
+      # SSH keys for remote push
+      - /home/pi/.ssh:/root/.ssh:ro
+    environment:
+      TZ: Europe/London
+      # Self-update: your DockerHub image once published
+      PRESTOBACK_IMAGE: yourdockerhubuser/prestoback:latest
+      PRESTOBACK_CONTAINER: prestoback
+    labels:
+      com.presto.app: prestoback

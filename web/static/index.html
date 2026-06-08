@@ -1,0 +1,1071 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PrestoBack</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0c0e11;--bg2:#111418;--bg3:#181c22;--bg4:#1e2330;--line:rgba(255,255,255,.07);--line2:rgba(255,255,255,.13);--txt:#e8eaf0;--txt2:#8b90a0;--txt3:#555b6e;--accent:#4f9cf9;--accent2:#3b7ad4;--green:#3dd68c;--gd:rgba(61,214,140,.12);--red:#f05f5f;--rd:rgba(240,95,95,.12);--amber:#f5a623;--ad:rgba(245,166,35,.12);--bld:rgba(79,156,249,.12);--r:10px;--rs:6px;--mono:'IBM Plex Mono',monospace;--head:'Syne',sans-serif;--body:'DM Sans',sans-serif}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--txt);font-family:var(--body);font-size:14px;line-height:1.5}
+.shell{display:flex;height:100vh;overflow:hidden}
+.sidebar{width:224px;flex-shrink:0;background:var(--bg2);border-right:1px solid var(--line);display:flex;flex-direction:column}
+.main{flex:1;overflow-y:auto}
+/* sidebar */
+.logo{padding:22px 20px 18px;border-bottom:1px solid var(--line)}
+.logo-mark{font-family:var(--head);font-size:18px;font-weight:700;letter-spacing:-.5px}
+.logo-mark span{color:var(--accent)}
+.logo-sub{font-family:var(--mono);font-size:10px;color:var(--txt3);letter-spacing:1px;text-transform:uppercase;margin-top:3px}
+nav{flex:1;padding:10px 0;overflow-y:auto}
+.nav-sec{padding:16px 20px 5px;font-family:var(--mono);font-size:10px;color:var(--txt3);letter-spacing:1.5px;text-transform:uppercase}
+.nav-item{display:flex;align-items:center;gap:10px;padding:8px 20px;cursor:pointer;color:var(--txt2);font-size:13.5px;transition:background .15s,color .15s;border-left:2px solid transparent;user-select:none}
+.nav-item svg{opacity:.7;flex-shrink:0}
+.nav-item:hover{background:var(--bg3);color:var(--txt)}
+.nav-item.active{background:var(--bld);color:var(--accent);border-left-color:var(--accent)}
+.nav-item.active svg{opacity:1}
+.sidebar-foot{padding:14px 20px;border-top:1px solid var(--line);display:flex;align-items:center;justify-content:space-between}
+.ver{font-family:var(--mono);font-size:10px;color:var(--txt3)}
+.upd-dot{width:8px;height:8px;border-radius:50%;background:var(--amber);display:none}
+.upd-dot.show{display:block;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+/* layout */
+.ph{padding:26px 36px 0;display:flex;align-items:flex-start;justify-content:space-between}
+.pt{font-family:var(--head);font-size:22px;font-weight:700;letter-spacing:-.5px}
+.ps{color:var(--txt2);font-size:13px;margin-top:3px}
+.ha{display:flex;gap:8px}
+.sec{padding:22px 36px}
+/* buttons */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:var(--rs);font-size:13px;font-weight:500;cursor:pointer;border:1px solid transparent;transition:all .15s;font-family:var(--body)}
+.btn-p{background:var(--accent);color:#fff;border-color:var(--accent)}.btn-p:hover{background:var(--accent2)}
+.btn-g{background:transparent;color:var(--txt2);border-color:var(--line2)}.btn-g:hover{background:var(--bg3);color:var(--txt)}
+.btn-d{background:transparent;color:var(--red);border-color:rgba(240,95,95,.3)}.btn-d:hover{background:var(--rd)}
+.btn-w{background:var(--ad);color:var(--amber);border-color:rgba(245,166,35,.3)}.btn-w:hover{background:rgba(245,166,35,.22)}
+.btn-sm{padding:5px 10px;font-size:12px}.btn-ic{padding:7px}
+.btn:disabled{opacity:.35;cursor:not-allowed;pointer-events:none}
+/* cards */
+.card{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;margin-bottom:18px}
+.card:last-child{margin-bottom:0}
+.ch{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px}
+.ct{font-family:var(--head);font-weight:700;font-size:14px}
+.cb{padding:20px}
+/* stats */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:22px}
+.stat{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);padding:14px 18px}
+.sl{font-family:var(--mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--txt3);margin-bottom:6px}
+.sv{font-family:var(--head);font-size:24px;font-weight:700}
+.sv.a{color:var(--accent)}.sv.g{color:var(--green)}.sv.am{color:var(--amber)}
+/* table */
+.tbl{width:100%;border-collapse:collapse}
+.tbl th{font-family:var(--mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--txt3);padding:10px 16px;text-align:left;border-bottom:1px solid var(--line)}
+.tbl td{padding:11px 16px;border-bottom:1px solid var(--line);vertical-align:middle}
+.tbl tr:last-child td{border-bottom:none}
+.tbl tr:hover td{background:var(--bg3)}
+.an{font-weight:500}.ap{font-family:var(--mono);font-size:11px;color:var(--txt3);margin-top:2px}
+.ra{display:flex;gap:6px;justify-content:flex-end}
+/* pills */
+.pill{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:99px;font-family:var(--mono);font-size:10px;font-weight:500;letter-spacing:.5px;text-transform:uppercase}
+.pg{background:var(--gd);color:var(--green)}.pr{background:var(--rd);color:var(--red)}.pa{background:var(--ad);color:var(--amber)}.pb{background:var(--bld);color:var(--accent)}
+.pd{width:5px;height:5px;border-radius:50%;background:currentColor}
+/* backup items */
+.bi{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--line)}
+.bi:last-child{border-bottom:none}
+.bic{width:34px;height:34px;border-radius:8px;background:var(--bg4);display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.bm{flex:1;min-width:0}
+.bid{font-family:var(--mono);font-size:11px;color:var(--txt)}
+.bif{font-size:12px;color:var(--txt3);margin-top:1px}
+.bsz{font-family:var(--mono);font-size:12px;color:var(--txt2);white-space:nowrap}
+/* history items */
+.hi{display:flex;align-items:flex-start;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}
+.hi:last-child{border-bottom:none}
+.hic{width:30px;height:30px;border-radius:6px;background:var(--bg4);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:14px}
+/* modal */
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(5px)}
+.overlay.hidden{display:none}
+.modal{background:var(--bg2);border:1px solid var(--line2);border-radius:14px;width:520px;max-width:95vw;max-height:90vh;overflow-y:auto}
+.mh{padding:18px 22px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between}
+.mt{font-family:var(--head);font-size:15px;font-weight:700}
+.mb{padding:22px}
+.mf{padding:14px 22px 18px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;gap:8px}
+/* banners */
+.warn-b{background:var(--ad);border:1px solid rgba(245,166,35,.25);border-radius:var(--rs);padding:12px 14px;margin-bottom:16px;display:flex;gap:10px;align-items:flex-start}
+.warn-t{font-size:13px;color:var(--amber);line-height:1.5}
+.danger-b{background:var(--rd);border:1px solid rgba(240,95,95,.25);border-radius:var(--rs);padding:12px 14px;margin-bottom:16px;display:flex;gap:10px;align-items:flex-start}
+.danger-t{font-size:13px;color:var(--red);line-height:1.5}
+.info-b{background:var(--bld);border:1px solid rgba(79,156,249,.2);border-radius:var(--rs);padding:12px 14px;margin-bottom:16px;display:flex;gap:10px;align-items:flex-start}
+.info-t{font-size:13px;color:var(--accent);line-height:1.5}
+/* steps */
+.steps{display:flex;flex-direction:column;gap:7px;margin:12px 0}
+.step{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--txt2)}
+.sn{width:22px;height:22px;border-radius:50%;background:var(--bg4);border:1px solid var(--line2);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;color:var(--txt3);flex-shrink:0}
+/* form */
+.fg{margin-bottom:16px}
+.fl{display:block;font-size:12px;font-weight:500;color:var(--txt2);margin-bottom:5px}
+.fi{width:100%;background:var(--bg3);border:1px solid var(--line2);border-radius:var(--rs);padding:8px 11px;font-size:13.5px;color:var(--txt);font-family:var(--body);outline:none;transition:border .15s}
+.fi:focus{border-color:var(--accent)}
+.fi::placeholder{color:var(--txt3)}
+select.fi{cursor:pointer}
+.fr{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+.fh{font-size:11px;color:var(--txt3);margin-top:3px}
+/* toggle */
+.ftog{display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:12px}
+.ftog-sw{width:38px;height:20px;background:var(--bg4);border-radius:10px;position:relative;transition:background .2s;border:1px solid var(--line2);flex-shrink:0}
+.ftog-sw.on{background:var(--accent);border-color:var(--accent)}
+.ftog-kn{width:14px;height:14px;background:#fff;border-radius:50%;position:absolute;top:2px;left:2px;transition:left .2s}
+.ftog-sw.on .ftog-kn{left:22px}
+.ftog-lbl{font-size:13px;color:var(--txt2)}
+/* log */
+.log{background:var(--bg);border:1px solid var(--line);border-radius:var(--rs);padding:11px 13px;font-family:var(--mono);font-size:11.5px;color:var(--txt2);height:200px;overflow-y:auto}
+.ll{line-height:1.75}
+.ll.ok{color:var(--green)}.ll.err{color:var(--red)}.ll.info{color:var(--accent)}.ll.warn{color:var(--amber)}
+/* empty */
+.empty{padding:48px 24px;text-align:center}
+.ei{width:50px;height:50px;margin:0 auto 12px;background:var(--bg3);border-radius:12px;display:flex;align-items:center;justify-content:center}
+.et{font-family:var(--head);font-size:15px;color:var(--txt);margin-bottom:5px}
+.es{color:var(--txt2);font-size:13px}
+/* remote items */
+.ri{display:flex;align-items:center;gap:12px;padding:13px 0;border-bottom:1px solid var(--line)}
+.ri:last-child{border-bottom:none}
+.ric{width:36px;height:36px;border-radius:9px;background:var(--bg4);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;flex-shrink:0}
+/* chips */
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;border-radius:99px;font-size:12.5px;font-weight:500;cursor:pointer;border:1px solid var(--line2);color:var(--txt2);background:var(--bg2);transition:all .15s}
+.chip:hover{border-color:var(--accent);color:var(--accent)}
+.chip.active{background:var(--bld);border-color:var(--accent);color:var(--accent)}
+/* code block */
+.code-b{background:var(--bg);border:1px solid var(--line);border-radius:var(--rs);padding:10px 14px;font-family:var(--mono);font-size:12px;color:var(--txt2);word-break:break-all;position:relative}
+.code-b .copy-btn{position:absolute;top:8px;right:8px}
+/* section divider label */
+.divlbl{font-family:var(--mono);font-size:10px;color:var(--txt3);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
+/* prog */
+.pw{background:var(--bg4);border-radius:4px;height:4px;overflow:hidden;margin-top:8px}
+.pb2{height:100%;background:var(--accent);border-radius:4px;animation:prog 1.5s ease-in-out infinite}
+@keyframes prog{0%,100%{opacity:1}50%{opacity:.5}}
+/* toast */
+#toasts{position:fixed;bottom:22px;right:22px;display:flex;flex-direction:column;gap:7px;z-index:200}
+.toast{background:var(--bg3);border:1px solid var(--line2);border-radius:var(--r);padding:11px 15px;font-size:13px;max-width:320px;display:flex;align-items:center;gap:9px;animation:tin .22s ease}
+.toast.success{border-left:3px solid var(--green)}.toast.error{border-left:3px solid var(--red)}.toast.info{border-left:3px solid var(--accent)}.toast.warn{border-left:3px solid var(--amber)}
+@keyframes tin{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.view-hidden{display:none}
+::-webkit-scrollbar{width:5px}
+::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:3px}
+</style>
+</head>
+<body>
+<div class="shell">
+<!-- SIDEBAR -->
+<aside class="sidebar">
+  <div class="logo">
+    <div class="logo-mark">Presto<span>Back</span></div>
+    <div class="logo-sub">v3 · Config Backup Manager</div>
+  </div>
+  <nav>
+    <div class="nav-sec">Main</div>
+    <div class="nav-item active" id="nav-dash" onclick="V('dash')">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>Dashboard
+    </div>
+    <div class="nav-item" id="nav-apps" onclick="V('apps')">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg>Applications
+    </div>
+    <div class="nav-item" id="nav-bk" onclick="V('bk')">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path d="M20 7H4a1 1 0 00-1 1v11a1 1 0 001 1h16a1 1 0 001-1V8a1 1 0 00-1-1z"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg>Backups
+    </div>
+    <div class="nav-item" id="nav-hist" onclick="V('hist')">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>History
+    </div>
+    <div class="nav-sec">Config</div>
+    <div class="nav-item" id="nav-rem" onclick="V('rem')">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2a10 10 0 100 20A10 10 0 0012 2z"/></svg>Remotes
+    </div>
+    <div class="nav-item" id="nav-notif" onclick="V('notif')">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 01-3.46 0"/></svg>Notifications
+    </div>
+    <div class="nav-item" id="nav-sec" onclick="V('sec')">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>Security
+    </div>
+    <div class="nav-item" id="nav-upd" onclick="V('upd')">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path d="M4 12a8 8 0 018-8 8 8 0 016.9 4M20 4v4h-4M20 12a8 8 0 01-8 8 8 8 0 01-6.9-4M4 20v-4h4"/></svg>Updates
+    </div>
+  </nav>
+  <div class="sidebar-foot">
+    <div class="ver" id="ver-badge">v3.0.0</div>
+    <div class="upd-dot" id="upd-dot" title="Update available"></div>
+  </div>
+</aside>
+
+<!-- MAIN -->
+<main class="main">
+
+<!-- DASHBOARD -->
+<div id="view-dash">
+  <div class="ph">
+    <div><div class="pt">Dashboard</div><div class="ps">Overview &amp; live activity</div></div>
+    <div class="ha"><button class="btn btn-g btn-sm" onclick="loadAll()">↺ Refresh</button></div>
+  </div>
+  <div class="sec">
+    <div class="stats">
+      <div class="stat"><div class="sl">Applications</div><div class="sv a" id="s-apps">0</div></div>
+      <div class="stat"><div class="sl">Remotes</div><div class="sv" id="s-rem">0</div></div>
+      <div class="stat"><div class="sl">Total Backups</div><div class="sv g" id="s-total">—</div></div>
+      <div class="stat"><div class="sl">Scheduled Jobs</div><div class="sv am" id="s-sched">0</div></div>
+    </div>
+    <div class="card">
+      <div class="ch"><div class="ct">Live activity</div><span class="pill pg"><span class="pd"></span>SSE</span></div>
+      <div style="padding:12px 18px"><div class="log" id="activity-log"><div class="ll info">Connecting…</div></div></div>
+    </div>
+  </div>
+</div>
+
+<!-- APPLICATIONS -->
+<div id="view-apps" class="view-hidden">
+  <div class="ph">
+    <div><div class="pt">Applications</div><div class="ps">Manage apps, schedules, and backups</div></div>
+    <div class="ha">
+      <button class="btn btn-g btn-sm" onclick="openDiscover()">🔍 Discover</button>
+      <button class="btn btn-p btn-sm" onclick="openAddApp()">+ Add App</button>
+    </div>
+  </div>
+  <div class="sec">
+    <div class="card">
+      <div class="empty" id="apps-empty"><div class="ei"><svg width="22" height="22" fill="none" stroke="var(--txt3)" stroke-width="1.5" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg></div><div class="et">No apps configured</div><div class="es">Use Discover to auto-import, or add manually.</div></div>
+      <table class="tbl" id="apps-tbl" style="display:none">
+        <thead><tr><th>Application</th><th>Retain</th><th>Schedule</th><th>Status</th><th style="text-align:right">Actions</th></tr></thead>
+        <tbody id="apps-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- BACKUPS -->
+<div id="view-bk" class="view-hidden">
+  <div class="ph"><div><div class="pt">Backups</div><div class="ps">Browse and restore config archives</div></div></div>
+  <div class="sec">
+    <div class="chips" id="app-chips"></div>
+    <div class="card" id="bk-notice"><div class="empty"><div class="ei"><svg width="22" height="22" fill="none" stroke="var(--txt3)" stroke-width="1.5" viewBox="0 0 24 24"><path d="M20 7H4a1 1 0 00-1 1v11a1 1 0 001 1h16a1 1 0 001-1V8a1 1 0 00-1-1z"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg></div><div class="et">Select an app above</div><div class="es">Click an app chip to browse its backup archives.</div></div></div>
+    <div class="card" id="bk-card" style="display:none">
+      <div class="ch"><div class="ct" id="bk-title">Backups</div><button class="btn btn-g btn-sm" onclick="loadBackups()">↺</button></div>
+      <div class="cb" id="bk-body"></div>
+    </div>
+  </div>
+</div>
+
+<!-- HISTORY -->
+<div id="view-hist" class="view-hidden">
+  <div class="ph"><div><div class="pt">History</div><div class="ps">Audit log of all backup and restore events</div></div><div class="ha"><button class="btn btn-g btn-sm" onclick="loadHistory()">↺ Refresh</button></div></div>
+  <div class="sec">
+    <div class="card">
+      <div class="ch"><div class="ct">Event log</div><span id="hist-count" class="pill pb">0 events</span></div>
+      <div class="cb" id="hist-body"><div style="color:var(--txt3)">Loading…</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- REMOTES -->
+<div id="view-rem" class="view-hidden">
+  <div class="ph"><div><div class="pt">Remote Targets</div><div class="ps">SSH destinations for off-site backup push</div></div><div class="ha"><button class="btn btn-p btn-sm" onclick="openAddRemote()">+ Add Remote</button></div></div>
+  <div class="sec">
+    <div class="card" style="margin-bottom:18px">
+      <div class="ch"><div class="ct">How remote push works</div></div>
+      <div class="cb" style="color:var(--txt2);font-size:13px;line-height:1.8">
+        <div class="steps">
+          <div class="step"><div class="sn">1</div>Add a remote — another Pi or Linux box you can SSH into</div>
+          <div class="step"><div class="sn">2</div>When starting a backup, pick the remote from the dropdown to auto-push after backup</div>
+          <div class="step"><div class="sn">3</div>Or open <strong>Backups</strong>, find any archive, click <strong>Push</strong> to send it now</div>
+        </div>
+        <div style="margin-top:12px;padding:10px 14px;background:var(--bg3);border-radius:var(--rs);font-family:var(--mono);font-size:11px;color:var(--txt3)">
+          ⓘ Uses <strong>rsync over SSH</strong>. Run once on your Pi: <br>
+          <code style="color:var(--accent)">ssh-keygen -t ed25519 && ssh-copy-id pi@&lt;remote-ip&gt;</code><br>
+          Then add to docker-compose: <code style="color:var(--txt2)">- /home/pi/.ssh:/root/.ssh:ro</code>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="empty" id="rem-empty"><div class="ei"><svg width="22" height="22" fill="none" stroke="var(--txt3)" stroke-width="1.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2a10 10 0 100 20A10 10 0 0012 2z"/></svg></div><div class="et">No remotes configured</div><div class="es">Add an SSH remote for off-site backup.</div></div>
+      <div class="cb" id="rem-body"></div>
+    </div>
+  </div>
+</div>
+
+<!-- NOTIFICATIONS -->
+<div id="view-notif" class="view-hidden">
+  <div class="ph"><div><div class="pt">Notifications</div><div class="ps">Telegram bot, Discord, Ntfy, webhooks</div></div></div>
+  <div class="sec">
+    <div class="card">
+      <div class="ch"><div class="ct">Telegram Bot</div></div>
+      <div class="cb">
+        <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg><div class="info-t">Get a bot token from <strong>@BotFather</strong> on Telegram → /newbot. Get your chat ID by messaging @userinfobot.</div></div>
+        <div class="fg"><div class="ftog" onclick="togNotif('telegram')"><div class="ftog-sw" id="tog-telegram"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable Telegram notifications</div></div></div>
+        <div class="fr">
+          <div class="fg"><label class="fl">Bot Token</label><input class="fi" id="tg-token" placeholder="1234567890:AAF..."></div>
+          <div class="fg"><label class="fl">Chat ID</label><input class="fi" id="tg-chatid" placeholder="123456789"></div>
+        </div>
+        <div style="font-size:12px;color:var(--txt2);margin-bottom:12px;font-weight:500">Telegram bot commands: /status · /backup &lt;name&gt; · /history · /help</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="ch"><div class="ct">Discord</div></div>
+      <div class="cb">
+        <div class="ftog" onclick="togNotif('discord')"><div class="ftog-sw" id="tog-discord"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable Discord notifications</div></div>
+        <div class="fg" style="margin-top:10px"><label class="fl">Webhook URL</label><input class="fi" id="dc-url" placeholder="https://discord.com/api/webhooks/1234/abcd…"><div class="fh">Create via Discord Server Settings → Integrations → Webhooks.</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="ch"><div class="ct">Ntfy</div></div>
+      <div class="cb">
+        <div class="ftog" onclick="togNotif('ntfy')"><div class="ftog-sw" id="tog-ntfy"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable Ntfy notifications</div></div>
+        <div class="fr" style="margin-top:10px">
+          <div class="fg"><label class="fl">Topic URL</label><input class="fi" id="ntfy-url" placeholder="https://ntfy.sh/my-secret-topic"></div>
+          <div class="fg"><label class="fl">Auth token (if private)</label><input class="fi" id="ntfy-token" placeholder="tk_optional…"></div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="ch"><div class="ct">Generic webhook (Gotify / Home Assistant / custom)</div></div>
+      <div class="cb">
+        <div class="ftog" onclick="togNotif('webhook')"><div class="ftog-sw" id="tog-webhook"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable generic webhook</div></div>
+        <div class="fg" style="margin-top:10px"><label class="fl">Webhook URL</label><input class="fi" id="wh-url" placeholder="https://gotify.example.com/message?token=…"><div class="fh">Receives a JSON POST with event, app, title, detail, is_error, time fields.</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="ch"><div class="ct">Notify on events</div></div>
+      <div class="cb">
+        <div class="fg"><div class="ftog" onclick="togNotif('bk_ok')"><div class="ftog-sw" id="tog-bk_ok"><div class="ftog-kn"></div></div><div class="ftog-lbl">Backup success</div></div></div>
+        <div class="fg"><div class="ftog" onclick="togNotif('bk_fail')"><div class="ftog-sw" id="tog-bk_fail"><div class="ftog-kn"></div></div><div class="ftog-lbl">Backup failure</div></div></div>
+        <div class="fg"><div class="ftog" onclick="togNotif('rs_ok')"><div class="ftog-sw" id="tog-rs_ok"><div class="ftog-kn"></div></div><div class="ftog-lbl">Restore success</div></div></div>
+        <div class="fg"><div class="ftog" onclick="togNotif('rs_fail')"><div class="ftog-sw" id="tog-rs_fail"><div class="ftog-kn"></div></div><div class="ftog-lbl">Restore failure</div></div></div>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:4px">
+      <button class="btn btn-p" onclick="saveNotify()">Save notification settings</button>
+      <button class="btn btn-g" onclick="testNotify()">Send test notification</button>
+    </div>
+  </div>
+</div>
+
+<!-- SECURITY -->
+<div id="view-sec" class="view-hidden">
+  <div class="ph"><div><div class="pt">Security</div><div class="ps">API key authentication</div></div></div>
+  <div class="sec">
+    <div class="card">
+      <div class="ch"><div class="ct">API Key</div></div>
+      <div class="cb">
+        <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">Every API request requires the <code>X-API-Key</code> header. The web UI sends it automatically once you're logged in. For external tools or scripts, use the key below.</div></div>
+        <div class="fg"><label class="fl">Current API Key</label>
+          <div class="code-b" id="api-key-display">Loading…
+            <button class="btn btn-g btn-sm copy-btn" onclick="copyKey()">Copy</button>
+          </div>
+        </div>
+        <div class="fg"><label class="fl">Use in curl:</label>
+          <div class="code-b" id="curl-example" style="font-size:11px;color:var(--txt3)">curl -H "X-API-Key: &lt;key&gt;" http://your-pi:8765/api/status</div>
+        </div>
+        <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">Regenerating the key will immediately invalidate the old one. Any scripts or integrations using the old key will stop working.</div></div>
+        <button class="btn btn-d btn-sm" onclick="regenKey()">⚠ Regenerate API Key</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- UPDATES -->
+<div id="view-upd" class="view-hidden">
+  <div class="ph"><div><div class="pt">Updates</div><div class="ps">Self-update PrestoBack from DockerHub</div></div></div>
+  <div class="sec">
+    <div class="card">
+      <div class="ch"><div class="ct">Current version</div></div>
+      <div class="cb">
+        <div class="fr" style="margin-bottom:16px">
+          <div><div class="sl">Running</div><div style="font-family:var(--mono);font-size:15px" id="upd-ver">—</div></div>
+          <div><div class="sl">Image</div><div style="font-family:var(--mono);font-size:11px;color:var(--txt2);margin-top:4px" id="upd-img">—</div></div>
+        </div>
+        <button class="btn btn-g btn-sm" id="check-btn" onclick="checkUpdate()">↺ Check for update</button>
+      </div>
+    </div>
+    <div class="card hidden" id="upd-avail" style="display:none">
+      <div class="ch"><div class="ct" style="color:var(--amber)">⭐ Update available</div></div>
+      <div class="cb">
+        <div style="font-size:13px;color:var(--txt2);margin-bottom:14px" id="upd-digest"></div>
+        <button class="btn btn-w" onclick="openUpdModal()">Update now</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="ch"><div class="ct">How self-update works</div></div>
+      <div class="cb" style="color:var(--txt2);font-size:13px">
+        <div class="steps">
+          <div class="step"><div class="sn">1</div>Pulls new image from DockerHub</div>
+          <div class="step"><div class="sn">2</div>Drains active jobs (max 60s)</div>
+          <div class="step"><div class="sn">3</div>Spawns a detached helper container via Docker socket</div>
+          <div class="step"><div class="sn">4</div>Helper stops this container, removes it, starts new one with same flags</div>
+          <div class="step"><div class="sn">5</div>PrestoBack is back up in ~15s — config and backups untouched</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</main>
+</div>
+
+<!-- ══════════════════════ MODALS ══════════════════════ -->
+
+<!-- Add App -->
+<div class="overlay hidden" id="m-add-app">
+  <div class="modal">
+    <div class="mh"><div class="mt">Add Application</div><button class="btn btn-g btn-ic" onclick="CM('m-add-app')">✕</button></div>
+    <div class="mb">
+      <div class="fg"><label class="fl">App name</label><input class="fi" id="a-name" placeholder="Plex, Radarr, Homepage…"></div>
+      <div class="fg"><label class="fl">Config directory path (container-internal)</label>
+        <div style="display:flex;gap:8px">
+          <input class="fi" id="a-path" placeholder="/volumes/plex" style="flex:1" oninput="validatePath(this)">
+          <button class="btn btn-g btn-sm" style="white-space:nowrap" onclick="validatePathBtn()">✓ Check</button>
+        </div>
+        <div class="fh">Path as seen <em>inside the container</em>. Volumes are mounted at <code>/volumes/appname</code>. For apps outside the presto stack, use the full host path (requires extra volume mount).</div>
+        <div id="path-status" style="font-size:12px;margin-top:4px"></div>
+      </div>
+      <div class="fr">
+        <div class="fg"><label class="fl">Keep last N backups</label><input class="fi" id="a-retain" type="number" value="5" min="1" max="99"></div>
+        <div class="fg"><label class="fl">ID (auto)</label><input class="fi" id="a-id" placeholder="auto-generated"></div>
+      </div>
+      <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
+        <div class="divlbl">Scheduled backup (optional)</div>
+        <div class="ftog" onclick="togAddSched()"><div class="ftog-sw" id="add-sched-tog"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable scheduled backup</div></div>
+        <div id="add-sched-fields" style="display:none">
+          <div class="fg"><label class="fl">Cron expression</label><input class="fi" id="a-cron" placeholder="0 3 * * *  (3:00 AM daily)"><div class="fh">Standard 5-field cron: minute hour day month weekday</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="CM('m-add-app')">Cancel</button><button class="btn btn-p" onclick="submitAddApp()">Save App</button></div>
+  </div>
+</div>
+
+<!-- Edit App -->
+<div class="overlay hidden" id="m-edit-app">
+  <div class="modal">
+    <div class="mh"><div class="mt">Edit Application</div><button class="btn btn-g btn-ic" onclick="CM('m-edit-app')">✕</button></div>
+    <div class="mb">
+      <div class="fg"><label class="fl">App name</label><input class="fi" id="ea-name"></div>
+      <div class="fg"><label class="fl">Config directory path</label><input class="fi" id="ea-path"></div>
+      <div class="fr">
+        <div class="fg"><label class="fl">Keep last N backups</label><input class="fi" id="ea-retain" type="number" min="1" max="99"></div>
+        <div class="fg"><label class="fl">App ID (read-only)</label><input class="fi" id="ea-id" disabled style="opacity:.5"></div>
+      </div>
+      <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
+        <div class="divlbl">Scheduled backup</div>
+        <div class="ftog" onclick="togEditSched()"><div class="ftog-sw" id="edit-sched-tog"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable scheduled backup</div></div>
+        <div id="edit-sched-fields" style="display:none">
+          <div class="fg"><label class="fl">Cron expression</label><input class="fi" id="ea-cron" placeholder="0 3 * * *"></div>
+        </div>
+        <div class="ftog" onclick="togEditPin()"><div class="ftog-sw" id="edit-pin-tog"><div class="ftog-kn"></div></div><div class="ftog-lbl">Pin / freeze (skip scheduled backups)</div></div>
+      </div>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="CM('m-edit-app')">Cancel</button><button class="btn btn-p" onclick="submitEditApp()">Save Changes</button></div>
+  </div>
+</div>
+
+<!-- Discover -->
+<div class="overlay hidden" id="m-discover">
+  <div class="modal">
+    <div class="mh"><div class="mt">Discover Volumes</div><button class="btn btn-g btn-ic" onclick="CM('m-discover')">✕</button></div>
+    <div class="mb"><div style="font-size:13px;color:var(--txt2);margin-bottom:14px">Directories found in your volumes folder. Tick the ones to add.</div><div id="disc-list"></div></div>
+    <div class="mf"><button class="btn btn-g" onclick="CM('m-discover')">Cancel</button><button class="btn btn-p" onclick="importDisc()">Import Selected</button></div>
+  </div>
+</div>
+
+<!-- Backup confirm -->
+<div class="overlay hidden" id="m-bk">
+  <div class="modal">
+    <div class="mh"><div class="mt" id="m-bk-title">Backup</div><button class="btn btn-g btn-ic" onclick="CM('m-bk')">✕</button></div>
+    <div class="mb">
+      <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">The app container will be <strong>stopped</strong> during backup for a consistent snapshot, then automatically restarted.</div></div>
+      <div class="steps">
+        <div class="step"><div class="sn">1</div>Stop app container</div>
+        <div class="step"><div class="sn">2</div>Archive config directory → .tar.gz</div>
+        <div class="step"><div class="sn">3</div>Restart container, verify health</div>
+        <div class="step"><div class="sn">4</div>Prune old backups beyond retention limit</div>
+      </div>
+      <div class="fg" style="margin-top:16px"><label class="fl">Push to remote after backup (optional)</label><select class="fi" id="bk-rem"><option value="">Local only</option></select></div>
+      <div id="bk-prog" style="display:none"><div style="font-size:12px;color:var(--txt2);margin-bottom:6px">Running — watch the activity log</div><div class="pw"><div class="pb2"></div></div></div>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="CM('m-bk')">Cancel</button><button class="btn btn-p" id="bk-run" onclick="runBackup()">▶ Start Backup</button></div>
+  </div>
+</div>
+
+<!-- Restore confirm -->
+<div class="overlay hidden" id="m-rs">
+  <div class="modal">
+    <div class="mh"><div class="mt">Restore — Confirm</div><button class="btn btn-g btn-ic" onclick="CM('m-rs')">✕</button></div>
+    <div class="mb">
+      <div class="danger-b"><svg width="15" height="15" fill="none" stroke="var(--red)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="danger-t">This will <strong>overwrite the current config directory</strong>. Container will be stopped, files replaced, then restarted.</div></div>
+      <div class="steps">
+        <div class="step"><div class="sn">1</div>Stop app container</div>
+        <div class="step"><div class="sn">2</div><strong>Auto-snapshot</strong> current state as safety backup (_prerestore)</div>
+        <div class="step"><div class="sn">3</div>Extract selected archive over config directory</div>
+        <div class="step"><div class="sn">4</div>Restart container, verify health</div>
+      </div>
+      <div style="margin-top:14px;padding:10px 14px;background:var(--bg3);border-radius:var(--rs)"><div style="font-size:10px;color:var(--txt3);font-family:var(--mono);margin-bottom:4px">RESTORING ARCHIVE</div><div style="font-family:var(--mono);font-size:12px;color:var(--txt)" id="rs-id">—</div></div>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="CM('m-rs')">Cancel</button><button class="btn btn-d" id="rs-run" onclick="runRestore()">↺ Restore Now</button></div>
+  </div>
+</div>
+
+<!-- Push modal -->
+<div class="overlay hidden" id="m-push">
+  <div class="modal">
+    <div class="mh"><div class="mt">Push to Remote</div><button class="btn btn-g btn-ic" onclick="CM('m-push')">✕</button></div>
+    <div class="mb">
+      <div style="padding:10px 14px;background:var(--bg3);border-radius:var(--rs);margin-bottom:16px"><div style="font-size:10px;color:var(--txt3);font-family:var(--mono);margin-bottom:4px">ARCHIVE</div><div style="font-family:var(--mono);font-size:12px;color:var(--txt)" id="push-id">—</div></div>
+      <div class="fg"><label class="fl">Destination remote</label><select class="fi" id="push-rem"></select><div class="fh">Archive will be copied via rsync over SSH.</div></div>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="CM('m-push')">Cancel</button><button class="btn btn-p" id="push-run" onclick="runPush()">⇪ Push Now</button></div>
+  </div>
+</div>
+
+<!-- Add Remote -->
+<div class="overlay hidden" id="m-add-rem">
+  <div class="modal">
+    <div class="mh"><div class="mt">Add Remote Target</div><button class="btn btn-g btn-ic" onclick="CM('m-add-rem')">✕</button></div>
+    <div class="mb">
+      <div class="fg"><label class="fl">Label</label><input class="fi" id="r-label" placeholder="Backup Pi, Office NAS…"></div>
+      <div class="fr"><div class="fg"><label class="fl">Host / IP</label><input class="fi" id="r-host" placeholder="192.168.1.50"></div><div class="fg"><label class="fl">SSH Port</label><input class="fi" id="r-port" type="number" value="22"></div></div>
+      <div class="fr"><div class="fg"><label class="fl">Username</label><input class="fi" id="r-user" placeholder="pi"></div><div class="fg"><label class="fl">Remote path</label><input class="fi" id="r-path" placeholder="/home/pi/prestoback-store"></div></div>
+      <div class="fg"><label class="fl">SSH key file (optional)</label><input class="fi" id="r-key" placeholder="/home/pi/.ssh/id_rsa"><div class="fh">Leave blank to use default key or agent.</div></div>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="CM('m-add-rem')">Cancel</button><button class="btn btn-p" onclick="submitAddRemote()">Save Remote</button></div>
+  </div>
+</div>
+
+<!-- Update confirm -->
+<div class="overlay hidden" id="m-upd">
+  <div class="modal">
+    <div class="mh"><div class="mt">Apply Update</div><button class="btn btn-g btn-ic" onclick="CM('m-upd')">✕</button></div>
+    <div class="mb">
+      <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">PrestoBack will stop and restart (~15s). Config and all backups are untouched — only the container is replaced.</div></div>
+      <p style="font-size:13px;color:var(--txt2)">After clicking <strong>Apply</strong> the page will show a reconnecting message. Refresh manually after ~20 seconds.</p>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="CM('m-upd')">Cancel</button><button class="btn btn-w" onclick="applyUpdate()">Apply Update</button></div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script>
+// ════════════════════ State ════════════════════
+const S = {
+  apps:[], remotes:[], apiKey:'',
+  selAppID:null, bkAppID:null, rsAppID:null, rsID:null, pushID:null,
+  editApp:null, addSchedOn:false, editSchedOn:false, editPinOn:false,
+  notif:{},
+};
+const VIEWS = ['dash','apps','bk','hist','rem','notif','sec','upd'];
+
+// ════════════════════ Init ════════════════════
+document.addEventListener('DOMContentLoaded', () => {
+  // Load API key from localStorage, prompt if missing
+  S.apiKey = localStorage.getItem('pb_apikey') || '';
+  if (!S.apiKey) {
+    S.apiKey = prompt('Enter your PrestoBack API key (shown in container logs on first start):') || '';
+    if (S.apiKey) localStorage.setItem('pb_apikey', S.apiKey);
+  }
+  loadAll();
+  connectSSE();
+});
+
+async function loadAll() {
+  await Promise.all([loadApps(), loadRemotes(), loadStatus(), loadNotify()]);
+}
+
+async function loadStatus() {
+  try {
+    const d = await api('/api/status');
+    document.getElementById('ver-badge').textContent = 'v'+d.version;
+    document.getElementById('upd-ver').textContent = 'v'+d.version;
+    document.getElementById('upd-img').textContent = d.image || 'not set';
+    document.getElementById('api-key-display').childNodes[0].textContent = S.apiKey;
+    document.getElementById('curl-example').textContent =
+      'curl -H "X-API-Key: '+S.apiKey+'" http://your-pi:8765/api/status';
+  } catch {}
+}
+
+// ════════════════════ Navigation ════════════════════
+function V(name) {
+  VIEWS.forEach(v => {
+    document.getElementById('view-'+v).classList.toggle('view-hidden', v!==name);
+    document.getElementById('nav-'+v)?.classList.toggle('active', v===name);
+  });
+  if (name==='bk') renderChips();
+  if (name==='hist') loadHistory();
+  if (name==='sec') loadStatus();
+}
+
+// ════════════════════ API helper ════════════════════
+async function api(url, opts={}) {
+  const res = await fetch(url, {
+    headers: {'Content-Type':'application/json','X-API-Key':S.apiKey},
+    ...opts
+  });
+  if (res.status === 401) {
+    S.apiKey = prompt('API key rejected. Enter the correct API key:') || '';
+    localStorage.setItem('pb_apikey', S.apiKey);
+    throw new Error('unauthorized — please retry');
+  }
+  if (!res.ok) {
+    const e = await res.json().catch(()=>({error:res.statusText}));
+    throw new Error(e.error||res.statusText);
+  }
+  return res.json();
+}
+
+// ════════════════════ Apps ════════════════════
+async function loadApps() {
+  try {
+    S.apps = await api('/api/apps')||[];
+    renderApps();
+    document.getElementById('s-apps').textContent = S.apps.length;
+    document.getElementById('s-sched').textContent = S.apps.filter(a=>a.schedule?.enabled&&!a.pinned).length;
+    countTotal();
+  } catch(e) { toast(e.message,'error'); }
+}
+
+function renderApps() {
+  const tbody=document.getElementById('apps-tbody');
+  const empty=document.getElementById('apps-empty');
+  const tbl=document.getElementById('apps-tbl');
+  if (!S.apps.length) { empty.style.display=''; tbl.style.display='none'; return; }
+  empty.style.display='none'; tbl.style.display='';
+  tbody.innerHTML = S.apps.map(a => {
+    const schedPill = a.schedule?.enabled && !a.pinned
+      ? `<span class="pill pg"><span class="pd"></span>${esc(a.schedule.cron_expr)}</span>`
+      : `<span class="pill" style="background:var(--bg4);color:var(--txt3)">manual</span>`;
+    const pinPill = a.pinned ? `<span class="pill pa" style="margin-left:4px">📌 pinned</span>` : '';
+    return `<tr>
+      <td><div class="an">${esc(a.name)}</div><div class="ap">${esc(a.path)}</div></td>
+      <td><span class="pill pb">${a.retain||5}</span></td>
+      <td>${schedPill}${pinPill}</td>
+      <td>${esc(a.id)}</td>
+      <td><div class="ra">
+        <button class="btn btn-g btn-sm" onclick="openBkModal('${a.id}','${esc(a.name)}')">▶ Backup</button>
+        <button class="btn btn-g btn-sm btn-ic" title="Edit" onclick="openEditApp('${a.id}')">✎</button>
+        <button class="btn btn-d btn-sm btn-ic" title="Delete" onclick="delApp('${a.id}')">🗑</button>
+      </div></td>
+    </tr>`;
+  }).join('');
+}
+
+async function delApp(id) {
+  if (!confirm('Remove this app? Backup archives on disk are NOT deleted.')) return;
+  try { await api('/api/apps/'+id,{method:'DELETE'}); toast('App removed','success'); loadApps(); }
+  catch(e) { toast(e.message,'error'); }
+}
+
+// Add App
+function openAddApp() {
+  ['a-name','a-path','a-id','a-cron'].forEach(x=>document.getElementById(x).value='');
+  document.getElementById('a-retain').value=5;
+  S.addSchedOn=false; setTog('add-sched-tog',false);
+  document.getElementById('add-sched-fields').style.display='none';
+  OM('m-add-app');
+}
+function togAddSched() {
+  S.addSchedOn=!S.addSchedOn; setTog('add-sched-tog',S.addSchedOn);
+  document.getElementById('add-sched-fields').style.display=S.addSchedOn?'':'none';
+}
+async function submitAddApp() {
+  const name=gv('a-name'), path=gv('a-path'), retain=parseInt(gv('a-retain'))||5, id=gv('a-id')||undefined;
+  if (!name||!path) { toast('Name and path required','error'); return; }
+  const app = {name,path,retain,id,
+    schedule:{enabled:S.addSchedOn, cron_expr: S.addSchedOn?gv('a-cron'):''}};
+  try { await api('/api/apps',{method:'POST',body:JSON.stringify(app)}); toast('App added','success'); CM('m-add-app'); loadApps(); }
+  catch(e) { toast(e.message,'error'); }
+}
+
+// Edit App
+function openEditApp(id) {
+  const a = S.apps.find(x=>x.id===id);
+  if (!a) return;
+  S.editApp=a;
+  document.getElementById('ea-name').value=a.name;
+  document.getElementById('ea-path').value=a.path;
+  document.getElementById('ea-retain').value=a.retain||5;
+  document.getElementById('ea-id').value=a.id;
+  document.getElementById('ea-cron').value=a.schedule?.cron_expr||'';
+  S.editSchedOn=a.schedule?.enabled||false; setTog('edit-sched-tog',S.editSchedOn);
+  document.getElementById('edit-sched-fields').style.display=S.editSchedOn?'':'none';
+  S.editPinOn=a.pinned||false; setTog('edit-pin-tog',S.editPinOn);
+  OM('m-edit-app');
+}
+function togEditSched() { S.editSchedOn=!S.editSchedOn; setTog('edit-sched-tog',S.editSchedOn); document.getElementById('edit-sched-fields').style.display=S.editSchedOn?'':'none'; }
+function togEditPin() { S.editPinOn=!S.editPinOn; setTog('edit-pin-tog',S.editPinOn); }
+async function submitEditApp() {
+  const a = {
+    ...S.editApp,
+    name:gv('ea-name'), path:gv('ea-path'),
+    retain:parseInt(gv('ea-retain'))||5,
+    pinned:S.editPinOn,
+    schedule:{enabled:S.editSchedOn, cron_expr:gv('ea-cron')},
+  };
+  try { await api('/api/apps/'+a.id,{method:'PUT',body:JSON.stringify(a)}); toast('Saved','success'); CM('m-edit-app'); loadApps(); }
+  catch(e) { toast(e.message,'error'); }
+}
+
+// Discover
+async function openDiscover() {
+  try {
+    const vols = await api('/api/volumes');
+    const existing = new Set(S.apps.map(a=>a.path));
+    const fresh = vols.filter(v=>!existing.has(v.path));
+    const list=document.getElementById('disc-list');
+    if (!fresh.length) { list.innerHTML='<div style="color:var(--txt2);font-size:13px">All volumes are already configured.</div>'; }
+    else { list.innerHTML=fresh.map(v=>`<label style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line);cursor:pointer"><input type="checkbox" data-name="${esc(v.name)}" data-path="${esc(v.path)}" checked style="accent-color:var(--accent);width:15px;height:15px"><div><div style="font-weight:500">${esc(v.name)}</div><div style="font-family:var(--mono);font-size:11px;color:var(--accent)">${esc(v.path)}</div><div style="font-size:11px;color:var(--txt3)">host: ${esc(v.host_path_hint||'—')}</div></div></label>`).join(''); }
+    OM('m-discover');
+  } catch(e) { toast(e.message,'error'); }
+}
+async function importDisc() {
+  const checks=[...document.querySelectorAll('#disc-list input[type=checkbox]:checked')];
+  if (!checks.length) { toast('Nothing selected','error'); return; }
+  let n=0;
+  for (const cb of checks) { try { await api('/api/apps',{method:'POST',body:JSON.stringify({name:cb.dataset.name,path:cb.dataset.path,retain:5})}); n++; } catch {} }
+  toast(n+' app(s) imported','success'); CM('m-discover'); loadApps();
+}
+
+// ════════════════════ Backup modal ════════════════════
+function openBkModal(id,name) {
+  S.bkAppID=id;
+  document.getElementById('m-bk-title').textContent='Backup — '+name;
+  document.getElementById('bk-rem').innerHTML='<option value="">Local only</option>'+S.remotes.map(r=>`<option value="${r.id}">${esc(r.label)} (${esc(r.host)})</option>`).join('');
+  document.getElementById('bk-prog').style.display='none';
+  document.getElementById('bk-run').disabled=false;
+  OM('m-bk');
+}
+async function runBackup() {
+  const rem=document.getElementById('bk-rem').value;
+  document.getElementById('bk-run').disabled=true;
+  document.getElementById('bk-prog').style.display='';
+  try {
+    await api('/api/apps/'+S.bkAppID+'/backup'+(rem?'?remote='+rem:''),{method:'POST'});
+    toast('Backup started — watch activity log','info'); CM('m-bk');
+  } catch(e) { toast(e.message,'error'); document.getElementById('bk-run').disabled=false; document.getElementById('bk-prog').style.display='none'; }
+}
+
+// ════════════════════ Restore modal ════════════════════
+function openRsModal(appID,backupID) {
+  S.rsAppID=appID; S.rsID=backupID;
+  document.getElementById('rs-id').textContent=backupID;
+  document.getElementById('rs-run').disabled=false;
+  OM('m-rs');
+}
+async function runRestore() {
+  document.getElementById('rs-run').disabled=true;
+  try {
+    await api('/api/apps/'+S.rsAppID+'/restore/'+S.rsID,{method:'POST'});
+    toast('Restore started — watch activity log','info'); CM('m-rs');
+  } catch(e) { toast(e.message,'error'); document.getElementById('rs-run').disabled=false; }
+}
+
+// ════════════════════ Backups view ════════════════════
+function renderChips() {
+  document.getElementById('app-chips').innerHTML=S.apps.map(a=>`<div class="chip ${S.selAppID===a.id?'active':''}" onclick="selApp('${a.id}','${esc(a.name)}')">${esc(a.name)}</div>`).join('');
+}
+async function selApp(id,name) {
+  S.selAppID=id;
+  document.getElementById('bk-notice').style.display='none';
+  document.getElementById('bk-card').style.display='';
+  document.getElementById('bk-title').textContent=name+' — Backups';
+  renderChips(); await loadBackups();
+}
+async function loadBackups() {
+  if (!S.selAppID) return;
+  const body=document.getElementById('bk-body');
+  body.innerHTML='<div style="color:var(--txt3);font-size:13px">Loading…</div>';
+  try {
+    const metas=await api('/api/backups/'+S.selAppID)||[];
+    countTotal();
+    if (!metas.length) { body.innerHTML='<div style="color:var(--txt2);font-size:13px;padding:8px 0">No backups yet.</div>'; return; }
+    body.innerHTML=metas.map(m=>`
+      <div class="bi">
+        <div class="bic">${m.pre_restore
+          ?'<span style="font-size:14px">⭐</span>'
+          :'<svg width="14" height="14" fill="none" stroke="var(--accent)" stroke-width="1.8" viewBox="0 0 24 24"><path d="M20 7H4a1 1 0 00-1 1v11a1 1 0 001 1h16a1 1 0 001-1V8a1 1 0 00-1-1z"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg>'}</div>
+        <div class="bm">
+          <div class="bid">${esc(m.id)} ${m.pre_restore?'<span class="pill pa" style="font-size:9px">safety snap</span>':''}</div>
+          <div class="bif">${new Date(m.started_at).toLocaleString()}</div>
+        </div>
+        <span class="bsz">${fmtBytes(m.size_bytes)}</span>
+        <div style="display:flex;gap:6px">
+          ${S.remotes.length?`<button class="btn btn-g btn-sm" onclick="openPush('${esc(m.id)}')">⇪ Push</button>`:''}
+          <button class="btn btn-g btn-sm" onclick="openRsModal('${S.selAppID}','${esc(m.id)}')">↺ Restore</button>
+          <button class="btn btn-d btn-sm btn-ic" onclick="delBackup('${esc(m.id)}')">🗑</button>
+        </div>
+      </div>`).join('');
+  } catch(e) { toast(e.message,'error'); }
+}
+async function delBackup(id) {
+  if (!confirm('Delete this archive? Cannot be undone.')) return;
+  try { await api('/api/backups/'+S.selAppID+'/'+id,{method:'DELETE'}); toast('Deleted','success'); loadBackups(); }
+  catch(e) { toast(e.message,'error'); }
+}
+async function countTotal() {
+  let n=0;
+  for (const a of S.apps) { try { const m=await api('/api/backups/'+a.id)||[]; n+=m.length; } catch{} }
+  document.getElementById('s-total').textContent=n;
+}
+
+// ════════════════════ Push ════════════════════
+function openPush(backupID) {
+  if (!S.remotes.length) { toast('No remotes configured','warn'); return; }
+  S.pushID=backupID;
+  document.getElementById('push-id').textContent=backupID;
+  document.getElementById('push-rem').innerHTML=S.remotes.map(r=>`<option value="${r.id}">${esc(r.label)} — ${esc(r.user)}@${esc(r.host)}</option>`).join('');
+  document.getElementById('push-run').disabled=false;
+  OM('m-push');
+}
+async function runPush() {
+  const rem=document.getElementById('push-rem').value;
+  document.getElementById('push-run').disabled=true;
+  try {
+    await api('/api/backups/'+S.selAppID+'/'+S.pushID+'/push?remote='+rem,{method:'POST'});
+    toast('Push started — watch activity log','info'); CM('m-push');
+  } catch(e) { toast(e.message,'error'); document.getElementById('push-run').disabled=false; }
+}
+
+// ════════════════════ History ════════════════════
+async function loadHistory() {
+  try {
+    const entries=await api('/api/history')||[];
+    document.getElementById('hist-count').textContent=entries.length+' events';
+    const body=document.getElementById('hist-body');
+    if (!entries.length) { body.innerHTML='<div style="color:var(--txt2)">No history yet.</div>'; return; }
+    body.innerHTML=entries.map(e=>{
+      const ok=!e.event.includes('fail');
+      const icons={'backup_success':'✅','backup_fail':'❌','restore_success':'🔄','restore_fail':'💥','push_success':'⇪','push_fail':'⚠'};
+      return `<div class="hi">
+        <div class="hic">${icons[e.event]||'📋'}</div>
+        <div style="flex:1">
+          <div style="font-weight:500">${esc(e.app_name)} <span style="font-family:var(--mono);font-size:11px;color:var(--txt3)">${e.event}</span></div>
+          <div style="font-size:12px;color:var(--txt3)">${esc(e.detail)}</div>
+        </div>
+        <div style="font-family:var(--mono);font-size:11px;color:var(--txt3);white-space:nowrap">${new Date(e.time).toLocaleString()}</div>
+      </div>`;
+    }).join('');
+  } catch(e) { toast(e.message,'error'); }
+}
+
+// ════════════════════ Remotes ════════════════════
+async function loadRemotes() {
+  try {
+    S.remotes=await api('/api/remotes')||[];
+    renderRemotes();
+    document.getElementById('s-rem').textContent=S.remotes.length;
+  } catch(e) { toast(e.message,'error'); }
+}
+function renderRemotes() {
+  const body=document.getElementById('rem-body'), empty=document.getElementById('rem-empty');
+  if (!S.remotes.length) { empty.style.display=''; body.innerHTML=''; return; }
+  empty.style.display='none';
+  body.innerHTML=S.remotes.map(r=>`
+    <div class="ri">
+      <div class="ric"><svg width="15" height="15" fill="none" stroke="var(--txt2)" stroke-width="1.6" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2a10 10 0 100 20A10 10 0 0012 2z"/></svg></div>
+      <div style="flex:1"><div style="font-weight:500">${esc(r.label)}</div><div style="font-family:var(--mono);font-size:11px;color:var(--txt3)">${esc(r.user)}@${esc(r.host)}:${r.port} → ${esc(r.path)}</div></div>
+      <div style="display:flex;gap:6px">
+        <button class="btn btn-g btn-sm" onclick="testRemote('${r.id}',this)">Test</button>
+        <button class="btn btn-d btn-sm btn-ic" onclick="delRemote('${r.id}')">🗑</button>
+      </div>
+    </div>`).join('');
+}
+function openAddRemote() {
+  ['r-label','r-host','r-user','r-path','r-key'].forEach(x=>document.getElementById(x).value='');
+  document.getElementById('r-port').value=22;
+  OM('m-add-rem');
+}
+async function submitAddRemote() {
+  const label=gv('r-label'),host=gv('r-host'),user=gv('r-user'),path=gv('r-path'),port=parseInt(gv('r-port'))||22,key_file=gv('r-key')||undefined;
+  if (!label||!host||!user||!path) { toast('All fields required','error'); return; }
+  try { await api('/api/remotes',{method:'POST',body:JSON.stringify({label,host,user,path,port,key_file})}); toast('Remote added','success'); CM('m-add-rem'); loadRemotes(); }
+  catch(e) { toast(e.message,'error'); }
+}
+async function delRemote(id) {
+  if (!confirm('Remove this remote?')) return;
+  try { await api('/api/remotes/'+id,{method:'DELETE'}); toast('Removed','success'); loadRemotes(); }
+  catch(e) { toast(e.message,'error'); }
+}
+async function testRemote(id,btn) {
+  btn.textContent='…'; btn.disabled=true;
+  try {
+    const r=await api('/api/remotes/'+id+'/test',{method:'POST'});
+    btn.textContent=r.ok?'✓ OK':'✗ Fail'; btn.style.color=r.ok?'var(--green)':'var(--red)';
+    if (!r.ok) toast('Failed: '+r.error,'error');
+  } catch(e) { btn.textContent='✗ Err'; btn.style.color='var(--red)'; }
+  setTimeout(()=>{ btn.textContent='Test'; btn.disabled=false; btn.style.color=''; }, 3500);
+}
+
+// ════════════════════ Notifications ════════════════════
+async function loadNotify() {
+  try {
+    S.notif = await api('/api/notify');
+    const n = S.notif;
+    document.getElementById('tg-token').value   = n.telegram_token   || '';
+    document.getElementById('tg-chatid').value  = n.telegram_chat_id || '';
+    document.getElementById('dc-url').value     = n.discord_url      || '';
+    document.getElementById('ntfy-url').value   = n.ntfy_url         || '';
+    document.getElementById('ntfy-token').value = n.ntfy_token       || '';
+    document.getElementById('wh-url').value     = n.webhook_url      || '';
+    setTog('tog-telegram', n.telegram_enabled);
+    setTog('tog-discord',  n.discord_enabled);
+    setTog('tog-ntfy',     n.ntfy_enabled);
+    setTog('tog-webhook',  n.webhook_enabled);
+    setTog('tog-bk_ok',    n.on_backup_success);
+    setTog('tog-bk_fail',  n.on_backup_fail);
+    setTog('tog-rs_ok',    n.on_restore_success);
+    setTog('tog-rs_fail',  n.on_restore_fail);
+  } catch {}
+}
+function togNotif(key) {
+  const map={
+    telegram:'telegram_enabled', discord:'discord_enabled',
+    ntfy:'ntfy_enabled', webhook:'webhook_enabled',
+    bk_ok:'on_backup_success', bk_fail:'on_backup_fail',
+    rs_ok:'on_restore_success', rs_fail:'on_restore_fail'
+  };
+  const field=map[key];
+  if (!field) return;
+  S.notif[field]=!S.notif[field];
+  setTog('tog-'+key, S.notif[field]);
+}
+async function saveNotify() {
+  const n = {
+    ...S.notif,
+    telegram_token:   gv('tg-token'),
+    telegram_chat_id: gv('tg-chatid'),
+    discord_url:      gv('dc-url'),
+    ntfy_url:         gv('ntfy-url'),
+    ntfy_token:       gv('ntfy-token'),
+    webhook_url:      gv('wh-url'),
+  };
+  try {
+    await api('/api/notify',{method:'PUT',body:JSON.stringify(n)});
+    toast('Notification settings saved','success'); S.notif=n;
+  } catch(e) { toast(e.message,'error'); }
+}
+async function testNotify() {
+  try {
+    const r=await api('/api/notify/test',{method:'POST'});
+    if (r.ok) toast('Test notification sent ✓','success');
+    else toast('Some channels failed: '+(r.errors||[]).join(', '),'warn');
+  } catch(e) { toast(e.message,'error'); }
+}
+
+// ════════════════════ Security ════════════════════
+function copyKey() {
+  navigator.clipboard.writeText(S.apiKey);
+  toast('API key copied','success');
+}
+async function regenKey() {
+  if (!confirm('Regenerate API key? The current key will stop working immediately — you will need to paste the new one here.')) return;
+  try {
+    const r=await api('/api/apikey/regenerate',{method:'POST'});
+    S.apiKey=r.api_key;
+    localStorage.setItem('pb_apikey',S.apiKey);
+    toast('New API key generated','success');
+    loadStatus();
+  } catch(e) { toast(e.message,'error'); }
+}
+
+// ════════════════════ Updates ════════════════════
+async function checkUpdate() {
+  const btn=document.getElementById('check-btn');
+  btn.disabled=true; btn.textContent='Checking…';
+  try {
+    const r=await api('/api/update/check');
+    if (r.available) {
+      document.getElementById('upd-avail').style.display='';
+      document.getElementById('upd-digest').textContent='Local: '+r.local_digest+'  →  Remote: '+r.remote_digest;
+      document.getElementById('upd-dot').classList.add('show');
+      toast('Update available!','warn');
+    } else { toast(r.error?'Check failed: '+r.error:'Already up to date ✓','info'); }
+  } catch(e) { toast(e.message,'error'); }
+  btn.disabled=false; btn.textContent='↺ Check for update';
+}
+function openUpdModal() { OM('m-upd'); }
+async function applyUpdate() {
+  CM('m-upd'); toast('Update started — reconnect in ~20s','warn');
+  addLog('_system','⬆ Self-update initiated…','info');
+  try { await api('/api/update/apply',{method:'POST'}); } catch(e) { toast('Update failed: '+e.message,'error'); }
+}
+
+// ════════════════════ SSE ════════════════════
+function connectSSE() {
+  const es=new EventSource('/api/events?api_key='+encodeURIComponent(S.apiKey));
+  es.onmessage=e=>{
+    try {
+      const u=JSON.parse(e.data);
+      const log=u.log||u.Log||'';
+      const appID=u.app_id||u.AppID||'';
+      const status=u.backup?.status||u.Backup?.status||'';
+      const cls = status==='failed'||log.includes('✗')||log.includes('FAILED') ? 'err'
+            : status==='success'||log.includes('✓')||log.includes('complete') ? 'ok'
+            : log.includes('⚠')||log.includes('Warning')||log.includes('warn') ? 'warn'
+            : log.includes('━━━') ? 'info'
+            : '';
+      if (log) addLog(appID, log, cls);
+      if (status==='success') { loadApps(); loadHistory(); }
+      if (status==='failed') loadHistory();
+    } catch {}
+  };
+  es.onerror=()=>addLog('_sys','SSE disconnected — retrying…','warn');
+}
+function addLog(appID,msg,cls='') {
+  const log=document.getElementById('activity-log');
+  const line=document.createElement('div');
+  line.className='ll '+(cls||'');
+  const ts=new Date().toLocaleTimeString();
+  const pre=appID&&appID!=='_system'?' ['+appID+']':'';
+  line.textContent='['+ts+']'+pre+' '+msg;
+  log.appendChild(line);
+  while(log.children.length>300) log.removeChild(log.firstChild);
+  log.scrollTop=log.scrollHeight;
+}
+
+// ════════════════════ Toggle helpers ════════════════════
+function setTog(id,on) { const el=document.getElementById(id); if(!el)return; el.classList.toggle('on',!!on); }
+
+// ════════════════════ Modal helpers ════════════════════
+function OM(id) { document.getElementById(id).classList.remove('hidden'); }
+function CM(id) { document.getElementById(id).classList.add('hidden'); }
+document.querySelectorAll('.overlay').forEach(o=>o.addEventListener('click',e=>{ if(e.target===o) o.classList.add('hidden'); }));
+
+// ════════════════════ Toast ════════════════════
+function toast(msg,type='info') {
+  const t=document.createElement('div'); t.className='toast '+type; t.textContent=msg;
+  document.getElementById('toasts').appendChild(t); setTimeout(()=>t.remove(),4500);
+}
+
+// ════════════════════ Path validation ════════════════════
+let pathCheckTimer = null;
+function validatePath(input) {
+  clearTimeout(pathCheckTimer);
+  pathCheckTimer = setTimeout(() => doValidatePath(input.value), 600);
+}
+async function validatePathBtn() {
+  await doValidatePath(gv('a-path'));
+}
+async function doValidatePath(path) {
+  const el = document.getElementById('path-status');
+  if (!path) { el.textContent=''; return; }
+  try {
+    const r = await api('/api/validate-path?path='+encodeURIComponent(path));
+    if (r.ok && r.is_dir) {
+      el.innerHTML = '<span style="color:var(--green)">✓ Path exists and is readable</span>';
+    } else if (r.ok && !r.is_dir) {
+      el.innerHTML = '<span style="color:var(--amber)">⚠ Path exists but is not a directory</span>';
+    } else {
+      el.innerHTML = '<span style="color:var(--red)">✗ ' + esc(r.error||'Path not found') + '</span>';
+    }
+  } catch(e) {
+    el.innerHTML = '<span style="color:var(--red)">✗ '+esc(e.message)+'</span>';
+  }
+}
+
+// ════════════════════ Utils ════════════════════
+function gv(id) { return (document.getElementById(id)?.value||'').trim(); }
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function fmtBytes(b) { if(!b)return'—'; if(b<1024)return b+' B'; if(b<1048576)return(b/1024).toFixed(1)+' KB'; if(b<1073741824)return(b/1048576).toFixed(1)+' MB'; return(b/1073741824).toFixed(2)+' GB'; }
+</script>
+</body>
+</html>

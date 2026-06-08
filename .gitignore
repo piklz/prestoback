@@ -1,0 +1,36 @@
+# Local development
+.DS_Store
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.iml
+
+# Build outputs
+prestoback
+dist/
+build/
+
+# PrestoBack data (contains API keys, secrets, SSH keys)
+/data/
+config.json
+config.json.tmp
+
+# Docker volumes (if stored locally during development)
+/volumes/
+
+# Go
+vendor/
+go.sum
+
+# macOS
+*.app
+
+# Git-related
+.git/
