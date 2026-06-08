@@ -10,7 +10,9 @@ COPY go.mod go.sum* ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /prestoback ./cmd/prestoback
+ARG VERSION=dev
+ENV GO_LDFLAGS="-s -w -X 'internal/config.Version=${VERSION}'"
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="$GO_LDFLAGS" -o /prestoback ./cmd/prestoback
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM alpine:3.19
