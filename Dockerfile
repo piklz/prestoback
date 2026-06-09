@@ -11,8 +11,10 @@ RUN go mod download
 
 COPY . .
 ARG VERSION=dev
-ENV GO_LDFLAGS="-s -w -X 'internal/config.Version=${VERSION}'"
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="$GO_LDFLAGS" -o /prestoback ./cmd/prestoback
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-s -w -X 'github.com/pi/prestoback/internal/config.Version=${VERSION}'" \
+    -o /prestoback ./cmd/prestoback
+
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM alpine:3.19
