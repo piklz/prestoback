@@ -184,6 +184,7 @@ func (c *Config) APIKey() string {
 func (c *Config) RegenerateAPIKey() string {
 	c.mu.Lock()
 	c.apiKey = generateKey()
+	c.revokedTokens = make(map[string]struct{}) // old tokens are all invalid now
 	c.mu.Unlock()
 	_ = c.Save()
 	return c.apiKey
@@ -325,12 +326,13 @@ func (c *Config) GetUser(username string) (User, bool) {
 
 func (c *Config) AddUser(u User) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if _, exists := c.users[u.Username]; exists {
+		c.mu.Unlock()
 		return fmt.Errorf("user '%s' already exists", u.Username)
 	}
 	c.users[u.Username] = u
-	return nil
+	c.mu.Unlock()
+	return c.Save() // persist immediately
 }
 
 // ── Token revocation (in-memory) ─────────────────────────────────────────────

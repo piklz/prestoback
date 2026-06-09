@@ -98,20 +98,6 @@ func (s *Server) routes() {
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
 
-func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		key := r.Header.Get("X-API-Key")
-		if key == "" {
-			key = r.URL.Query().Get("api_key")
-		}
-		if key != s.cfg.APIKey() {
-			w.Header().Set("WWW-Authenticate", `X-API-Key realm="PrestoBack"`)
-			errOut(w, 401, "invalid or missing API key — add X-API-Key header")
-			return
-		}
-		next(w, r)
-	}
-}
 
 // SSE uses query param auth so EventSource (no custom headers) works.
 // Accepts ?token=<jwt> or legacy ?api_key=<apikey>
