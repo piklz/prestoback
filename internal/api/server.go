@@ -67,26 +67,33 @@ func (s *Server) Run(port int) error {
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 func (s *Server) routes() {
-	// Public — no auth
+	// Public — no auth (healthcheck, auth flow, status)
 	s.mux.Handle("/", http.FileServer(http.FS(web.StaticFS())))
 	s.mux.HandleFunc("/healthz", s.handleHealth)
-	s.mux.HandleFunc("/api/events", s.handleSSE) // SSE — auth via query param
+	s.mux.HandleFunc("/health", s.handleHealth)
+	s.mux.HandleFunc("/api/health", s.handleHealth)
+	s.mux.HandleFunc("/api/status", s.handleStatus)   // public — used by UI before login & Docker healthcheck
+	s.mux.HandleFunc("/api/auth/status", s.handleAuthStatus) // {setup_required, version}
+	s.mux.HandleFunc("/api/auth/setup", s.handleAuthSetup)   // first-run setup
+	s.mux.HandleFunc("/api/auth/login", s.handleAuthLogin)   // credential login → JWT
+	s.mux.HandleFunc("/api/events", s.handleSSE)             // SSE — auth via query param
 
-	// Auth-required API
-	s.mux.HandleFunc("/api/status", s.auth(s.handleStatus))
-	s.mux.HandleFunc("/api/volumes", s.auth(s.handleListVolumes))
-	s.mux.HandleFunc("/api/validate-path", s.auth(s.handleValidatePath))
-	s.mux.HandleFunc("/api/apps", s.auth(s.handleApps))
-	s.mux.HandleFunc("/api/apps/", s.auth(s.handleApp))
-	s.mux.HandleFunc("/api/backups/", s.auth(s.handleBackups))
-	s.mux.HandleFunc("/api/remotes", s.auth(s.handleRemotes))
-	s.mux.HandleFunc("/api/remotes/", s.auth(s.handleRemote))
-	s.mux.HandleFunc("/api/history", s.auth(s.handleHistory))
-	s.mux.HandleFunc("/api/notify", s.auth(s.handleNotify))
-	s.mux.HandleFunc("/api/notify/test", s.auth(s.handleNotifyTest))
-	s.mux.HandleFunc("/api/apikey/regenerate", s.auth(s.handleRegenKey))
-	s.mux.HandleFunc("/api/update/check", s.auth(s.handleUpdateCheck))
-	s.mux.HandleFunc("/api/update/apply", s.auth(s.handleUpdateApply))
+	// Auth-required API (JWT or legacy X-API-Key)
+	s.mux.HandleFunc("/api/auth/logout", s.authJWT(s.handleAuthLogout))
+	s.mux.HandleFunc("/api/auth/me", s.authJWT(s.handleAuthMe))
+	s.mux.HandleFunc("/api/volumes", s.authJWT(s.handleListVolumes))
+	s.mux.HandleFunc("/api/validate-path", s.authJWT(s.handleValidatePath))
+	s.mux.HandleFunc("/api/apps", s.authJWT(s.handleApps))
+	s.mux.HandleFunc("/api/apps/", s.authJWT(s.handleApp))
+	s.mux.HandleFunc("/api/backups/", s.authJWT(s.handleBackups))
+	s.mux.HandleFunc("/api/remotes", s.authJWT(s.handleRemotes))
+	s.mux.HandleFunc("/api/remotes/", s.authJWT(s.handleRemote))
+	s.mux.HandleFunc("/api/history", s.authJWT(s.handleHistory))
+	s.mux.HandleFunc("/api/notify", s.authJWT(s.handleNotify))
+	s.mux.HandleFunc("/api/notify/test", s.authJWT(s.handleNotifyTest))
+	s.mux.HandleFunc("/api/apikey/regenerate", s.authJWT(s.handleRegenKey))
+	s.mux.HandleFunc("/api/update/check", s.authJWT(s.handleUpdateCheck))
+	s.mux.HandleFunc("/api/update/apply", s.authJWT(s.handleUpdateApply))
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
@@ -106,13 +113,28 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// SSE uses query param auth so EventSource (no custom headers) works
+// SSE uses query param auth so EventSource (no custom headers) works.
+// Accepts ?token=<jwt> or legacy ?api_key=<apikey>
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
-	key := r.URL.Query().Get("api_key")
-	if key != s.cfg.APIKey() {
+	// JWT token param
+	token := r.URL.Query().Get("token")
+	if token != "" {
+		if !s.cfg.IsTokenRevoked(token) {
+			if _, err := jwtVerify(token, jwtSecret(s.cfg.APIKey())); err == nil {
+				goto authorized
+			}
+		}
 		http.Error(w, "unauthorized", 401)
 		return
 	}
+	// Legacy API key param
+	if key := r.URL.Query().Get("api_key"); key == s.cfg.APIKey() {
+		goto authorized
+	}
+	http.Error(w, "unauthorized", 401)
+	return
+
+authorized:
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")

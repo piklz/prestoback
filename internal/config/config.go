@@ -66,12 +66,20 @@ type NotifyConfig struct {
 	OnRestoreFail    bool `json:"on_restore_fail"`
 }
 
+// User is a PrestoBack login account.
+type User struct {
+	Username string `json:"username"`
+	Hash     string `json:"hash"` // bcrypt hash
+	Role     string `json:"role"` // "admin" (only role for now)
+}
+
 // disk is the on-disk JSON shape.
 type disk struct {
 	APIKey  string         `json:"api_key"`
 	Apps    []AppConfig    `json:"apps"`
 	Remotes []RemoteTarget `json:"remotes"`
 	Notify  NotifyConfig   `json:"notify"`
+	Users   []User         `json:"users,omitempty"`
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -80,11 +88,13 @@ type Config struct {
 	DataDir    string
 	VolumesDir string
 
-	mu      sync.RWMutex
-	apiKey  string
-	apps    map[string]AppConfig
-	remotes map[string]RemoteTarget
-	notify  NotifyConfig
+	mu           sync.RWMutex
+	apiKey       string
+	apps         map[string]AppConfig
+	remotes      map[string]RemoteTarget
+	notify       NotifyConfig
+	users        map[string]User
+	revokedTokens map[string]struct{} // in-memory revocation set
 }
 
 func Load(dataDir string) (*Config, error) {
@@ -95,6 +105,8 @@ func Load(dataDir string) (*Config, error) {
 		DataDir: dataDir,
 		apps:    make(map[string]AppConfig),
 		remotes: make(map[string]RemoteTarget),
+		users:   make(map[string]User),
+		revokedTokens: make(map[string]struct{}),
 	}
 	path := filepath.Join(dataDir, "config.json")
 	data, err := os.ReadFile(path)
@@ -127,6 +139,9 @@ func Load(dataDir string) (*Config, error) {
 		c.remotes[r.ID] = r
 	}
 	c.notify = d.Notify
+	for _, u := range d.Users {
+		c.users[u.Username] = u
+	}
 	return c, nil
 }
 
@@ -141,6 +156,9 @@ func (c *Config) Save() error {
 	}
 	for _, r := range c.remotes {
 		d.Remotes = append(d.Remotes, r)
+	}
+	for _, u := range c.users {
+		d.Users = append(d.Users, u)
 	}
 	c.mu.RUnlock()
 
@@ -288,4 +306,44 @@ func generateKey() string {
 	b := make([]byte, 32)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// ── Users ─────────────────────────────────────────────────────────────────────
+
+func (c *Config) HasUsers() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.users) > 0
+}
+
+func (c *Config) GetUser(username string) (User, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	u, ok := c.users[username]
+	return u, ok
+}
+
+func (c *Config) AddUser(u User) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.users[u.Username]; exists {
+		return fmt.Errorf("user '%s' already exists", u.Username)
+	}
+	c.users[u.Username] = u
+	return nil
+}
+
+// ── Token revocation (in-memory) ─────────────────────────────────────────────
+
+func (c *Config) RevokeToken(token string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.revokedTokens[token] = struct{}{}
+}
+
+func (c *Config) IsTokenRevoked(token string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, revoked := c.revokedTokens[token]
+	return revoked
 }

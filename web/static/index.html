@@ -80,7 +80,7 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .lgi-dot.empty{background:var(--amber)}
 .lgi-dot.orphan{background:var(--txt3)}
 .chips{display:flex;gap:8px;flex-wrap:wrap}
-.chip{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;border-radius:99px;font-size:12.5px;font-weight:500;cursor:pointer;border:1px solid var(--line2);color:var(--txt2);background:var(--bg2);transition:all .15s}
+.chip{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:99px;font-size:12px;font-weight:500;cursor:pointer;border:1px solid var(--line2);color:var(--txt2);background:var(--bg2);transition:all .15s}
 .chip:hover{border-color:var(--accent);color:var(--accent)}
 .chip.active{background:var(--bld);border-color:var(--accent);color:var(--accent)}
 /* availability states */
@@ -95,7 +95,7 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .chip.no-backups .chip-dot{background:var(--amber)}
 .chip.orphan .chip-dot{background:var(--txt3)}
 /* chip count badge */
-.chip-cnt{font-family:var(--mono);font-size:9px;opacity:.7}
+.chip-cnt{font-family:var(--mono);font-size:9px;opacity:.65;min-width:0}
 
 /* ── BACKUP LIST (many items support) ── */
 .bk-list{display:flex;flex-direction:column}
@@ -177,6 +177,21 @@ select.fi{cursor:pointer}
 /* toast */
 #toasts{position:fixed;bottom:22px;right:22px;display:flex;flex-direction:column;gap:7px;z-index:200}
 .toast{background:var(--bg3);border:1px solid var(--line2);border-radius:var(--r);padding:11px 15px;font-size:13px;max-width:320px;display:flex;align-items:center;gap:9px;animation:tin .22s ease}
+/* ── Auth overlay ── */
+.auth-overlay{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:9999;padding:20px}
+.auth-card{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);padding:36px 40px;width:100%;max-width:380px;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+.auth-logo{display:flex;align-items:center;gap:10px;margin-bottom:28px}
+.auth-logo-icon{width:36px;height:36px;background:var(--accent);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px}
+.auth-title{font-size:18px;font-weight:600;color:var(--txt);margin-bottom:6px}
+.auth-sub{font-size:13px;color:var(--txt3);margin-bottom:24px}
+.auth-err{font-size:12.5px;color:var(--red);margin-bottom:12px;min-height:18px}
+.auth-field{margin-bottom:14px}
+.auth-field label{display:block;font-size:11.5px;font-weight:500;color:var(--txt2);margin-bottom:5px;font-family:var(--mono);letter-spacing:.5px;text-transform:uppercase}
+.auth-btn{width:100%;padding:10px;border-radius:var(--rs);background:var(--accent);color:#fff;border:none;font-size:14px;font-weight:600;cursor:pointer;transition:opacity .15s;margin-top:6px}
+.auth-btn:hover{opacity:.88}
+.auth-btn:active{opacity:.75}
+.user-badge{font-family:var(--mono);font-size:11px;color:var(--txt3);background:var(--bg3);border:1px solid var(--line);border-radius:var(--rs);padding:3px 8px;cursor:pointer}
+.user-badge:hover{color:var(--txt);border-color:var(--line2)}
 .toast.success{border-left:3px solid var(--green)}.toast.error{border-left:3px solid var(--red)}.toast.info{border-left:3px solid var(--accent)}.toast.warn{border-left:3px solid var(--amber)}
 @keyframes tin{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
 .view-hidden{display:none}
@@ -196,6 +211,49 @@ select.fi{cursor:pointer}
 </style>
 </head>
 <body>
+<!-- AUTH OVERLAY -->
+<div id="auth-overlay" class="auth-overlay" style="display:none">
+  <div class="auth-card">
+    <div class="auth-logo">
+      <div class="auth-logo-icon">⚡</div>
+      <span style="font-size:16px;font-weight:700;color:var(--txt)">PrestoBack</span>
+    </div>
+    <div id="auth-title" class="auth-title"></div>
+    <div id="auth-subtitle" class="auth-sub"></div>
+    <div id="auth-err" class="auth-err"></div>
+
+    <!-- First-run setup form -->
+    <div id="auth-setup-form">
+      <div class="auth-field">
+        <label>Username</label>
+        <input class="fi" id="setup-user" type="text" placeholder="admin" autocomplete="username" onkeydown="if(event.key==='Tab'&&!event.shiftKey){event.preventDefault();document.getElementById('setup-pass').focus()}">
+      </div>
+      <div class="auth-field">
+        <label>Password</label>
+        <input class="fi" id="setup-pass" type="password" placeholder="At least 8 characters" autocomplete="new-password">
+      </div>
+      <div class="auth-field">
+        <label>Confirm password</label>
+        <input class="fi" id="setup-pass2" type="password" placeholder="Repeat password" autocomplete="new-password" onkeydown="if(event.key==='Enter')doSetup()">
+      </div>
+      <button class="auth-btn" onclick="doSetup()">Create admin account →</button>
+    </div>
+
+    <!-- Login form -->
+    <div id="auth-login-form">
+      <div class="auth-field">
+        <label>Username</label>
+        <input class="fi" id="login-user" type="text" placeholder="admin" autocomplete="username" onkeydown="if(event.key==='Enter')document.getElementById('login-pass').focus()">
+      </div>
+      <div class="auth-field">
+        <label>Password</label>
+        <input class="fi" id="login-pass" type="password" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()">
+      </div>
+      <button class="auth-btn" onclick="doLogin()">Sign in →</button>
+    </div>
+  </div>
+</div>
+<!-- APP SHELL -->
 <div class="shell">
 <!-- SIDEBAR -->
 <aside class="sidebar">
@@ -233,7 +291,10 @@ select.fi{cursor:pointer}
   </nav>
   <div class="sidebar-foot">
     <div class="ver" id="ver-badge">v3.0.0</div>
-    <div class="upd-dot" id="upd-dot" title="Update available"></div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <div class="upd-dot" id="upd-dot" title="Update available"></div>
+      <span id="user-badge" class="user-badge" title="Click to log out" onclick="doLogout()" style="display:none"></span>
+    </div>
   </div>
 </aside>
 
@@ -399,10 +460,16 @@ select.fi{cursor:pointer}
 
 <!-- SECURITY -->
 <div id="view-sec" class="view-hidden">
-  <div class="ph"><div><div class="pt">Security</div><div class="ps">API key authentication</div></div></div>
+  <div class="ph"><div><div class="pt">Security</div><div class="ps">Authentication &amp; access</div></div></div>
   <div class="sec">
-    <div class="card"><div class="ch"><div class="ct">API Key</div></div><div class="cb">
-      <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">Every API request requires the <code>X-API-Key</code> header. The web UI sends it automatically once you're logged in.</div></div>
+    <div class="card"><div class="ch"><div class="ct">Session</div></div><div class="cb">
+      <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg><div class="info-t">Signed in as <strong id="sec-username">—</strong>. Sessions last 12 hours.</div></div>
+      <button class="btn btn-g btn-sm" style="margin-top:4px" onclick="doLogout()">Sign out</button>
+    </div></div>
+  </div>
+  <div class="sec">
+    <div class="card"><div class="ch"><div class="ct">API Key (for scripts &amp; automations)</div></div><div class="cb">
+      <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">Use the <code>X-API-Key</code> header for scripts and automations. The web UI uses JWT tokens — you only need this for direct API access.</div></div>
       <div class="fg"><label class="fl">Current API Key</label>
         <div class="code-b" id="api-key-display">Loading…
           <button class="btn btn-g btn-sm copy-btn" onclick="copyKey()">Copy</button>
@@ -411,7 +478,7 @@ select.fi{cursor:pointer}
       <div class="fg"><label class="fl">Use in curl:</label>
         <div class="code-b" id="curl-example" style="font-size:11px;color:var(--txt3)">curl -H "X-API-Key: &lt;key&gt;" http://your-pi:8765/api/status</div>
       </div>
-      <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">Regenerating the key will immediately invalidate the old one. Any scripts or integrations using the old key will stop working.</div></div>
+      <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">Regenerating invalidates the old key immediately and revokes all active browser sessions. You will be logged out.</div></div>
       <button class="btn btn-d btn-sm" onclick="regenKey()">⚠ Regenerate API Key</button>
     </div></div>
   </div>
@@ -598,6 +665,7 @@ select.fi{cursor:pointer}
 // ════════════════════ State ════════════════════
 const S = {
   apps:[], remotes:[], apiKey:'',
+  token:'', username:'', role:'',
   selAppID:null, bkAppID:null, rsAppID:null, rsID:null, pushID:null,
   editApp:null, addSchedOn:false, editSchedOn:false, editPinOn:false,
   notif:{},
@@ -609,15 +677,167 @@ const S = {
 };
 const VIEWS = ['dash','apps','bk','hist','rem','notif','sec','upd'];
 
+// ════════════════════ Auth ════════════════════
+function authHeader() {
+  if (S.token) return {'Authorization':'Bearer '+S.token};
+  if (S.apiKey) return {'X-API-Key':S.apiKey}; // legacy compat
+  return {};
+}
+
+function authSave(data) {
+  S.token = data.token || '';
+  S.username = data.username || '';
+  S.role = data.role || '';
+  if (S.token) {
+    localStorage.setItem('pb_token', S.token);
+    localStorage.setItem('pb_username', S.username);
+  }
+}
+
+function authClear() {
+  S.token=''; S.username=''; S.role=''; S.apiKey='';
+  localStorage.removeItem('pb_token');
+  localStorage.removeItem('pb_username');
+  localStorage.removeItem('pb_apikey');
+}
+
+async function checkAuthAndInit() {
+  // Restore session from storage
+  S.token = localStorage.getItem('pb_token') || '';
+  S.username = localStorage.getItem('pb_username') || '';
+  S.apiKey = localStorage.getItem('pb_apikey') || ''; // legacy
+
+  // Check if setup is needed (no users yet)
+  try {
+    const st = await fetch('/api/auth/status').then(r=>r.json());
+    if (st.setup_required) {
+      showAuthScreen('setup');
+      return;
+    }
+  } catch { /* server may be down */ }
+
+  // If we have a token, validate it
+  if (S.token) {
+    try {
+      const me = await fetch('/api/auth/me', {headers:{'Authorization':'Bearer '+S.token}});
+      if (me.ok) {
+        const d = await me.json();
+        S.username = d.username;
+        S.role = d.role;
+        hideAuthScreen();
+        loadAll();
+        connectSSE();
+        return;
+      }
+    } catch {}
+    // Token invalid/expired
+    authClear();
+  }
+
+  // Legacy API key
+  if (S.apiKey) {
+    try {
+      const res = await fetch('/api/apps', {headers:{'X-API-Key':S.apiKey}});
+      if (res.ok) {
+        hideAuthScreen();
+        loadAll();
+        connectSSE();
+        return;
+      }
+    } catch {}
+    authClear();
+  }
+
+  showAuthScreen('login');
+}
+
+function showAuthScreen(mode) {
+  document.getElementById('auth-overlay').style.display='flex';
+  document.getElementById('auth-setup-form').style.display = mode==='setup' ? '' : 'none';
+  document.getElementById('auth-login-form').style.display = mode==='login' ? '' : 'none';
+  if (mode==='setup') {
+    document.getElementById('auth-title').textContent = 'Welcome to PrestoBack';
+    document.getElementById('auth-subtitle').textContent = 'Create your admin account to get started.';
+  } else {
+    document.getElementById('auth-title').textContent = 'Sign in to PrestoBack';
+    document.getElementById('auth-subtitle').textContent = 'Enter your credentials to continue.';
+    setTimeout(()=>document.getElementById('login-user')?.focus(), 50);
+  }
+}
+
+function hideAuthScreen() {
+  document.getElementById('auth-overlay').style.display='none';
+  updateUserBadge();
+}
+
+function updateUserBadge() {
+  const el = document.getElementById('user-badge');
+  if (!el) return;
+  if (S.username && S.username !== 'api-key') {
+    el.textContent = S.username;
+    el.style.display='';
+  } else {
+    el.style.display='none';
+  }
+}
+
+async function doSetup() {
+  const u = document.getElementById('setup-user').value.trim();
+  const p = document.getElementById('setup-pass').value;
+  const p2 = document.getElementById('setup-pass2').value;
+  const err = document.getElementById('auth-err');
+  err.textContent='';
+  if (p !== p2) { err.textContent='Passwords do not match'; return; }
+  if (p.length < 8) { err.textContent='Password must be at least 8 characters'; return; }
+  try {
+    const r = await fetch('/api/auth/setup', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username:u, password:p})
+    });
+    const d = await r.json();
+    if (!r.ok) { err.textContent = d.error || 'Setup failed'; return; }
+    authSave(d);
+    hideAuthScreen();
+    loadAll();
+    connectSSE();
+    toast('Welcome, '+d.username+'! PrestoBack is ready.','success');
+  } catch(e) { err.textContent = e.message; }
+}
+
+async function doLogin() {
+  const u = document.getElementById('login-user').value.trim();
+  const p = document.getElementById('login-pass').value;
+  const err = document.getElementById('auth-err');
+  err.textContent='';
+  try {
+    const r = await fetch('/api/auth/login', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username:u, password:p})
+    });
+    const d = await r.json();
+    if (!r.ok) { err.textContent = d.error || 'Login failed'; return; }
+    authSave(d);
+    hideAuthScreen();
+    loadAll();
+    connectSSE();
+    toast('Welcome back, '+d.username,'success');
+  } catch(e) { err.textContent = e.message; }
+}
+
+async function doLogout() {
+  try {
+    await fetch('/api/auth/logout', {method:'POST', headers:authHeader()});
+  } catch {}
+  authClear();
+  showAuthScreen('login');
+  toast('Logged out','info');
+}
+
 // ════════════════════ Init ════════════════════
 document.addEventListener('DOMContentLoaded', () => {
-  S.apiKey = localStorage.getItem('pb_apikey') || '';
-  if (!S.apiKey) {
-    S.apiKey = prompt('Enter your PrestoBack API key (shown in container logs on first start):') || '';
-    if (S.apiKey) localStorage.setItem('pb_apikey', S.apiKey);
-  }
-  loadAll();
-  connectSSE();
+  checkAuthAndInit();
 });
 
 async function loadAll() {
@@ -635,6 +855,8 @@ async function loadStatus() {
     document.getElementById('api-key-display').childNodes[0].textContent = S.apiKey;
     document.getElementById('curl-example').textContent =
       'curl -H "X-API-Key: '+S.apiKey+'" http://your-pi:8765/api/status';
+    const secUser = document.getElementById('sec-username');
+    if (secUser) secUser.textContent = S.username || '—';
   } catch {}
 }
 
@@ -702,13 +924,13 @@ function V(name) {
 // ════════════════════ API helper ════════════════════
 async function api(url, opts={}) {
   const res = await fetch(url, {
-    headers: {'Content-Type':'application/json','X-API-Key':S.apiKey},
+    headers: {'Content-Type':'application/json', ...authHeader()},
     ...opts
   });
   if (res.status === 401) {
-    S.apiKey = prompt('API key rejected. Enter the correct API key:') || '';
-    localStorage.setItem('pb_apikey', S.apiKey);
-    throw new Error('unauthorized — please retry');
+    authClear();
+    showAuthScreen('login');
+    throw new Error('session expired — please log in again');
   }
   if (!res.ok) {
     const e = await res.json().catch(()=>({error:res.statusText}));
@@ -921,7 +1143,7 @@ async function renderChips() {
     else if (cnt === null) { cls = ''; }          // not yet checked → neutral
     else if (cnt > 0)     { cls = 'has-backups'; }
     else                  { cls = 'no-backups'; }
-    const cntLabel = cnt !== null ? `<span class="chip-cnt">${cnt}</span>` : '';
+    const cntLabel = (cnt !== null && cnt > 0) ? `<span class="chip-cnt">${cnt}</span>` : '';
     const dotHtml = cls ? `<span class="chip-dot"></span>` : '';
     return `<div class="chip ${cls} ${isActive?'active':''}" onclick="selApp('${item.id}','${esc(item.name)}')">${dotHtml}${esc(item.name)}${cntLabel}</div>`;
   }).join('');
@@ -1153,11 +1375,14 @@ async function testNotify() {
 // ════════════════════ Security ════════════════════
 function copyKey() { navigator.clipboard.writeText(S.apiKey); toast('API key copied','success'); }
 async function regenKey() {
-  if (!confirm('Regenerate API key? The current key will stop working immediately.')) return;
+  if (!confirm('Regenerate API key? The current key will stop working immediately and you will be logged out.')) return;
   try {
     const r=await api('/api/apikey/regenerate',{method:'POST'});
     S.apiKey=r.api_key; localStorage.setItem('pb_apikey',S.apiKey);
-    toast('New API key generated','success'); loadStatus();
+    toast('New API key generated — logging out','warn');
+    // All JWT tokens are now invalid (they were signed with old key)
+    authClear();
+    showAuthScreen('login');
   } catch(e) { toast(e.message,'error'); }
 }
 
@@ -1193,7 +1418,10 @@ async function applyUpdate() {
 
 // ════════════════════ SSE ════════════════════
 function connectSSE() {
-  const es=new EventSource('/api/events?api_key='+encodeURIComponent(S.apiKey));
+  const tokenParam = S.token ? encodeURIComponent(S.token) :
+                     S.apiKey ? encodeURIComponent(S.apiKey) : '';
+  const paramName  = S.token ? 'token' : 'api_key';
+  const es=new EventSource('/api/events?'+paramName+'='+tokenParam);
   es.onmessage=e=>{
     try {
       const u=JSON.parse(e.data);
