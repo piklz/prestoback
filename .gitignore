@@ -27,7 +27,6 @@ config.json.tmp
 
 # Go
 vendor/
-go.sum
 
 # macOS
 *.app
