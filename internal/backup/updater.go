@@ -10,7 +10,7 @@ import (
 
 // UpdateResult is sent over SSE during a self-update.
 type UpdateResult struct {
-	Stage   string `json:"stage"`   // pulling | draining | stopping | done | error
+	Stage   string `json:"stage"` // pulling | draining | stopping | done | error
 	Message string `json:"message"`
 	Error   string `json:"error,omitempty"`
 }
@@ -75,7 +75,7 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 	// captured the -p flags from the original container config.
 
 	stopCmd := fmt.Sprintf(
-		"sleep 3 && docker stop %s && docker rm %s && docker run -d %s && echo 'prestoback-update-ok'",
+		"sleep 3 && docker stop %s || true && docker rm %s || true && for i in 1 2 3; do docker run -d %s && break || sleep 2; done && echo 'prestoback-update-ok'",
 		selfName, selfName, flags,
 	)
 
@@ -83,18 +83,18 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 		"run", "--rm", "-d",
 		"--name", "prestoback-updater",
 		"-v", "/var/run/docker.sock:/var/run/docker.sock",
-		// docker:cli is a tiny image (<20 MB) with docker CLI pre-installed
-		"docker:cli",
+		// docker:27-cli is a small, multi-arch image with the Docker CLI pre-installed
+		"docker:27-cli",
 		"sh", "-c", stopCmd,
 	}
 
 	log.Printf("[updater] spawning helper: docker %s", strings.Join(helperArgs, " "))
 	out2, err := exec.Command("docker", helperArgs...).CombinedOutput()
 	if err != nil {
-		// Fallback: try with alpine + apk install in case docker:cli pull fails
-		log.Printf("[updater] docker:cli helper failed (%v), falling back to alpine", err)
+		// Fallback: try with alpine + apk install in case docker:27-cli pull fails
+		log.Printf("[updater] docker:27-cli helper failed (%v), falling back to alpine", err)
 		alpineStopCmd := fmt.Sprintf(
-			"apk add --no-cache docker-cli -q && sleep 3 && docker stop %s && docker rm %s && docker run -d %s && echo 'prestoback-update-ok'",
+			"apk add --no-cache docker-cli -q && sleep 3 && docker stop %s || true && docker rm %s || true && for i in 1 2 3; do docker run -d %s && break || sleep 2; done && echo 'prestoback-update-ok'",
 			selfName, selfName, flags,
 		)
 		alpineArgs := []string{
