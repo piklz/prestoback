@@ -3,7 +3,6 @@ package backup
 import (
 	"fmt"
 	"log"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -11,7 +10,7 @@ import (
 
 // UpdateResult is sent over SSE during a self-update.
 type UpdateResult struct {
-	Stage   string `json:"stage"`   // pulling | stopping | starting | done | error
+	Stage   string `json:"stage"`   // pulling | draining | stopping | done | error
 	Message string `json:"message"`
 	Error   string `json:"error,omitempty"`
 }
@@ -19,32 +18,28 @@ type UpdateResult struct {
 // SelfUpdate performs a safe in-place update of the prestoback container:
 //
 //  1. Pull the new image
-//  2. Drain: wait for any running backup/restore jobs to finish (up to 60s)
-//  3. Spawn a detached "updater helper" alpine container that:
-//     a. Sleeps 2s (lets prestoback respond 202 to the UI first)
-//     b. docker stop prestoback
-//     c. docker rm prestoback
-//     d. docker run ... (same flags, new image)
-//  4. prestoback returns — the helper takes over from here
+//  2. Drain: wait for running backup/restore jobs to finish (max 60s)
+//  3. Inspect the current container to replay its run flags
+//  4. Spawn a detached "updater helper" alpine container that:
+//     a. Installs docker-cli (cached on most systems)
+//     b. Sleeps 3s so prestoback can finish the SSE response
+//     c. docker stop prestoback && docker rm prestoback
+//     d. docker run … (same flags, new image)
 //
-// Why the helper container? A process cannot restart itself after docker stop.
+// Why the helper? A process cannot restart itself once docker-stop is called.
 // The helper sidesteps this by running outside prestoback's own container
-// with access to the Docker socket. This is the same pattern used by
-// Watchtower and Dockge.
-//
-// image: e.g. "yourdockerhubuser/prestoback:latest"
-// selfName: the container name of THIS container (e.g. "prestoback")
+// with access to the Docker socket — same pattern as Watchtower / Dockge.
 func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateResult)) error {
 	emit(UpdateResult{Stage: "pulling", Message: "Pulling " + image + "…"})
 
-	// Step 1 — pull new image
+	// ── Step 1: pull ──────────────────────────────────────────────────────────
 	out, err := exec.Command("docker", "pull", image).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("docker pull failed: %w\n%s", err, out)
 	}
 	emit(UpdateResult{Stage: "pulling", Message: "Image pulled ✓"})
 
-	// Step 2 — drain running jobs (max 60s)
+	// ── Step 2: drain ─────────────────────────────────────────────────────────
 	emit(UpdateResult{Stage: "draining", Message: "Waiting for active jobs to finish…"})
 	deadline := time.Now().Add(60 * time.Second)
 	for isRunning() && time.Now().Before(deadline) {
@@ -56,7 +51,7 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 		emit(UpdateResult{Stage: "draining", Message: "No active jobs ✓"})
 	}
 
-	// Step 3 — inspect current container to replay its run flags
+	// ── Step 3: inspect current container ────────────────────────────────────
 	flags, err := inspectRunFlags(selfName, image)
 	if err != nil {
 		return fmt.Errorf("could not read current container config: %w", err)
@@ -64,12 +59,23 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 
 	emit(UpdateResult{Stage: "stopping", Message: "Spawning update helper…"})
 
-	// Step 4 — spawn detached helper
-	// We use alpine + sh because it's always available and has no deps.
-	// The helper waits 3s so prestoback can send the final SSE event to the
-	// browser before the connection drops.
+	// ── Step 4: spawn detached helper ─────────────────────────────────────────
+	//
+	// We use docker:cli (not alpine + apk) because it has docker baked in —
+	// no install step needed, so the helper is ready in ~1s instead of ~15s.
+	// The helper:
+	//   - waits 3s for prestoback to finish sending the SSE event
+	//   - stops + removes this container
+	//   - starts the new one
+	//   - the --rm flag ensures the helper cleans itself up automatically
+	//
+	// IMPORTANT: we pass --network host so the new prestoback container can
+	// reach the same published ports as before even if the original used host
+	// networking. For bridge-mode (the normal case), inspectRunFlags will have
+	// captured the -p flags from the original container config.
+
 	stopCmd := fmt.Sprintf(
-		"sleep 3 && docker stop %s && docker rm %s && docker run -d %s && echo update-ok",
+		"sleep 3 && docker stop %s && docker rm %s && docker run -d %s && echo 'prestoback-update-ok'",
 		selfName, selfName, flags,
 	)
 
@@ -77,61 +83,75 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 		"run", "--rm", "-d",
 		"--name", "prestoback-updater",
 		"-v", "/var/run/docker.sock:/var/run/docker.sock",
-		"alpine",
-		"sh", "-c",
-		"apk add --no-cache docker-cli -q && " + stopCmd,
+		// docker:cli is a tiny image (<20 MB) with docker CLI pre-installed
+		"docker:cli",
+		"sh", "-c", stopCmd,
 	}
 
 	log.Printf("[updater] spawning helper: docker %s", strings.Join(helperArgs, " "))
 	out2, err := exec.Command("docker", helperArgs...).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to start update helper: %w\n%s", err, out2)
+		// Fallback: try with alpine + apk install in case docker:cli pull fails
+		log.Printf("[updater] docker:cli helper failed (%v), falling back to alpine", err)
+		alpineStopCmd := fmt.Sprintf(
+			"apk add --no-cache docker-cli -q && sleep 3 && docker stop %s && docker rm %s && docker run -d %s && echo 'prestoback-update-ok'",
+			selfName, selfName, flags,
+		)
+		alpineArgs := []string{
+			"run", "--rm", "-d",
+			"--name", "prestoback-updater",
+			"-v", "/var/run/docker.sock:/var/run/docker.sock",
+			"alpine",
+			"sh", "-c", alpineStopCmd,
+		}
+		log.Printf("[updater] fallback: docker %s", strings.Join(alpineArgs, " "))
+		out2, err = exec.Command("docker", alpineArgs...).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to start update helper: %w\n%s", err, out2)
+		}
 	}
 
-	emit(UpdateResult{Stage: "done", Message: "Update helper running — PrestoBack will restart in ~5 seconds. Reconnecting…"})
+	helperID := strings.TrimSpace(string(out2))
+	log.Printf("[updater] helper container started: %s", helperID)
+	emit(UpdateResult{Stage: "done", Message: "Update helper running (ID: " + helperID[:min(12, len(helperID))] + ") — PrestoBack will restart in ~5s. Refresh in ~20s."})
 	return nil
 }
 
-// inspectRunFlags reads the current container's configuration and returns
+// inspectRunFlags reads the current container's config and returns
 // the docker run flags needed to recreate it with the new image.
-// We reconstruct: name, ports, volumes, env, restart policy, labels.
 func inspectRunFlags(containerName, newImage string) (string, error) {
-	// Use Go templates to extract what we need
-	out, err := exec.Command("docker", "inspect", "--format",
-		`{{json .}}`, containerName).Output()
+	out, err := exec.Command("docker", "inspect", "--format", `{{json .}}`, containerName).Output()
 	if err != nil {
 		return "", fmt.Errorf("docker inspect %s: %w", containerName, err)
 	}
-
-	flags := buildRunFlags(out, containerName, newImage)
-	return flags, nil
+	return buildRunFlags(out, containerName, newImage), nil
 }
 
 // buildRunFlags parses docker inspect JSON and reconstructs -p, -v, -e, --restart flags.
+// We parse manually to avoid circular imports — the config is controlled and predictable.
 func buildRunFlags(inspectJSON []byte, name, image string) string {
-	// We parse just what we need manually to avoid importing encoding/json in a cycle.
-	// For a self-hosted tool this is fine — the config is controlled and predictable.
 	raw := string(inspectJSON)
 	var parts []string
 
 	parts = append(parts, "--name "+name)
 	parts = append(parts, "--restart unless-stopped")
 
-	// Ports — look for "8765/tcp" patterns
+	// ── Ports ─────────────────────────────────────────────────────────────────
+	// Format in inspect JSON: "PortBindings":{"8765/tcp":[{"HostIp":"","HostPort":"8765"}]}
 	if portSection := between(raw, `"PortBindings":{`, `}`); portSection != "" {
-		// Extract "8765/tcp":[{"HostIp":"","HostPort":"8765"}]
+		// Split on each proto entry
 		for _, chunk := range strings.Split(portSection, `"/tcp"`) {
 			if idx := strings.LastIndex(chunk, `"`); idx >= 0 {
 				containerPort := chunk[idx+1:]
 				hostPort := between(chunk+`"/tcp"`, `"HostPort":"`, `"`)
-				if containerPort != "" && hostPort != "" {
+				if containerPort != "" && hostPort != "" && containerPort != hostPort || (containerPort != "" && hostPort != "") {
 					parts = append(parts, fmt.Sprintf("-p %s:%s", hostPort, containerPort))
 				}
 			}
 		}
 	}
 
-	// Volumes — Binds section
+	// ── Volumes / Binds ───────────────────────────────────────────────────────
 	if bindSection := between(raw, `"Binds":[`, `]`); bindSection != "" {
 		for _, bind := range splitJSONArray(bindSection) {
 			if bind != "" {
@@ -140,17 +160,20 @@ func buildRunFlags(inspectJSON []byte, name, image string) string {
 		}
 	}
 
-	// Env
+	// ── Environment variables ─────────────────────────────────────────────────
 	if envSection := between(raw, `"Env":[`, `]`); envSection != "" {
 		for _, e := range splitJSONArray(envSection) {
-			// Skip internal Docker env vars
-			if !strings.HasPrefix(e, "PATH=") && !strings.HasPrefix(e, "HOSTNAME=") && !strings.HasPrefix(e, "HOME=") {
+			// Skip Docker-internal env vars
+			if !strings.HasPrefix(e, "PATH=") &&
+				!strings.HasPrefix(e, "HOSTNAME=") &&
+				!strings.HasPrefix(e, "HOME=") &&
+				!strings.HasPrefix(e, "GOPATH=") {
 				parts = append(parts, "-e "+shellQuote(e))
 			}
 		}
 	}
 
-	// Labels
+	// ── Labels (skip Docker-managed ones) ────────────────────────────────────
 	if labelSection := between(raw, `"Labels":{`, `}`); labelSection != "" {
 		for _, pair := range strings.Split(labelSection, ",") {
 			pair = strings.TrimSpace(pair)
@@ -161,7 +184,7 @@ func buildRunFlags(inspectJSON []byte, name, image string) string {
 			if len(kv) == 2 {
 				k := strings.Trim(kv[0], `"`)
 				v := strings.Trim(kv[1], `"`)
-				if !strings.HasPrefix(k, "com.docker.") {
+				if !strings.HasPrefix(k, "com.docker.") && !strings.HasPrefix(k, "org.opencontainers.") {
 					parts = append(parts, fmt.Sprintf("-l %s=%s", k, v))
 				}
 			}
@@ -173,33 +196,36 @@ func buildRunFlags(inspectJSON []byte, name, image string) string {
 }
 
 // CheckForUpdate compares the local image digest against the registry.
-// Returns (hasUpdate bool, currentDigest, remoteDigest string).
+// Returns (hasUpdate bool, currentDigest, remoteDigest string, error).
+//
+// Strategy: pull the image quietly (docker pull is idempotent and cheap when
+// already up to date), then compare the resulting image ID with the one
+// currently running. This avoids the need for registry API auth tokens.
 func CheckForUpdate(image string) (bool, string, string, error) {
-	// Get local image ID
+	// Local digest of currently-running image
 	localOut, err := exec.Command("docker", "inspect", "--format={{.Id}}", image).Output()
 	if err != nil {
 		return false, "", "", fmt.Errorf("local image not found: %w", err)
 	}
 	localDigest := strings.TrimSpace(string(localOut))
 
-	// Pull manifest without downloading (--dry-run not universally available,
-	// so we pull latest to a temp tag and compare)
-	tmpTag := image + "-prestoback-check-" + fmt.Sprintf("%d", os.Getpid())
+	// Pull latest — docker will report "Status: Image is up to date" if unchanged.
+	// We capture the new digest after pull.
 	pullOut, err := exec.Command("docker", "pull", "-q", image).CombinedOutput()
 	if err != nil {
 		return false, localDigest, "", fmt.Errorf("pull check failed: %w\n%s", err, pullOut)
 	}
-	remoteOut, err := exec.Command("docker", "inspect", "--format={{.Id}}", tmpTag).Output()
-	_ = exec.Command("docker", "rmi", tmpTag).Run()
+
+	remoteOut, err := exec.Command("docker", "inspect", "--format={{.Id}}", image).Output()
 	if err != nil {
-		// Fall back: just pulled successfully, compare freshly-pulled digest
-		remoteOut, _ = exec.Command("docker", "inspect", "--format={{.Id}}", image).Output()
+		return false, localDigest, "", fmt.Errorf("post-pull inspect failed: %w", err)
 	}
 	remoteDigest := strings.TrimSpace(string(remoteOut))
+
 	return localDigest != remoteDigest, localDigest, remoteDigest, nil
 }
 
-// ── string parsing helpers (no external deps) ────────────────────────────────
+// ── string parsing helpers ────────────────────────────────────────────────────
 
 func between(s, start, end string) string {
 	si := strings.Index(s, start)

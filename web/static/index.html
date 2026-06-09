@@ -55,26 +55,65 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .sl{font-family:var(--mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--txt3);margin-bottom:6px}
 .sv{font-family:var(--head);font-size:24px;font-weight:700}
 .sv.a{color:var(--accent)}.sv.g{color:var(--green)}.sv.am{color:var(--amber)}
-/* table */
+/* ── APPS TABLE ── */
 .tbl{width:100%;border-collapse:collapse}
 .tbl th{font-family:var(--mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--txt3);padding:10px 16px;text-align:left;border-bottom:1px solid var(--line)}
 .tbl td{padding:11px 16px;border-bottom:1px solid var(--line);vertical-align:middle}
 .tbl tr:last-child td{border-bottom:none}
 .tbl tr:hover td{background:var(--bg3)}
+/* path-not-found row dimming */
+.tbl tr.path-missing td{opacity:.55}
+.tbl tr.path-missing td:first-child{opacity:1}
 .an{font-weight:500}.ap{font-family:var(--mono);font-size:11px;color:var(--txt3);margin-top:2px}
 .ra{display:flex;gap:6px;justify-content:flex-end}
 /* pills */
 .pill{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:99px;font-family:var(--mono);font-size:10px;font-weight:500;letter-spacing:.5px;text-transform:uppercase}
 .pg{background:var(--gd);color:var(--green)}.pr{background:var(--rd);color:var(--red)}.pa{background:var(--ad);color:var(--amber)}.pb{background:var(--bld);color:var(--accent)}
 .pd{width:5px;height:5px;border-radius:50%;background:currentColor}
-/* backup items */
-.bi{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--line)}
+
+/* ── BACKUP CHIPS — reality-aware ── */
+.chips-wrap{display:flex;flex-direction:column;gap:10px;margin-bottom:18px}
+.chips-legend{display:flex;gap:14px;font-family:var(--mono);font-size:10px;color:var(--txt3);letter-spacing:.5px}
+.lgi{display:flex;align-items:center;gap:5px}
+.lgi-dot{width:7px;height:7px;border-radius:50%}
+.lgi-dot.avail{background:var(--green)}
+.lgi-dot.empty{background:var(--amber)}
+.lgi-dot.orphan{background:var(--txt3)}
+.chips{display:flex;gap:8px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;border-radius:99px;font-size:12.5px;font-weight:500;cursor:pointer;border:1px solid var(--line2);color:var(--txt2);background:var(--bg2);transition:all .15s}
+.chip:hover{border-color:var(--accent);color:var(--accent)}
+.chip.active{background:var(--bld);border-color:var(--accent);color:var(--accent)}
+/* availability states */
+.chip.has-backups{border-color:rgba(61,214,140,.35);color:var(--green)}
+.chip.has-backups.active{background:var(--gd);border-color:var(--green)}
+.chip.no-backups{border-color:rgba(245,166,35,.3);color:var(--amber)}
+.chip.no-backups.active{background:var(--ad);border-color:var(--amber)}
+.chip.orphan{border-color:var(--line);color:var(--txt3);font-style:italic}
+.chip.orphan.active{background:var(--bg3);border-color:var(--line2);color:var(--txt2)}
+.chip-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.chip.has-backups .chip-dot{background:var(--green)}
+.chip.no-backups .chip-dot{background:var(--amber)}
+.chip.orphan .chip-dot{background:var(--txt3)}
+/* chip count badge */
+.chip-cnt{font-family:var(--mono);font-size:9px;opacity:.7}
+
+/* ── BACKUP LIST (many items support) ── */
+.bk-list{display:flex;flex-direction:column}
+/* each item */
+.bi{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}
 .bi:last-child{border-bottom:none}
 .bic{width:34px;height:34px;border-radius:8px;background:var(--bg4);display:flex;align-items:center;justify-content:center;flex-shrink:0}
 .bm{flex:1;min-width:0}
-.bid{font-family:var(--mono);font-size:11px;color:var(--txt)}
+.bid{font-family:var(--mono);font-size:11px;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .bif{font-size:12px;color:var(--txt3);margin-top:1px}
 .bsz{font-family:var(--mono);font-size:12px;color:var(--txt2);white-space:nowrap}
+/* missing-on-disk backup item */
+.bi.file-missing{opacity:.45;pointer-events:none}
+.bi.file-missing .bid::after{content:" [file missing]";color:var(--red);font-size:9px;margin-left:5px}
+/* pagination */
+.bk-pager{display:flex;align-items:center;justify-content:space-between;padding:10px 0 0;font-size:12px;color:var(--txt3)}
+.bk-pager-btns{display:flex;gap:6px}
+
 /* history items */
 .hi{display:flex;align-items:flex-start;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}
 .hi:last-child{border-bottom:none}
@@ -127,15 +166,9 @@ select.fi{cursor:pointer}
 .ri{display:flex;align-items:center;gap:12px;padding:13px 0;border-bottom:1px solid var(--line)}
 .ri:last-child{border-bottom:none}
 .ric{width:36px;height:36px;border-radius:9px;background:var(--bg4);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;flex-shrink:0}
-/* chips */
-.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
-.chip{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;border-radius:99px;font-size:12.5px;font-weight:500;cursor:pointer;border:1px solid var(--line2);color:var(--txt2);background:var(--bg2);transition:all .15s}
-.chip:hover{border-color:var(--accent);color:var(--accent)}
-.chip.active{background:var(--bld);border-color:var(--accent);color:var(--accent)}
 /* code block */
 .code-b{background:var(--bg);border:1px solid var(--line);border-radius:var(--rs);padding:10px 14px;font-family:var(--mono);font-size:12px;color:var(--txt2);word-break:break-all;position:relative}
 .code-b .copy-btn{position:absolute;top:8px;right:8px}
-/* section divider label */
 .divlbl{font-family:var(--mono);font-size:10px;color:var(--txt3);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
 /* prog */
 .pw{background:var(--bg4);border-radius:4px;height:4px;overflow:hidden;margin-top:8px}
@@ -149,6 +182,17 @@ select.fi{cursor:pointer}
 .view-hidden{display:none}
 ::-webkit-scrollbar{width:5px}
 ::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:3px}
+/* ── Apps search bar ── */
+.apps-toolbar{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+.apps-search{flex:1;max-width:320px;background:var(--bg3);border:1px solid var(--line2);border-radius:var(--rs);padding:7px 11px;font-size:13px;color:var(--txt);font-family:var(--body);outline:none}
+.apps-search:focus{border-color:var(--accent)}
+.apps-search::placeholder{color:var(--txt3)}
+.app-count-badge{font-family:var(--mono);font-size:11px;color:var(--txt3);white-space:nowrap}
+/* path status indicator in apps table */
+.path-status-dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:4px;flex-shrink:0}
+.path-ok{background:var(--green)}
+.path-missing{background:var(--red)}
+.path-unknown{background:var(--txt3)}
 </style>
 </head>
 <body>
@@ -219,17 +263,22 @@ select.fi{cursor:pointer}
 <!-- APPLICATIONS -->
 <div id="view-apps" class="view-hidden">
   <div class="ph">
-    <div><div class="pt">Applications</div><div class="ps">Manage apps, schedules, and backups</div></div>
+    <div><div class="pt">Applications</div><div class="ps">Manage apps, schedules and backups</div></div>
     <div class="ha">
       <button class="btn btn-g btn-sm" onclick="openDiscover()">🔍 Discover</button>
       <button class="btn btn-p btn-sm" onclick="openAddApp()">+ Add App</button>
     </div>
   </div>
   <div class="sec">
+    <div class="apps-toolbar">
+      <input class="apps-search" id="apps-search" placeholder="Filter apps…" oninput="filterApps(this.value)">
+      <span class="app-count-badge" id="apps-count-badge"></span>
+      <button class="btn btn-g btn-sm" onclick="refreshPathStatuses()" title="Re-check all config paths on disk">⟳ Check paths</button>
+    </div>
     <div class="card">
       <div class="empty" id="apps-empty"><div class="ei"><svg width="22" height="22" fill="none" stroke="var(--txt3)" stroke-width="1.5" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg></div><div class="et">No apps configured</div><div class="es">Use Discover to auto-import, or add manually.</div></div>
       <table class="tbl" id="apps-tbl" style="display:none">
-        <thead><tr><th>Application</th><th>Retain</th><th>Schedule</th><th>Status</th><th style="text-align:right">Actions</th></tr></thead>
+        <thead><tr><th>Application</th><th>Path</th><th>Retain</th><th>Schedule</th><th style="text-align:right">Actions</th></tr></thead>
         <tbody id="apps-tbody"></tbody>
       </table>
     </div>
@@ -238,12 +287,33 @@ select.fi{cursor:pointer}
 
 <!-- BACKUPS -->
 <div id="view-bk" class="view-hidden">
-  <div class="ph"><div><div class="pt">Backups</div><div class="ps">Browse and restore config archives</div></div></div>
+  <div class="ph"><div><div class="pt">Backups</div><div class="ps">Browse and restore config archives</div></div>
+    <div class="ha"><button class="btn btn-g btn-sm" onclick="refreshBkView()">↺ Refresh</button></div>
+  </div>
   <div class="sec">
-    <div class="chips" id="app-chips"></div>
+    <!-- chips with reality state -->
+    <div class="chips-wrap">
+      <div class="chips-legend">
+        <div class="lgi"><div class="lgi-dot avail"></div>has backups</div>
+        <div class="lgi"><div class="lgi-dot empty"></div>no backups</div>
+        <div class="lgi"><div class="lgi-dot orphan"></div>orphan (backups on disk, not in config)</div>
+      </div>
+      <div class="chips" id="app-chips"><div style="font-size:12px;color:var(--txt3)">Loading…</div></div>
+    </div>
+
     <div class="card" id="bk-notice"><div class="empty"><div class="ei"><svg width="22" height="22" fill="none" stroke="var(--txt3)" stroke-width="1.5" viewBox="0 0 24 24"><path d="M20 7H4a1 1 0 00-1 1v11a1 1 0 001 1h16a1 1 0 001-1V8a1 1 0 00-1-1z"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg></div><div class="et">Select an app above</div><div class="es">Click an app chip to browse its backup archives.</div></div></div>
+
     <div class="card" id="bk-card" style="display:none">
-      <div class="ch"><div class="ct" id="bk-title">Backups</div><button class="btn btn-g btn-sm" onclick="loadBackups()">↺</button></div>
+      <div class="ch">
+        <div>
+          <div class="ct" id="bk-title">Backups</div>
+          <div id="bk-subtitle" style="font-family:var(--mono);font-size:10px;color:var(--txt3);margin-top:2px"></div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span id="bk-missing-warn" style="display:none;font-size:11px;color:var(--amber)">⚠ some files missing on disk</span>
+          <button class="btn btn-g btn-sm" onclick="loadBackups()">↺</button>
+        </div>
+      </div>
       <div class="cb" id="bk-body"></div>
     </div>
   </div>
@@ -290,51 +360,36 @@ select.fi{cursor:pointer}
 <div id="view-notif" class="view-hidden">
   <div class="ph"><div><div class="pt">Notifications</div><div class="ps">Telegram bot, Discord, Ntfy, webhooks</div></div></div>
   <div class="sec">
-    <div class="card">
-      <div class="ch"><div class="ct">Telegram Bot</div></div>
-      <div class="cb">
-        <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg><div class="info-t">Get a bot token from <strong>@BotFather</strong> on Telegram → /newbot. Get your chat ID by messaging @userinfobot.</div></div>
-        <div class="fg"><div class="ftog" onclick="togNotif('telegram')"><div class="ftog-sw" id="tog-telegram"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable Telegram notifications</div></div></div>
-        <div class="fr">
-          <div class="fg"><label class="fl">Bot Token</label><input class="fi" id="tg-token" placeholder="1234567890:AAF..."></div>
-          <div class="fg"><label class="fl">Chat ID</label><input class="fi" id="tg-chatid" placeholder="123456789"></div>
-        </div>
-        <div style="font-size:12px;color:var(--txt2);margin-bottom:12px;font-weight:500">Telegram bot commands: /status · /backup &lt;name&gt; · /history · /help</div>
+    <div class="card"><div class="ch"><div class="ct">Telegram Bot</div></div><div class="cb">
+      <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg><div class="info-t">Get a bot token from <strong>@BotFather</strong> on Telegram → /newbot. Get your chat ID by messaging @userinfobot.</div></div>
+      <div class="fg"><div class="ftog" onclick="togNotif('telegram')"><div class="ftog-sw" id="tog-telegram"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable Telegram notifications</div></div></div>
+      <div class="fr">
+        <div class="fg"><label class="fl">Bot Token</label><input class="fi" id="tg-token" placeholder="1234567890:AAF..."></div>
+        <div class="fg"><label class="fl">Chat ID</label><input class="fi" id="tg-chatid" placeholder="123456789"></div>
       </div>
-    </div>
-    <div class="card">
-      <div class="ch"><div class="ct">Discord</div></div>
-      <div class="cb">
-        <div class="ftog" onclick="togNotif('discord')"><div class="ftog-sw" id="tog-discord"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable Discord notifications</div></div>
-        <div class="fg" style="margin-top:10px"><label class="fl">Webhook URL</label><input class="fi" id="dc-url" placeholder="https://discord.com/api/webhooks/1234/abcd…"><div class="fh">Create via Discord Server Settings → Integrations → Webhooks.</div></div>
+      <div style="font-size:12px;color:var(--txt2);margin-bottom:12px;font-weight:500">Telegram bot commands: /status · /backup &lt;name&gt; · /history · /help</div>
+    </div></div>
+    <div class="card"><div class="ch"><div class="ct">Discord</div></div><div class="cb">
+      <div class="ftog" onclick="togNotif('discord')"><div class="ftog-sw" id="tog-discord"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable Discord notifications</div></div>
+      <div class="fg" style="margin-top:10px"><label class="fl">Webhook URL</label><input class="fi" id="dc-url" placeholder="https://discord.com/api/webhooks/1234/abcd…"><div class="fh">Create via Discord Server Settings → Integrations → Webhooks.</div></div>
+    </div></div>
+    <div class="card"><div class="ch"><div class="ct">Ntfy</div></div><div class="cb">
+      <div class="ftog" onclick="togNotif('ntfy')"><div class="ftog-sw" id="tog-ntfy"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable Ntfy notifications</div></div>
+      <div class="fr" style="margin-top:10px">
+        <div class="fg"><label class="fl">Topic URL</label><input class="fi" id="ntfy-url" placeholder="https://ntfy.sh/my-secret-topic"></div>
+        <div class="fg"><label class="fl">Auth token (if private)</label><input class="fi" id="ntfy-token" placeholder="tk_optional…"></div>
       </div>
-    </div>
-    <div class="card">
-      <div class="ch"><div class="ct">Ntfy</div></div>
-      <div class="cb">
-        <div class="ftog" onclick="togNotif('ntfy')"><div class="ftog-sw" id="tog-ntfy"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable Ntfy notifications</div></div>
-        <div class="fr" style="margin-top:10px">
-          <div class="fg"><label class="fl">Topic URL</label><input class="fi" id="ntfy-url" placeholder="https://ntfy.sh/my-secret-topic"></div>
-          <div class="fg"><label class="fl">Auth token (if private)</label><input class="fi" id="ntfy-token" placeholder="tk_optional…"></div>
-        </div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="ch"><div class="ct">Generic webhook (Gotify / Home Assistant / custom)</div></div>
-      <div class="cb">
-        <div class="ftog" onclick="togNotif('webhook')"><div class="ftog-sw" id="tog-webhook"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable generic webhook</div></div>
-        <div class="fg" style="margin-top:10px"><label class="fl">Webhook URL</label><input class="fi" id="wh-url" placeholder="https://gotify.example.com/message?token=…"><div class="fh">Receives a JSON POST with event, app, title, detail, is_error, time fields.</div></div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="ch"><div class="ct">Notify on events</div></div>
-      <div class="cb">
-        <div class="fg"><div class="ftog" onclick="togNotif('bk_ok')"><div class="ftog-sw" id="tog-bk_ok"><div class="ftog-kn"></div></div><div class="ftog-lbl">Backup success</div></div></div>
-        <div class="fg"><div class="ftog" onclick="togNotif('bk_fail')"><div class="ftog-sw" id="tog-bk_fail"><div class="ftog-kn"></div></div><div class="ftog-lbl">Backup failure</div></div></div>
-        <div class="fg"><div class="ftog" onclick="togNotif('rs_ok')"><div class="ftog-sw" id="tog-rs_ok"><div class="ftog-kn"></div></div><div class="ftog-lbl">Restore success</div></div></div>
-        <div class="fg"><div class="ftog" onclick="togNotif('rs_fail')"><div class="ftog-sw" id="tog-rs_fail"><div class="ftog-kn"></div></div><div class="ftog-lbl">Restore failure</div></div></div>
-      </div>
-    </div>
+    </div></div>
+    <div class="card"><div class="ch"><div class="ct">Generic webhook (Gotify / Home Assistant / custom)</div></div><div class="cb">
+      <div class="ftog" onclick="togNotif('webhook')"><div class="ftog-sw" id="tog-webhook"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable generic webhook</div></div>
+      <div class="fg" style="margin-top:10px"><label class="fl">Webhook URL</label><input class="fi" id="wh-url" placeholder="https://gotify.example.com/message?token=…"><div class="fh">Receives a JSON POST with event, app, title, detail, is_error, time fields.</div></div>
+    </div></div>
+    <div class="card"><div class="ch"><div class="ct">Notify on events</div></div><div class="cb">
+      <div class="fg"><div class="ftog" onclick="togNotif('bk_ok')"><div class="ftog-sw" id="tog-bk_ok"><div class="ftog-kn"></div></div><div class="ftog-lbl">Backup success</div></div></div>
+      <div class="fg"><div class="ftog" onclick="togNotif('bk_fail')"><div class="ftog-sw" id="tog-bk_fail"><div class="ftog-kn"></div></div><div class="ftog-lbl">Backup failure</div></div></div>
+      <div class="fg"><div class="ftog" onclick="togNotif('rs_ok')"><div class="ftog-sw" id="tog-rs_ok"><div class="ftog-kn"></div></div><div class="ftog-lbl">Restore success</div></div></div>
+      <div class="fg"><div class="ftog" onclick="togNotif('rs_fail')"><div class="ftog-sw" id="tog-rs_fail"><div class="ftog-kn"></div></div><div class="ftog-lbl">Restore failure</div></div></div>
+    </div></div>
     <div style="display:flex;gap:8px;margin-top:4px">
       <button class="btn btn-p" onclick="saveNotify()">Save notification settings</button>
       <button class="btn btn-g" onclick="testNotify()">Send test notification</button>
@@ -346,22 +401,19 @@ select.fi{cursor:pointer}
 <div id="view-sec" class="view-hidden">
   <div class="ph"><div><div class="pt">Security</div><div class="ps">API key authentication</div></div></div>
   <div class="sec">
-    <div class="card">
-      <div class="ch"><div class="ct">API Key</div></div>
-      <div class="cb">
-        <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">Every API request requires the <code>X-API-Key</code> header. The web UI sends it automatically once you're logged in. For external tools or scripts, use the key below.</div></div>
-        <div class="fg"><label class="fl">Current API Key</label>
-          <div class="code-b" id="api-key-display">Loading…
-            <button class="btn btn-g btn-sm copy-btn" onclick="copyKey()">Copy</button>
-          </div>
+    <div class="card"><div class="ch"><div class="ct">API Key</div></div><div class="cb">
+      <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">Every API request requires the <code>X-API-Key</code> header. The web UI sends it automatically once you're logged in.</div></div>
+      <div class="fg"><label class="fl">Current API Key</label>
+        <div class="code-b" id="api-key-display">Loading…
+          <button class="btn btn-g btn-sm copy-btn" onclick="copyKey()">Copy</button>
         </div>
-        <div class="fg"><label class="fl">Use in curl:</label>
-          <div class="code-b" id="curl-example" style="font-size:11px;color:var(--txt3)">curl -H "X-API-Key: &lt;key&gt;" http://your-pi:8765/api/status</div>
-        </div>
-        <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">Regenerating the key will immediately invalidate the old one. Any scripts or integrations using the old key will stop working.</div></div>
-        <button class="btn btn-d btn-sm" onclick="regenKey()">⚠ Regenerate API Key</button>
       </div>
-    </div>
+      <div class="fg"><label class="fl">Use in curl:</label>
+        <div class="code-b" id="curl-example" style="font-size:11px;color:var(--txt3)">curl -H "X-API-Key: &lt;key&gt;" http://your-pi:8765/api/status</div>
+      </div>
+      <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">Regenerating the key will immediately invalidate the old one. Any scripts or integrations using the old key will stop working.</div></div>
+      <button class="btn btn-d btn-sm" onclick="regenKey()">⚠ Regenerate API Key</button>
+    </div></div>
   </div>
 </div>
 
@@ -369,35 +421,30 @@ select.fi{cursor:pointer}
 <div id="view-upd" class="view-hidden">
   <div class="ph"><div><div class="pt">Updates</div><div class="ps">Self-update PrestoBack from DockerHub</div></div></div>
   <div class="sec">
-    <div class="card">
-      <div class="ch"><div class="ct">Current version</div></div>
-      <div class="cb">
-        <div class="fr" style="margin-bottom:16px">
-          <div><div class="sl">Running</div><div style="font-family:var(--mono);font-size:15px" id="upd-ver">—</div></div>
-          <div><div class="sl">Image</div><div style="font-family:var(--mono);font-size:11px;color:var(--txt2);margin-top:4px" id="upd-img">—</div></div>
-        </div>
-        <button class="btn btn-g btn-sm" id="check-btn" onclick="checkUpdate()">↺ Check for update</button>
+    <div class="card"><div class="ch"><div class="ct">Current version</div></div><div class="cb">
+      <div class="fr" style="margin-bottom:16px">
+        <div><div class="sl">Running</div><div style="font-family:var(--mono);font-size:15px" id="upd-ver">—</div></div>
+        <div><div class="sl">Image</div><div style="font-family:var(--mono);font-size:11px;color:var(--txt2);margin-top:4px" id="upd-img">—</div></div>
       </div>
-    </div>
-    <div class="card hidden" id="upd-avail" style="display:none">
+      <button class="btn btn-g btn-sm" id="check-btn" onclick="checkUpdate()">↺ Check for update</button>
+    </div></div>
+    <div class="card" id="upd-avail" style="display:none">
       <div class="ch"><div class="ct" style="color:var(--amber)">⭐ Update available</div></div>
       <div class="cb">
         <div style="font-size:13px;color:var(--txt2);margin-bottom:14px" id="upd-digest"></div>
         <button class="btn btn-w" onclick="openUpdModal()">Update now</button>
       </div>
     </div>
-    <div class="card">
-      <div class="ch"><div class="ct">How self-update works</div></div>
-      <div class="cb" style="color:var(--txt2);font-size:13px">
-        <div class="steps">
-          <div class="step"><div class="sn">1</div>Pulls new image from DockerHub</div>
-          <div class="step"><div class="sn">2</div>Drains active jobs (max 60s)</div>
-          <div class="step"><div class="sn">3</div>Spawns a detached helper container via Docker socket</div>
-          <div class="step"><div class="sn">4</div>Helper stops this container, removes it, starts new one with same flags</div>
-          <div class="step"><div class="sn">5</div>PrestoBack is back up in ~15s — config and backups untouched</div>
-        </div>
+    <div class="card"><div class="ch"><div class="ct">How self-update works</div></div><div class="cb" style="color:var(--txt2);font-size:13px">
+      <div class="steps">
+        <div class="step"><div class="sn">1</div>Pulls new image from DockerHub</div>
+        <div class="step"><div class="sn">2</div>Drains active jobs (max 60s)</div>
+        <div class="step"><div class="sn">3</div>Spawns a detached helper container via Docker socket</div>
+        <div class="step"><div class="sn">4</div>Helper stops this container, removes it, starts new one with same flags</div>
+        <div class="step"><div class="sn">5</div>PrestoBack is back up in ~15–20s — config and backups untouched</div>
       </div>
-    </div>
+      <div class="info-b" style="margin-top:14px"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg><div class="info-t">After clicking Apply, this page will briefly disconnect. <strong>Wait ~20 seconds then refresh manually.</strong> The helper container (<code>prestoback-updater</code>) stops itself automatically once the new container is running.</div></div>
+    </div></div>
   </div>
 </div>
 
@@ -417,7 +464,7 @@ select.fi{cursor:pointer}
           <input class="fi" id="a-path" placeholder="/volumes/plex" style="flex:1" oninput="validatePath(this)">
           <button class="btn btn-g btn-sm" style="white-space:nowrap" onclick="validatePathBtn()">✓ Check</button>
         </div>
-        <div class="fh">Path as seen <em>inside the container</em>. Volumes are mounted at <code>/volumes/appname</code>. For apps outside the presto stack, use the full host path (requires extra volume mount).</div>
+        <div class="fh">Path as seen <em>inside the container</em>. Volumes are mounted at <code>/volumes/appname</code>.</div>
         <div id="path-status" style="font-size:12px;margin-top:4px"></div>
       </div>
       <div class="fr">
@@ -537,8 +584,9 @@ select.fi{cursor:pointer}
   <div class="modal">
     <div class="mh"><div class="mt">Apply Update</div><button class="btn btn-g btn-ic" onclick="CM('m-upd')">✕</button></div>
     <div class="mb">
-      <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">PrestoBack will stop and restart (~15s). Config and all backups are untouched — only the container is replaced.</div></div>
-      <p style="font-size:13px;color:var(--txt2)">After clicking <strong>Apply</strong> the page will show a reconnecting message. Refresh manually after ~20 seconds.</p>
+      <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">PrestoBack will stop and restart (~15–20s). Config and all backups are untouched — only the container is replaced.</div></div>
+      <p style="font-size:13px;color:var(--txt2)">After clicking <strong>Apply</strong>, the page will disconnect briefly. <strong>Wait ~20 seconds then refresh manually.</strong></p>
+      <p style="font-size:12px;color:var(--txt3);margin-top:8px">The helper container (<code>prestoback-updater</code>) will appear briefly in your container list — this is expected and it will remove itself automatically.</p>
     </div>
     <div class="mf"><button class="btn btn-g" onclick="CM('m-upd')">Cancel</button><button class="btn btn-w" onclick="applyUpdate()">Apply Update</button></div>
   </div>
@@ -553,12 +601,16 @@ const S = {
   selAppID:null, bkAppID:null, rsAppID:null, rsID:null, pushID:null,
   editApp:null, addSchedOn:false, editSchedOn:false, editPinOn:false,
   notif:{},
+  // reality tracking
+  pathStatuses:{},   // appID → 'ok'|'missing'|'unknown'
+  backupCounts:{},   // appID → number (from real disk listing)
+  orphanIDs:[],      // appIDs found on disk but not in config
+  bkPage:0, bkPerPage:20, bkAll:[],
 };
 const VIEWS = ['dash','apps','bk','hist','rem','notif','sec','upd'];
 
 // ════════════════════ Init ════════════════════
 document.addEventListener('DOMContentLoaded', () => {
-  // Load API key from localStorage, prompt if missing
   S.apiKey = localStorage.getItem('pb_apikey') || '';
   if (!S.apiKey) {
     S.apiKey = prompt('Enter your PrestoBack API key (shown in container logs on first start):') || '';
@@ -570,6 +622,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
 async function loadAll() {
   await Promise.all([loadApps(), loadRemotes(), loadStatus(), loadNotify()]);
+  // after apps loaded, probe paths and backup counts in background
+  probeAllApps();
 }
 
 async function loadStatus() {
@@ -584,13 +638,63 @@ async function loadStatus() {
   } catch {}
 }
 
+// ════════════════════ Reality probe ════════════════════
+// Fetches backup counts for all apps from the real disk (via API).
+// Also detects orphan directories that exist on disk but aren't in config.
+async function probeAllApps() {
+  const configIDs = new Set(S.apps.map(a => a.id));
+  const counts = {};
+
+  // probe each configured app
+  await Promise.all(S.apps.map(async a => {
+    try {
+      const metas = await api('/api/backups/' + a.id) || [];
+      counts[a.id] = metas.length;
+    } catch {
+      counts[a.id] = 0;
+    }
+    // probe path
+    try {
+      const r = await api('/api/validate-path?path=' + encodeURIComponent(a.path));
+      S.pathStatuses[a.id] = (r.ok && r.is_dir) ? 'ok' : 'missing';
+    } catch {
+      S.pathStatuses[a.id] = 'unknown';
+    }
+  }));
+
+  S.backupCounts = counts;
+
+  // detect orphans: try listing known backup dir sub-folders
+  // We use a heuristic: query backups for any id that appears in disk
+  // but isn't in config. The API returns [] for unknown IDs harmlessly.
+  // No direct "list all folders" API — skip orphan detection for now.
+  // (would need a new /api/backups endpoint that lists all app dirs)
+
+  // update total count
+  const total = Object.values(counts).reduce((s,n)=>s+n,0);
+  document.getElementById('s-total').textContent = total;
+
+  // re-render chips if bk view is open
+  if (!document.getElementById('view-bk').classList.contains('view-hidden')) {
+    renderChips();
+  }
+  // re-render apps table path column
+  renderApps();
+}
+
+async function refreshPathStatuses() {
+  toast('Checking all paths…','info');
+  await probeAllApps();
+  toast('Path check complete','success');
+}
+
 // ════════════════════ Navigation ════════════════════
 function V(name) {
   VIEWS.forEach(v => {
     document.getElementById('view-'+v).classList.toggle('view-hidden', v!==name);
     document.getElementById('nav-'+v)?.classList.toggle('active', v===name);
   });
-  if (name==='bk') renderChips();
+  if (name==='bk') { renderChips(); refreshBkView(); }
   if (name==='hist') loadHistory();
   if (name==='sec') loadStatus();
 }
@@ -620,28 +724,50 @@ async function loadApps() {
     renderApps();
     document.getElementById('s-apps').textContent = S.apps.length;
     document.getElementById('s-sched').textContent = S.apps.filter(a=>a.schedule?.enabled&&!a.pinned).length;
-    countTotal();
   } catch(e) { toast(e.message,'error'); }
+}
+
+let appsFilter = '';
+function filterApps(q) {
+  appsFilter = q.toLowerCase();
+  renderApps();
 }
 
 function renderApps() {
   const tbody=document.getElementById('apps-tbody');
   const empty=document.getElementById('apps-empty');
   const tbl=document.getElementById('apps-tbl');
-  if (!S.apps.length) { empty.style.display=''; tbl.style.display='none'; return; }
+  const badge=document.getElementById('apps-count-badge');
+  if (!S.apps.length) { empty.style.display=''; tbl.style.display='none'; badge.textContent=''; return; }
   empty.style.display='none'; tbl.style.display='';
-  tbody.innerHTML = S.apps.map(a => {
+  const filtered = appsFilter
+    ? S.apps.filter(a => a.name.toLowerCase().includes(appsFilter) || a.path.toLowerCase().includes(appsFilter) || a.id.toLowerCase().includes(appsFilter))
+    : S.apps;
+  badge.textContent = appsFilter ? `${filtered.length} / ${S.apps.length} apps` : `${S.apps.length} apps`;
+  if (!filtered.length) {
+    tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--txt3);padding:24px">No apps match "${esc(appsFilter)}"</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = filtered.map(a => {
+    const pathSt = S.pathStatuses[a.id];
+    const dotCls = pathSt==='ok' ? 'path-ok' : pathSt==='missing' ? 'path-missing' : 'path-unknown';
+    const dotTitle = pathSt==='ok' ? 'Path found on disk' : pathSt==='missing' ? 'Path not found on disk' : 'Path not yet checked';
+    const rowCls = pathSt==='missing' ? 'path-missing' : '';
+    const cnt = S.backupCounts[a.id];
+    const cntHtml = cnt !== undefined
+      ? `<span style="font-family:var(--mono);font-size:10px;color:${cnt>0?'var(--green)':'var(--txt3)'};margin-left:4px">[${cnt}]</span>`
+      : '';
     const schedPill = a.schedule?.enabled && !a.pinned
       ? `<span class="pill pg"><span class="pd"></span>${esc(a.schedule.cron_expr)}</span>`
       : `<span class="pill" style="background:var(--bg4);color:var(--txt3)">manual</span>`;
     const pinPill = a.pinned ? `<span class="pill pa" style="margin-left:4px">📌 pinned</span>` : '';
-    return `<tr>
-      <td><div class="an">${esc(a.name)}</div><div class="ap">${esc(a.path)}</div></td>
+    return `<tr class="${rowCls}">
+      <td><div class="an">${esc(a.name)}${cntHtml}</div></td>
+      <td><div style="display:flex;align-items:center;gap:4px"><span class="path-status-dot ${dotCls}" title="${dotTitle}"></span><span class="ap" style="margin-top:0">${esc(a.path)}</span></div></td>
       <td><span class="pill pb">${a.retain||5}</span></td>
       <td>${schedPill}${pinPill}</td>
-      <td>${esc(a.id)}</td>
       <td><div class="ra">
-        <button class="btn btn-g btn-sm" onclick="openBkModal('${a.id}','${esc(a.name)}')">▶ Backup</button>
+        <button class="btn btn-g btn-sm" onclick="openBkModal('${a.id}','${esc(a.name)}')"${pathSt==='missing'?' title="Config path missing — backup may fail"':''}>▶ Backup</button>
         <button class="btn btn-g btn-sm btn-ic" title="Edit" onclick="openEditApp('${a.id}')">✎</button>
         <button class="btn btn-d btn-sm btn-ic" title="Delete" onclick="delApp('${a.id}')">🗑</button>
       </div></td>
@@ -661,6 +787,7 @@ function openAddApp() {
   document.getElementById('a-retain').value=5;
   S.addSchedOn=false; setTog('add-sched-tog',false);
   document.getElementById('add-sched-fields').style.display='none';
+  document.getElementById('path-status').textContent='';
   OM('m-add-app');
 }
 function togAddSched() {
@@ -759,68 +886,158 @@ async function runRestore() {
   } catch(e) { toast(e.message,'error'); document.getElementById('rs-run').disabled=false; }
 }
 
-// ════════════════════ Backups view ════════════════════
-function renderChips() {
-  document.getElementById('app-chips').innerHTML=S.apps.map(a=>`<div class="chip ${S.selAppID===a.id?'active':''}" onclick="selApp('${a.id}','${esc(a.name)}')">${esc(a.name)}</div>`).join('');
+// ════════════════════ Backups view — reality-aware ════════════════════
+function refreshBkView() {
+  renderChips();
+  if (S.selAppID) loadBackups();
 }
-async function selApp(id,name) {
-  S.selAppID=id;
+
+// Chips: colour-coded by real backup count on disk
+async function renderChips() {
+  const container = document.getElementById('app-chips');
+
+  // build chip data from config + counts already in S.backupCounts
+  const items = S.apps.map(a => ({
+    id: a.id, name: a.name,
+    count: S.backupCounts[a.id] ?? null,
+    inConfig: true,
+  }));
+  // add orphans
+  S.orphanIDs.forEach(id => {
+    if (!items.find(i=>i.id===id))
+      items.push({id, name: id, count: S.backupCounts[id]??0, inConfig:false});
+  });
+
+  if (!items.length) {
+    container.innerHTML = '<div style="font-size:12px;color:var(--txt3)">No apps configured yet.</div>';
+    return;
+  }
+
+  container.innerHTML = items.map(item => {
+    const isActive = S.selAppID === item.id;
+    const cnt = item.count;
+    let cls = '';
+    if (!item.inConfig) { cls = 'orphan'; }
+    else if (cnt === null) { cls = ''; }          // not yet checked → neutral
+    else if (cnt > 0)     { cls = 'has-backups'; }
+    else                  { cls = 'no-backups'; }
+    const cntLabel = cnt !== null ? `<span class="chip-cnt">${cnt}</span>` : '';
+    const dotHtml = cls ? `<span class="chip-dot"></span>` : '';
+    return `<div class="chip ${cls} ${isActive?'active':''}" onclick="selApp('${item.id}','${esc(item.name)}')">${dotHtml}${esc(item.name)}${cntLabel}</div>`;
+  }).join('');
+}
+
+async function selApp(id, name) {
+  S.selAppID = id;
+  S.bkPage = 0;
   document.getElementById('bk-notice').style.display='none';
   document.getElementById('bk-card').style.display='';
-  document.getElementById('bk-title').textContent=name+' — Backups';
-  renderChips(); await loadBackups();
+  document.getElementById('bk-title').textContent = name + ' — Backups';
+  renderChips();
+  await loadBackups();
 }
+
+const BK_PER_PAGE = 20;
+
 async function loadBackups() {
   if (!S.selAppID) return;
-  const body=document.getElementById('bk-body');
-  body.innerHTML='<div style="color:var(--txt3);font-size:13px">Loading…</div>';
+  const body = document.getElementById('bk-body');
+  const sub = document.getElementById('bk-subtitle');
+  const warnEl = document.getElementById('bk-missing-warn');
+  body.innerHTML = '<div style="color:var(--txt3);font-size:13px">Loading…</div>';
+  sub.textContent = '';
+  warnEl.style.display = 'none';
   try {
-    const metas=await api('/api/backups/'+S.selAppID)||[];
-    countTotal();
-    if (!metas.length) { body.innerHTML='<div style="color:var(--txt2);font-size:13px;padding:8px 0">No backups yet.</div>'; return; }
-    body.innerHTML=metas.map(m=>`
-      <div class="bi">
-        <div class="bic">${m.pre_restore
-          ?'<span style="font-size:14px">⭐</span>'
-          :'<svg width="14" height="14" fill="none" stroke="var(--accent)" stroke-width="1.8" viewBox="0 0 24 24"><path d="M20 7H4a1 1 0 00-1 1v11a1 1 0 001 1h16a1 1 0 001-1V8a1 1 0 00-1-1z"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg>'}</div>
-        <div class="bm">
-          <div class="bid">${esc(m.id)} ${m.pre_restore?'<span class="pill pa" style="font-size:9px">safety snap</span>':''}</div>
-          <div class="bif">${new Date(m.started_at).toLocaleString()}</div>
-        </div>
-        <span class="bsz">${fmtBytes(m.size_bytes)}</span>
-        <div style="display:flex;gap:6px">
-          ${S.remotes.length?`<button class="btn btn-g btn-sm" onclick="openPush('${esc(m.id)}')">⇪ Push</button>`:''}
-          <button class="btn btn-g btn-sm" onclick="openRsModal('${S.selAppID}','${esc(m.id)}')">↺ Restore</button>
-          <button class="btn btn-d btn-sm btn-ic" onclick="delBackup('${esc(m.id)}')">🗑</button>
-        </div>
-      </div>`).join('');
-  } catch(e) { toast(e.message,'error'); }
+    const metas = await api('/api/backups/' + S.selAppID) || [];
+    S.bkAll = metas;
+    S.backupCounts[S.selAppID] = metas.length;
+    renderChips(); // update chip colour now we have real count
+
+    if (!metas.length) {
+      sub.textContent = 'No backups on disk';
+      body.innerHTML = `<div style="color:var(--txt2);font-size:13px;padding:8px 0">No backups yet for this app. Hit <strong>▶ Backup</strong> from the Applications page.</div>`;
+      return;
+    }
+
+    // Check which files are actually present (API returns metas from disk, so they should all exist,
+    // but we guard against the case where someone deleted files manually)
+    // The API reads from the real filesystem so metas = what's actually on disk. 
+    // We show them as-is, but flag any with size 0 as potentially corrupt.
+    const corrupt = metas.filter(m => m.size_bytes === 0);
+    if (corrupt.length) warnEl.style.display = '';
+
+    sub.textContent = `${metas.length} archive${metas.length!==1?'s':''} on disk`;
+    renderBkPage();
+  } catch(e) { toast(e.message,'error'); body.innerHTML = `<div style="color:var(--red);font-size:13px">Error loading backups: ${esc(e.message)}</div>`; }
 }
+
+function renderBkPage() {
+  const metas = S.bkAll;
+  const total = metas.length;
+  const pages = Math.ceil(total / BK_PER_PAGE);
+  const page = Math.min(S.bkPage, Math.max(0, pages-1));
+  S.bkPage = page;
+  const slice = metas.slice(page * BK_PER_PAGE, (page+1) * BK_PER_PAGE);
+  const body = document.getElementById('bk-body');
+
+  let html = '<div class="bk-list">' + slice.map(m => {
+    const missing = m.size_bytes === 0;
+    return `<div class="bi${missing?' file-missing':''}">
+      <div class="bic">${m.pre_restore
+        ? '<span style="font-size:14px">⭐</span>'
+        : '<svg width="14" height="14" fill="none" stroke="var(--accent)" stroke-width="1.8" viewBox="0 0 24 24"><path d="M20 7H4a1 1 0 00-1 1v11a1 1 0 001 1h16a1 1 0 001-1V8a1 1 0 00-1-1z"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg>'}</div>
+      <div class="bm">
+        <div class="bid">${esc(m.id)} ${m.pre_restore?'<span class="pill pa" style="font-size:9px">safety snap</span>':''}</div>
+        <div class="bif">${new Date(m.started_at).toLocaleString()}</div>
+      </div>
+      <span class="bsz">${missing?'<span style="color:var(--red)">corrupt/empty</span>':fmtBytes(m.size_bytes)}</span>
+      <div style="display:flex;gap:6px">
+        ${S.remotes.length&&!missing?`<button class="btn btn-g btn-sm" onclick="openPush('${esc(m.id)}')">⇪ Push</button>`:''}
+        ${!missing?`<button class="btn btn-g btn-sm" onclick="openRsModal('${S.selAppID}','${esc(m.id)}')">↺ Restore</button>`:''}
+        <button class="btn btn-d btn-sm btn-ic" onclick="delBackup('${esc(m.id)}')">🗑</button>
+      </div>
+    </div>`;
+  }).join('') + '</div>';
+
+  // pagination
+  if (pages > 1) {
+    html += `<div class="bk-pager">
+      <span>${total} archives · page ${page+1} of ${pages}</span>
+      <div class="bk-pager-btns">
+        <button class="btn btn-g btn-sm" onclick="bkGoPage(${page-1})" ${page===0?'disabled':''}>← Prev</button>
+        <button class="btn btn-g btn-sm" onclick="bkGoPage(${page+1})" ${page===pages-1?'disabled':''}>Next →</button>
+      </div>
+    </div>`;
+  }
+  body.innerHTML = html;
+}
+
+function bkGoPage(p) {
+  S.bkPage = p;
+  renderBkPage();
+  document.getElementById('bk-card').scrollIntoView({behavior:'smooth', block:'start'});
+}
+
 async function delBackup(id) {
   if (!confirm('Delete this archive? Cannot be undone.')) return;
   try { await api('/api/backups/'+S.selAppID+'/'+id,{method:'DELETE'}); toast('Deleted','success'); loadBackups(); }
   catch(e) { toast(e.message,'error'); }
 }
-async function countTotal() {
-  let n=0;
-  for (const a of S.apps) { try { const m=await api('/api/backups/'+a.id)||[]; n+=m.length; } catch{} }
-  document.getElementById('s-total').textContent=n;
-}
 
 // ════════════════════ Push ════════════════════
 function openPush(backupID) {
   if (!S.remotes.length) { toast('No remotes configured','warn'); return; }
-  S.pushID=backupID;
-  document.getElementById('push-id').textContent=backupID;
-  document.getElementById('push-rem').innerHTML=S.remotes.map(r=>`<option value="${r.id}">${esc(r.label)} — ${esc(r.user)}@${esc(r.host)}</option>`).join('');
-  document.getElementById('push-run').disabled=false;
+  S.pushID = backupID;
+  document.getElementById('push-id').textContent = backupID;
+  document.getElementById('push-rem').innerHTML = S.remotes.map(r=>`<option value="${r.id}">${esc(r.label)} — ${esc(r.user)}@${esc(r.host)}</option>`).join('');
+  document.getElementById('push-run').disabled = false;
   OM('m-push');
 }
 async function runPush() {
-  const rem=document.getElementById('push-rem').value;
-  document.getElementById('push-run').disabled=true;
+  const rem = document.getElementById('push-rem').value;
+  document.getElementById('push-run').disabled = true;
   try {
-    await api('/api/backups/'+S.selAppID+'/'+S.pushID+'/push?remote='+rem,{method:'POST'});
+    await api('/api/backups/'+S.selAppID+'/'+S.pushID+'/push?remote='+rem, {method:'POST'});
     toast('Push started — watch activity log','info'); CM('m-push');
   } catch(e) { toast(e.message,'error'); document.getElementById('push-run').disabled=false; }
 }
@@ -828,12 +1045,11 @@ async function runPush() {
 // ════════════════════ History ════════════════════
 async function loadHistory() {
   try {
-    const entries=await api('/api/history')||[];
-    document.getElementById('hist-count').textContent=entries.length+' events';
-    const body=document.getElementById('hist-body');
+    const entries = await api('/api/history') || [];
+    document.getElementById('hist-count').textContent = entries.length + ' events';
+    const body = document.getElementById('hist-body');
     if (!entries.length) { body.innerHTML='<div style="color:var(--txt2)">No history yet.</div>'; return; }
-    body.innerHTML=entries.map(e=>{
-      const ok=!e.event.includes('fail');
+    body.innerHTML = entries.map(e => {
       const icons={'backup_success':'✅','backup_fail':'❌','restore_success':'🔄','restore_fail':'💥','push_success':'⇪','push_fail':'⚠'};
       return `<div class="hi">
         <div class="hic">${icons[e.event]||'📋'}</div>
@@ -850,16 +1066,16 @@ async function loadHistory() {
 // ════════════════════ Remotes ════════════════════
 async function loadRemotes() {
   try {
-    S.remotes=await api('/api/remotes')||[];
+    S.remotes = await api('/api/remotes') || [];
     renderRemotes();
-    document.getElementById('s-rem').textContent=S.remotes.length;
+    document.getElementById('s-rem').textContent = S.remotes.length;
   } catch(e) { toast(e.message,'error'); }
 }
 function renderRemotes() {
   const body=document.getElementById('rem-body'), empty=document.getElementById('rem-empty');
   if (!S.remotes.length) { empty.style.display=''; body.innerHTML=''; return; }
   empty.style.display='none';
-  body.innerHTML=S.remotes.map(r=>`
+  body.innerHTML = S.remotes.map(r=>`
     <div class="ri">
       <div class="ric"><svg width="15" height="15" fill="none" stroke="var(--txt2)" stroke-width="1.6" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2a10 10 0 100 20A10 10 0 0012 2z"/></svg></div>
       <div style="flex:1"><div style="font-weight:500">${esc(r.label)}</div><div style="font-family:var(--mono);font-size:11px;color:var(--txt3)">${esc(r.user)}@${esc(r.host)}:${r.port} → ${esc(r.path)}</div></div>
@@ -888,7 +1104,7 @@ async function delRemote(id) {
 async function testRemote(id,btn) {
   btn.textContent='…'; btn.disabled=true;
   try {
-    const r=await api('/api/remotes/'+id+'/test',{method:'POST'});
+    const r = await api('/api/remotes/'+id+'/test',{method:'POST'});
     btn.textContent=r.ok?'✓ OK':'✗ Fail'; btn.style.color=r.ok?'var(--green)':'var(--red)';
     if (!r.ok) toast('Failed: '+r.error,'error');
   } catch(e) { btn.textContent='✗ Err'; btn.style.color='var(--red)'; }
@@ -917,53 +1133,31 @@ async function loadNotify() {
   } catch {}
 }
 function togNotif(key) {
-  const map={
-    telegram:'telegram_enabled', discord:'discord_enabled',
-    ntfy:'ntfy_enabled', webhook:'webhook_enabled',
-    bk_ok:'on_backup_success', bk_fail:'on_backup_fail',
-    rs_ok:'on_restore_success', rs_fail:'on_restore_fail'
-  };
-  const field=map[key];
-  if (!field) return;
-  S.notif[field]=!S.notif[field];
-  setTog('tog-'+key, S.notif[field]);
+  const map={telegram:'telegram_enabled',discord:'discord_enabled',ntfy:'ntfy_enabled',webhook:'webhook_enabled',bk_ok:'on_backup_success',bk_fail:'on_backup_fail',rs_ok:'on_restore_success',rs_fail:'on_restore_fail'};
+  const field=map[key]; if(!field)return;
+  S.notif[field]=!S.notif[field]; setTog('tog-'+key,S.notif[field]);
 }
 async function saveNotify() {
-  const n = {
-    ...S.notif,
-    telegram_token:   gv('tg-token'),
-    telegram_chat_id: gv('tg-chatid'),
-    discord_url:      gv('dc-url'),
-    ntfy_url:         gv('ntfy-url'),
-    ntfy_token:       gv('ntfy-token'),
-    webhook_url:      gv('wh-url'),
-  };
-  try {
-    await api('/api/notify',{method:'PUT',body:JSON.stringify(n)});
-    toast('Notification settings saved','success'); S.notif=n;
-  } catch(e) { toast(e.message,'error'); }
+  const n={...S.notif,telegram_token:gv('tg-token'),telegram_chat_id:gv('tg-chatid'),discord_url:gv('dc-url'),ntfy_url:gv('ntfy-url'),ntfy_token:gv('ntfy-token'),webhook_url:gv('wh-url')};
+  try { await api('/api/notify',{method:'PUT',body:JSON.stringify(n)}); toast('Notification settings saved','success'); S.notif=n; }
+  catch(e) { toast(e.message,'error'); }
 }
 async function testNotify() {
   try {
     const r=await api('/api/notify/test',{method:'POST'});
-    if (r.ok) toast('Test notification sent ✓','success');
+    if(r.ok) toast('Test notification sent ✓','success');
     else toast('Some channels failed: '+(r.errors||[]).join(', '),'warn');
   } catch(e) { toast(e.message,'error'); }
 }
 
 // ════════════════════ Security ════════════════════
-function copyKey() {
-  navigator.clipboard.writeText(S.apiKey);
-  toast('API key copied','success');
-}
+function copyKey() { navigator.clipboard.writeText(S.apiKey); toast('API key copied','success'); }
 async function regenKey() {
-  if (!confirm('Regenerate API key? The current key will stop working immediately — you will need to paste the new one here.')) return;
+  if (!confirm('Regenerate API key? The current key will stop working immediately.')) return;
   try {
     const r=await api('/api/apikey/regenerate',{method:'POST'});
-    S.apiKey=r.api_key;
-    localStorage.setItem('pb_apikey',S.apiKey);
-    toast('New API key generated','success');
-    loadStatus();
+    S.apiKey=r.api_key; localStorage.setItem('pb_apikey',S.apiKey);
+    toast('New API key generated','success'); loadStatus();
   } catch(e) { toast(e.message,'error'); }
 }
 
@@ -984,9 +1178,17 @@ async function checkUpdate() {
 }
 function openUpdModal() { OM('m-upd'); }
 async function applyUpdate() {
-  CM('m-upd'); toast('Update started — reconnect in ~20s','warn');
-  addLog('_system','⬆ Self-update initiated…','info');
-  try { await api('/api/update/apply',{method:'POST'}); } catch(e) { toast('Update failed: '+e.message,'error'); }
+  CM('m-upd');
+  toast('Update started — reconnect in ~20s','warn');
+  addLog('_system','⬆ Self-update initiated — container will restart…','info');
+  try { await api('/api/update/apply',{method:'POST'}); }
+  catch(e) {
+    // A network error here is expected — the container is restarting.
+    // Only show an error toast if we get a real error response.
+    if (e.message && !e.message.includes('fetch') && !e.message.includes('Failed to fetch') && !e.message.includes('NetworkError')) {
+      toast('Update error: '+e.message,'error');
+    }
+  }
 }
 
 // ════════════════════ SSE ════════════════════
@@ -1001,11 +1203,15 @@ function connectSSE() {
       const cls = status==='failed'||log.includes('✗')||log.includes('FAILED') ? 'err'
             : status==='success'||log.includes('✓')||log.includes('complete') ? 'ok'
             : log.includes('⚠')||log.includes('Warning')||log.includes('warn') ? 'warn'
-            : log.includes('━━━') ? 'info'
-            : '';
+            : log.includes('━━━') ? 'info' : '';
       if (log) addLog(appID, log, cls);
-      if (status==='success') { loadApps(); loadHistory(); }
-      if (status==='failed') loadHistory();
+      if (status==='success') {
+        loadApps(); loadHistory();
+        // re-probe counts so chips update
+        probeAllApps();
+        if (S.selAppID === appID) loadBackups();
+      }
+      if (status==='failed') { loadHistory(); probeAllApps(); }
     } catch {}
   };
   es.onerror=()=>addLog('_sys','SSE disconnected — retrying…','warn');
@@ -1038,28 +1244,17 @@ function toast(msg,type='info') {
 
 // ════════════════════ Path validation ════════════════════
 let pathCheckTimer = null;
-function validatePath(input) {
-  clearTimeout(pathCheckTimer);
-  pathCheckTimer = setTimeout(() => doValidatePath(input.value), 600);
-}
-async function validatePathBtn() {
-  await doValidatePath(gv('a-path'));
-}
+function validatePath(input) { clearTimeout(pathCheckTimer); pathCheckTimer = setTimeout(() => doValidatePath(input.value), 600); }
+async function validatePathBtn() { await doValidatePath(gv('a-path')); }
 async function doValidatePath(path) {
   const el = document.getElementById('path-status');
   if (!path) { el.textContent=''; return; }
   try {
     const r = await api('/api/validate-path?path='+encodeURIComponent(path));
-    if (r.ok && r.is_dir) {
-      el.innerHTML = '<span style="color:var(--green)">✓ Path exists and is readable</span>';
-    } else if (r.ok && !r.is_dir) {
-      el.innerHTML = '<span style="color:var(--amber)">⚠ Path exists but is not a directory</span>';
-    } else {
-      el.innerHTML = '<span style="color:var(--red)">✗ ' + esc(r.error||'Path not found') + '</span>';
-    }
-  } catch(e) {
-    el.innerHTML = '<span style="color:var(--red)">✗ '+esc(e.message)+'</span>';
-  }
+    if (r.ok && r.is_dir)   el.innerHTML = '<span style="color:var(--green)">✓ Path exists and is readable</span>';
+    else if (r.ok && !r.is_dir) el.innerHTML = '<span style="color:var(--amber)">⚠ Path exists but is not a directory</span>';
+    else el.innerHTML = '<span style="color:var(--red)">✗ ' + esc(r.error||'Path not found') + '</span>';
+  } catch(e) { el.innerHTML = '<span style="color:var(--red)">✗ '+esc(e.message)+'</span>'; }
 }
 
 // ════════════════════ Utils ════════════════════

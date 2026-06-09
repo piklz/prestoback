@@ -1,25 +1,93 @@
+# PrestoBack — Docker Compose
+# Copy this file alongside your presto stack, or run standalone.
+#
+# Quick start:
+#   1. Copy docker-compose.yml to your deployment dir
+#   2. Edit the environment section below (TZ, PRESTOBACK_IMAGE, PRESTOBACK_CONTAINER)
+#   3. docker compose up -d
+#   4. Open http://<pi-ip>:8765 — the API key is printed in the container logs
+
 version: "3.9"
+
+# Shared network so PrestoBack can reference sibling containers by name.
+# If your presto stack uses a different network name, add it under networks: below.
+networks:
+  prestoback-net:
+    driver: bridge
+  # Attach to your presto stack's external network if it exists.
+  # Comment this out if you don't use a shared presto network.
+  presto_default:
+    external: true
+    name: presto_default   # ← match whatever your presto stack calls its network
 
 services:
   prestoback:
+    # Use the published image once you've pushed to DockerHub, or keep `build: .` for local dev.
+    # image: yourdockerhubuser/prestoback:latest
     build: .
     container_name: prestoback
     restart: unless-stopped
+
     ports:
       - "8765:8765"
+
+    networks:
+      - prestoback-net
+      - presto_default    # ← lets prestoback reach sibling containers; remove if not needed
+
     volumes:
-      # READ-WRITE — restore must write files back into app config dirs
+      # ── Config volumes (read-write — restore writes files back into app dirs) ──
       - ./volumes:/volumes:rw
-      # PrestoBack data: config.json + backup archives + history
-      - ./volumes/prestoback:/data
-      # Docker socket — required for container stop/start and self-update
+
+      # ── PrestoBack data: config.json, backup archives, history ──
+      # Using a named volume keeps data safe across `docker compose down` / `up`.
+      - prestoback-data:/data
+
+      # ── Docker socket — required for container stop/start and self-update ──
       - /var/run/docker.sock:/var/run/docker.sock
-      # SSH keys for remote push
-      - /home/pi/.ssh:/root/.ssh:ro
+
+      # ── SSH keys for remote push (rsync over SSH) ──
+      # Uncomment if you use the remote push feature.
+      # - /home/pi/.ssh:/root/.ssh:ro
+
     environment:
       TZ: Europe/London
-      # Self-update: your DockerHub image once published
+
+      # ── Self-update: set to your DockerHub image reference ──
       PRESTOBACK_IMAGE: yourdockerhubuser/prestoback:latest
+      # Must match the container_name above (used by the updater helper to
+      # stop and recreate this container).
       PRESTOBACK_CONTAINER: prestoback
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8765/api/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # Resource limits — tune for your Pi.
+    # These defaults are safe for a Pi 4/5 running a moderate number of apps.
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+
+    # Keep container logs manageable.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
     labels:
       com.presto.app: prestoback
+      com.presto.description: "PrestoBack config backup manager"
+
+# Named volume — data survives `docker compose down`.
+# The backup archives and config.json are stored here.
+volumes:
+  prestoback-data:
+    driver: local
