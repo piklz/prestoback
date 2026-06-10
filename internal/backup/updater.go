@@ -10,7 +10,7 @@ import (
 
 // UpdateResult is sent over SSE during a self-update.
 type UpdateResult struct {
-	Stage   string `json:"stage"` // pulling | draining | stopping | done | error
+	Stage   string `json:"stage"`   // pulling | draining | stopping | done | error
 	Message string `json:"message"`
 	Error   string `json:"error,omitempty"`
 }
@@ -61,21 +61,16 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 
 	// ── Step 4: spawn detached helper ─────────────────────────────────────────
 	//
-	// We use docker:cli (not alpine + apk) because it has docker baked in —
-	// no install step needed, so the helper is ready in ~1s instead of ~15s.
-	// The helper:
-	//   - waits 3s for prestoback to finish sending the SSE event
-	//   - stops + removes this container
-	//   - starts the new one
-	//   - the --rm flag ensures the helper cleans itself up automatically
+	// The helper runs outside this container (via the Docker socket) so it can
+	// stop and recreate us. We use newline-separated commands instead of &&
+	// chaining so a slow/partial docker stop doesn't abort the docker run.
+	// The sleep gives prestoback time to flush the SSE "done" event before
+	// the socket disappears.
 	//
-	// IMPORTANT: we pass --network host so the new prestoback container can
-	// reach the same published ports as before even if the original used host
-	// networking. For bridge-mode (the normal case), inspectRunFlags will have
-	// captured the -p flags from the original container config.
-
+	// docker:27-cli is a versioned multi-arch image (amd64+arm64) with docker
+	// CLI pre-installed — no apk install step, ready in ~1s on a Pi.
 	stopCmd := fmt.Sprintf(
-		"sleep 3 && docker stop %s || true && docker rm %s || true && for i in 1 2 3; do docker run -d %s && break || sleep 2; done && echo 'prestoback-update-ok'",
+		"sleep 3\ndocker stop -t 15 %s || true\ndocker rm -f %s || true\ndocker run -d %s\necho 'prestoback-update-ok'",
 		selfName, selfName, flags,
 	)
 
@@ -83,7 +78,6 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 		"run", "--rm", "-d",
 		"--name", "prestoback-updater",
 		"-v", "/var/run/docker.sock:/var/run/docker.sock",
-		// docker:27-cli is a small, multi-arch image with the Docker CLI pre-installed
 		"docker:27-cli",
 		"sh", "-c", stopCmd,
 	}
@@ -91,10 +85,10 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 	log.Printf("[updater] spawning helper: docker %s", strings.Join(helperArgs, " "))
 	out2, err := exec.Command("docker", helperArgs...).CombinedOutput()
 	if err != nil {
-		// Fallback: try with alpine + apk install in case docker:27-cli pull fails
-		log.Printf("[updater] docker:27-cli helper failed (%v), falling back to alpine", err)
+		// Fallback: alpine + apk install if docker:27-cli isn't available
+		log.Printf("[updater] docker:27-cli helper failed (%v), falling back to alpine+apk", err)
 		alpineStopCmd := fmt.Sprintf(
-			"apk add --no-cache docker-cli -q && sleep 3 && docker stop %s || true && docker rm %s || true && for i in 1 2 3; do docker run -d %s && break || sleep 2; done && echo 'prestoback-update-ok'",
+			"apk add --no-cache docker-cli -q\nsleep 3\ndocker stop -t 15 %s || true\ndocker rm -f %s || true\ndocker run -d %s\necho 'prestoback-update-ok'",
 			selfName, selfName, flags,
 		)
 		alpineArgs := []string{
@@ -139,13 +133,27 @@ func buildRunFlags(inspectJSON []byte, name, image string) string {
 	// ── Ports ─────────────────────────────────────────────────────────────────
 	// Format in inspect JSON: "PortBindings":{"8765/tcp":[{"HostIp":"","HostPort":"8765"}]}
 	if portSection := between(raw, `"PortBindings":{`, `}`); portSection != "" {
-		// Split on each proto entry
 		for _, chunk := range strings.Split(portSection, `"/tcp"`) {
 			if idx := strings.LastIndex(chunk, `"`); idx >= 0 {
 				containerPort := chunk[idx+1:]
 				hostPort := between(chunk+`"/tcp"`, `"HostPort":"`, `"`)
-				if containerPort != "" && hostPort != "" && containerPort != hostPort || (containerPort != "" && hostPort != "") {
+				if containerPort != "" && hostPort != "" {
 					parts = append(parts, fmt.Sprintf("-p %s:%s", hostPort, containerPort))
+				}
+			}
+		}
+	}
+
+	// ── Networks ──────────────────────────────────────────────────────────────
+	// Format: "Networks":{"presto_default":{...},"prestoback-net":{...}}
+	// Skip the built-in "bridge" network — docker adds it automatically and
+	// attaching to it explicitly alongside named networks causes an error.
+	if netSection := between(raw, `"Networks":{`, `}`); netSection != "" {
+		for _, chunk := range strings.Split(netSection, `":{`) {
+			if idx := strings.LastIndex(chunk, `"`); idx >= 0 {
+				netName := chunk[idx+1:]
+				if netName != "" && netName != "bridge" {
+					parts = append(parts, "--network "+netName)
 				}
 			}
 		}
