@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os/exec"
@@ -10,25 +11,25 @@ import (
 
 // UpdateResult is sent over SSE during a self-update.
 type UpdateResult struct {
-	Stage   string `json:"stage"`   // pulling | draining | stopping | done | error
+	Stage   string `json:"stage"` // pulling | draining | stopping | done | error
 	Message string `json:"message"`
 	Error   string `json:"error,omitempty"`
 }
 
-// SelfUpdate performs a safe in-place update of the prestoback container:
+// SelfUpdate performs a safe in-place update of the prestoback container.
 //
+// Strategy (same as Portainer / Dockge):
 //  1. Pull the new image
 //  2. Drain: wait for running backup/restore jobs to finish (max 60s)
-//  3. Inspect the current container to replay its run flags
-//  4. Spawn a detached "updater helper" alpine container that:
-//     a. Installs docker-cli (cached on most systems)
-//     b. Sleeps 3s so prestoback can finish the SSE response
-//     c. docker stop prestoback && docker rm prestoback
-//     d. docker run … (same flags, new image)
+//  3. Inspect the running container to find its compose file + service name
+//  4. Spawn a detached helper container that:
+//     a. Sleeps 3s so prestoback can flush the SSE "done" event
+//     b. Runs: docker compose -f <file> up -d --pull always <service>
+//     — compose handles stop/rm/recreate atomically with the right networks,
+//     volumes, labels, and env vars. No fragile flag reconstruction needed.
 //
-// Why the helper? A process cannot restart itself once docker-stop is called.
-// The helper sidesteps this by running outside prestoback's own container
-// with access to the Docker socket — same pattern as Watchtower / Dockge.
+// Falls back to bare "docker run" (reconstructed flags) if the container was
+// not started by compose (e.g. during development / manual docker run).
 func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateResult)) error {
 	emit(UpdateResult{Stage: "pulling", Message: "Pulling " + image + "…"})
 
@@ -51,57 +52,87 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 		emit(UpdateResult{Stage: "draining", Message: "No active jobs ✓"})
 	}
 
-	// ── Step 3: inspect current container ────────────────────────────────────
-	flags, err := inspectRunFlags(selfName, image)
-	if err != nil {
-		return fmt.Errorf("could not read current container config: %w", err)
+	// ── Step 3: inspect — prefer compose path, fall back to raw flags ─────────
+	composeFile, serviceName, inspectErr := inspectComposeInfo(selfName)
+
+	var restartCmd string
+	if inspectErr == nil && composeFile != "" {
+		// Compose path: atomically stops, removes, recreates with correct config
+		restartCmd = fmt.Sprintf(
+			"docker compose -f %s up -d --pull always %s",
+			composeFile, serviceName,
+		)
+		emit(UpdateResult{Stage: "stopping", Message: fmt.Sprintf(
+			"Using compose: %s (service: %s)", composeFile, serviceName,
+		)})
+	} else {
+		// Fallback: reconstruct docker run flags from inspect
+		log.Printf("[updater] compose info unavailable (%v), falling back to docker run", inspectErr)
+		flags, err := inspectRunFlags(selfName, image)
+		if err != nil {
+			return fmt.Errorf("could not read current container config: %w", err)
+		}
+		runArgs := buildRunArgList(flags)
+		restartCmd = fmt.Sprintf(
+			"docker stop -t 15 %s || true; docker rm -f %s || true; docker run %s",
+			selfName, selfName, strings.Join(runArgs, " "),
+		)
+		emit(UpdateResult{Stage: "stopping", Message: "No compose config found — using docker run fallback"})
 	}
 
 	emit(UpdateResult{Stage: "stopping", Message: "Spawning update helper…"})
 
 	// ── Step 4: spawn detached helper ─────────────────────────────────────────
 	//
-	// Pre-clean any leftover updater container from a previous failed attempt
-	// so --name prestoback-updater doesn't conflict.
+	// Pre-clean any leftover helper from a previous failed attempt.
 	_ = exec.Command("docker", "rm", "-f", "prestoback-updater").Run()
 
-	// Build the restart command as a proper arg list to avoid word-splitting
-	// issues with env vars or paths that contain spaces.
-	runArgs := buildRunArgList(flags)
-
-	// Use semicolons not newlines — more portable across sh implementations.
-	// Drop --rm so the container stays after exit for log inspection via
-	// "docker logs prestoback-updater" when debugging failed updates.
-	stopCmd := fmt.Sprintf(
-		"sleep 3; docker stop -t 15 %s || true; docker rm -f %s || true; docker run %s; echo prestoback-update-ok",
-		selfName, selfName, strings.Join(runArgs, " "),
-	)
+	// The helper is NOT --rm so it stays after exit — inspect its logs with:
+	//   docker logs prestoback-updater
+	// if the update appears to fail.
+	helperScript := fmt.Sprintf("sleep 3; %s; echo prestoback-update-ok", restartCmd)
+	log.Printf("[updater] helper script: %s", helperScript)
 
 	helperArgs := []string{
 		"run", "-d",
 		"--name", "prestoback-updater",
 		"-v", "/var/run/docker.sock:/var/run/docker.sock",
-		"docker:27-cli",
-		"sh", "-c", stopCmd,
 	}
 
-	log.Printf("[updater] helper cmd: %s", stopCmd)
+	// Mount the compose file directory so docker compose can resolve relative
+	// paths (e.g. .env files, named volumes defined in the compose file).
+	if composeFile != "" {
+		dir := composeFileDir(composeFile)
+		helperArgs = append(helperArgs, "-v", dir+":"+dir, "-w", dir)
+	}
+
+	helperArgs = append(helperArgs,
+		"docker:27-cli",
+		"sh", "-c", helperScript,
+	)
+
 	out2, err := exec.Command("docker", helperArgs...).CombinedOutput()
 	if err != nil {
-		// Fallback: alpine + apk install if docker:27-cli isn't available/cached
-		log.Printf("[updater] docker:27-cli helper failed (%v), falling back to alpine+apk", err)
-		alpineStopCmd := fmt.Sprintf(
-			"apk add --no-cache docker-cli -q; sleep 3; docker stop -t 15 %s || true; docker rm -f %s || true; docker run %s; echo prestoback-update-ok",
-			selfName, selfName, strings.Join(runArgs, " "),
+		// Fallback to alpine if docker:27-cli isn't cached on this host
+		log.Printf("[updater] docker:27-cli failed (%v), trying alpine+apk", err)
+		_ = exec.Command("docker", "rm", "-f", "prestoback-updater").Run()
+
+		alpineScript := fmt.Sprintf(
+			"apk add --no-cache docker-cli docker-cli-compose -q; sleep 3; %s; echo prestoback-update-ok",
+			restartCmd,
 		)
 		alpineArgs := []string{
 			"run", "-d",
 			"--name", "prestoback-updater",
 			"-v", "/var/run/docker.sock:/var/run/docker.sock",
-			"alpine",
-			"sh", "-c", alpineStopCmd,
 		}
-		log.Printf("[updater] fallback cmd: %s", alpineStopCmd)
+		if composeFile != "" {
+			dir := composeFileDir(composeFile)
+			alpineArgs = append(alpineArgs, "-v", dir+":"+dir, "-w", dir)
+		}
+		alpineArgs = append(alpineArgs, "alpine", "sh", "-c", alpineScript)
+
+		log.Printf("[updater] alpine fallback script: %s", alpineScript)
 		out2, err = exec.Command("docker", alpineArgs...).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("failed to start update helper: %w\n%s", err, out2)
@@ -109,96 +140,112 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 	}
 
 	helperID := strings.TrimSpace(string(out2))
-	log.Printf("[updater] helper container started: %s", helperID)
-	emit(UpdateResult{Stage: "done", Message: "Update helper running (ID: " + helperID[:min(12, len(helperID))] + ") — PrestoBack will restart in ~5s. Refresh in ~20s."})
+	log.Printf("[updater] helper started: %s", helperID)
+	emit(UpdateResult{
+		Stage: "done",
+		Message: fmt.Sprintf(
+			"Update helper running (ID: %s) — PrestoBack will restart in ~5s. "+
+				"If it doesn't come back, check: docker logs prestoback-updater",
+			helperID[:min(12, len(helperID))],
+		),
+	})
 	return nil
+}
+
+// ── Inspect helpers ───────────────────────────────────────────────────────────
+
+// containerInspect holds the fields we care about from docker inspect.
+type containerInspect struct {
+	Config struct {
+		Labels map[string]string `json:"Labels"`
+		Env    []string          `json:"Env"`
+	} `json:"Config"`
+	HostConfig struct {
+		Binds        []string `json:"Binds"`
+		PortBindings map[string][]struct {
+			HostIP   string `json:"HostIp"`
+			HostPort string `json:"HostPort"`
+		} `json:"PortBindings"`
+		RestartPolicy struct {
+			Name string `json:"Name"`
+		} `json:"RestartPolicy"`
+	} `json:"HostConfig"`
+	NetworkSettings struct {
+		Networks map[string]json.RawMessage `json:"Networks"`
+	} `json:"NetworkSettings"`
+	Name string `json:"Name"`
+}
+
+// inspectComposeInfo returns the compose file path and service name for the
+// given container, by reading com.docker.compose.* labels set by compose.
+func inspectComposeInfo(containerName string) (composeFile, service string, err error) {
+	raw, err := exec.Command("docker", "inspect", "--format={{json .}}", containerName).Output()
+	if err != nil {
+		return "", "", fmt.Errorf("docker inspect: %w", err)
+	}
+
+	// docker inspect returns an array
+	var arr []containerInspect
+	if err := json.Unmarshal(raw, &arr); err != nil || len(arr) == 0 {
+		return "", "", fmt.Errorf("parse inspect: %w", err)
+	}
+	c := arr[0]
+
+	composeFile = c.Config.Labels["com.docker.compose.project.config_files"]
+	service = c.Config.Labels["com.docker.compose.service"]
+
+	if composeFile == "" {
+		return "", "", fmt.Errorf("container was not started by compose (no config_files label)")
+	}
+	return composeFile, service, nil
 }
 
 // inspectRunFlags reads the current container's config and returns
 // the docker run flags needed to recreate it with the new image.
+// Used only when compose info is unavailable.
 func inspectRunFlags(containerName, newImage string) (string, error) {
-	out, err := exec.Command("docker", "inspect", "--format", `{{json .}}`, containerName).Output()
+	raw, err := exec.Command("docker", "inspect", "--format={{json .}}", containerName).Output()
 	if err != nil {
 		return "", fmt.Errorf("docker inspect %s: %w", containerName, err)
 	}
-	return buildRunFlags(out, containerName, newImage), nil
+	var arr []containerInspect
+	if err := json.Unmarshal(raw, &arr); err != nil || len(arr) == 0 {
+		return "", fmt.Errorf("parse inspect: %w", err)
+	}
+	return buildRunFlags(arr[0], containerName, newImage), nil
 }
 
-// buildRunFlags parses docker inspect JSON and reconstructs -p, -v, -e, --restart flags.
-// We parse manually to avoid circular imports — the config is controlled and predictable.
-func buildRunFlags(inspectJSON []byte, name, image string) string {
-	raw := string(inspectJSON)
+// buildRunFlags reconstructs docker run flags from a parsed inspect struct.
+func buildRunFlags(c containerInspect, name, image string) string {
 	var parts []string
+	parts = append(parts, "-d")
+	parts = append(parts, "--name", name)
+	parts = append(parts, "--restart", c.HostConfig.RestartPolicy.Name)
 
-	parts = append(parts, "--name "+name)
-	parts = append(parts, "--restart unless-stopped")
-
-	// ── Ports ─────────────────────────────────────────────────────────────────
-	// Format in inspect JSON: "PortBindings":{"8765/tcp":[{"HostIp":"","HostPort":"8765"}]}
-	if portSection := between(raw, `"PortBindings":{`, `}`); portSection != "" {
-		for _, chunk := range strings.Split(portSection, `"/tcp"`) {
-			if idx := strings.LastIndex(chunk, `"`); idx >= 0 {
-				containerPort := chunk[idx+1:]
-				hostPort := between(chunk+`"/tcp"`, `"HostPort":"`, `"`)
-				if containerPort != "" && hostPort != "" {
-					parts = append(parts, fmt.Sprintf("-p %s:%s", hostPort, containerPort))
-				}
+	for portProto, bindings := range c.HostConfig.PortBindings {
+		containerPort := strings.TrimSuffix(portProto, "/tcp")
+		for _, b := range bindings {
+			if b.HostPort != "" {
+				parts = append(parts, "-p", b.HostPort+":"+containerPort)
 			}
 		}
 	}
 
-	// ── Networks ──────────────────────────────────────────────────────────────
-	// Format: "Networks":{"presto_default":{...},"prestoback-net":{...}}
-	// Skip the built-in "bridge" network — docker adds it automatically and
-	// attaching to it explicitly alongside named networks causes an error.
-	if netSection := between(raw, `"Networks":{`, `}`); netSection != "" {
-		for _, chunk := range strings.Split(netSection, `":{`) {
-			if idx := strings.LastIndex(chunk, `"`); idx >= 0 {
-				netName := chunk[idx+1:]
-				if netName != "" && netName != "bridge" {
-					parts = append(parts, "--network "+netName)
-				}
-			}
+	for netName := range c.NetworkSettings.Networks {
+		if netName != "bridge" {
+			parts = append(parts, "--network", netName)
 		}
 	}
 
-	// ── Volumes / Binds ───────────────────────────────────────────────────────
-	if bindSection := between(raw, `"Binds":[`, `]`); bindSection != "" {
-		for _, bind := range splitJSONArray(bindSection) {
-			if bind != "" {
-				parts = append(parts, "-v "+bind)
-			}
-		}
+	for _, bind := range c.HostConfig.Binds {
+		parts = append(parts, "-v", bind)
 	}
 
-	// ── Environment variables ─────────────────────────────────────────────────
-	if envSection := between(raw, `"Env":[`, `]`); envSection != "" {
-		for _, e := range splitJSONArray(envSection) {
-			// Skip Docker-internal env vars
-			if !strings.HasPrefix(e, "PATH=") &&
-				!strings.HasPrefix(e, "HOSTNAME=") &&
-				!strings.HasPrefix(e, "HOME=") &&
-				!strings.HasPrefix(e, "GOPATH=") {
-				parts = append(parts, "-e "+shellQuote(e))
-			}
-		}
-	}
-
-	// ── Labels (skip Docker-managed ones) ────────────────────────────────────
-	if labelSection := between(raw, `"Labels":{`, `}`); labelSection != "" {
-		for _, pair := range strings.Split(labelSection, ",") {
-			pair = strings.TrimSpace(pair)
-			if pair == "" {
-				continue
-			}
-			kv := strings.SplitN(pair, ":", 2)
-			if len(kv) == 2 {
-				k := strings.Trim(kv[0], `"`)
-				v := strings.Trim(kv[1], `"`)
-				if !strings.HasPrefix(k, "com.docker.") && !strings.HasPrefix(k, "org.opencontainers.") {
-					parts = append(parts, fmt.Sprintf("-l %s=%s", k, v))
-				}
-			}
+	skipEnv := map[string]bool{"PATH": true, "HOSTNAME": true, "HOME": true, "GOPATH": true}
+	for _, env := range c.Config.Env {
+		key := strings.SplitN(env, "=", 2)[0]
+		if !skipEnv[key] {
+			parts = append(parts, "-e", shellQuote(env))
 		}
 	}
 
@@ -206,22 +253,23 @@ func buildRunFlags(inspectJSON []byte, name, image string) string {
 	return strings.Join(parts, " ")
 }
 
+// composeFileDir returns the directory containing the compose file.
+func composeFileDir(composeFile string) string {
+	idx := strings.LastIndex(composeFile, "/")
+	if idx < 0 {
+		return "."
+	}
+	return composeFile[:idx]
+}
+
 // CheckForUpdate compares the local image digest against the registry.
-// Returns (hasUpdate bool, currentDigest, remoteDigest string, error).
-//
-// Strategy: pull the image quietly (docker pull is idempotent and cheap when
-// already up to date), then compare the resulting image ID with the one
-// currently running. This avoids the need for registry API auth tokens.
 func CheckForUpdate(image string) (bool, string, string, error) {
-	// Local digest of currently-running image
 	localOut, err := exec.Command("docker", "inspect", "--format={{.Id}}", image).Output()
 	if err != nil {
 		return false, "", "", fmt.Errorf("local image not found: %w", err)
 	}
 	localDigest := strings.TrimSpace(string(localOut))
 
-	// Pull latest — docker will report "Status: Image is up to date" if unchanged.
-	// We capture the new digest after pull.
 	pullOut, err := exec.Command("docker", "pull", "-q", image).CombinedOutput()
 	if err != nil {
 		return false, localDigest, "", fmt.Errorf("pull check failed: %w\n%s", err, pullOut)
@@ -236,31 +284,7 @@ func CheckForUpdate(image string) (bool, string, string, error) {
 	return localDigest != remoteDigest, localDigest, remoteDigest, nil
 }
 
-// ── string parsing helpers ────────────────────────────────────────────────────
-
-func between(s, start, end string) string {
-	si := strings.Index(s, start)
-	if si < 0 {
-		return ""
-	}
-	s = s[si+len(start):]
-	ei := strings.Index(s, end)
-	if ei < 0 {
-		return s
-	}
-	return s[:ei]
-}
-
-func splitJSONArray(s string) []string {
-	var out []string
-	for _, part := range strings.Split(s, `","`) {
-		part = strings.Trim(part, `" `)
-		if part != "" {
-			out = append(out, part)
-		}
-	}
-	return out
-}
+// ── string helpers ────────────────────────────────────────────────────────────
 
 func shellQuote(s string) string {
 	if !strings.ContainsAny(s, " \t\"'\\$`!") {
@@ -269,9 +293,7 @@ func shellQuote(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
 }
 
-// buildRunArgList splits a flags string (as produced by buildRunFlags) into
-// a proper []string arg list for exec.Command, respecting double-quoted values.
-// This avoids word-splitting on spaces inside quoted env vars or paths.
+// buildRunArgList splits a quoted flags string into a []string arg list.
 func buildRunArgList(flags string) []string {
 	var args []string
 	var cur strings.Builder
@@ -296,4 +318,11 @@ func buildRunArgList(flags string) []string {
 		args = append(args, cur.String())
 	}
 	return args
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
