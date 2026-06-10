@@ -61,44 +61,47 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 
 	// ── Step 4: spawn detached helper ─────────────────────────────────────────
 	//
-	// The helper runs outside this container (via the Docker socket) so it can
-	// stop and recreate us. We use newline-separated commands instead of &&
-	// chaining so a slow/partial docker stop doesn't abort the docker run.
-	// The sleep gives prestoback time to flush the SSE "done" event before
-	// the socket disappears.
-	//
-	// docker:27-cli is a versioned multi-arch image (amd64+arm64) with docker
-	// CLI pre-installed — no apk install step, ready in ~1s on a Pi.
+	// Pre-clean any leftover updater container from a previous failed attempt
+	// so --name prestoback-updater doesn't conflict.
+	_ = exec.Command("docker", "rm", "-f", "prestoback-updater").Run()
+
+	// Build the restart command as a proper arg list to avoid word-splitting
+	// issues with env vars or paths that contain spaces.
+	runArgs := buildRunArgList(flags)
+
+	// Use semicolons not newlines — more portable across sh implementations.
+	// Drop --rm so the container stays after exit for log inspection via
+	// "docker logs prestoback-updater" when debugging failed updates.
 	stopCmd := fmt.Sprintf(
-		"sleep 3\ndocker stop -t 15 %s || true\ndocker rm -f %s || true\ndocker run -d %s\necho 'prestoback-update-ok'",
-		selfName, selfName, flags,
+		"sleep 3; docker stop -t 15 %s || true; docker rm -f %s || true; docker run %s; echo prestoback-update-ok",
+		selfName, selfName, strings.Join(runArgs, " "),
 	)
 
 	helperArgs := []string{
-		"run", "--rm", "-d",
+		"run", "-d",
 		"--name", "prestoback-updater",
 		"-v", "/var/run/docker.sock:/var/run/docker.sock",
 		"docker:27-cli",
 		"sh", "-c", stopCmd,
 	}
 
-	log.Printf("[updater] spawning helper: docker %s", strings.Join(helperArgs, " "))
+	log.Printf("[updater] helper cmd: %s", stopCmd)
 	out2, err := exec.Command("docker", helperArgs...).CombinedOutput()
 	if err != nil {
-		// Fallback: alpine + apk install if docker:27-cli isn't available
+		// Fallback: alpine + apk install if docker:27-cli isn't available/cached
 		log.Printf("[updater] docker:27-cli helper failed (%v), falling back to alpine+apk", err)
 		alpineStopCmd := fmt.Sprintf(
-			"apk add --no-cache docker-cli -q\nsleep 3\ndocker stop -t 15 %s || true\ndocker rm -f %s || true\ndocker run -d %s\necho 'prestoback-update-ok'",
-			selfName, selfName, flags,
+			"apk add --no-cache docker-cli -q; sleep 3; docker stop -t 15 %s || true; docker rm -f %s || true; docker run %s; echo prestoback-update-ok",
+			selfName, selfName, strings.Join(runArgs, " "),
 		)
 		alpineArgs := []string{
-			"run", "--rm", "-d",
+			"run", "-d",
 			"--name", "prestoback-updater",
 			"-v", "/var/run/docker.sock:/var/run/docker.sock",
 			"alpine",
 			"sh", "-c", alpineStopCmd,
 		}
-		log.Printf("[updater] fallback: docker %s", strings.Join(alpineArgs, " "))
+		log.Printf("[updater] fallback cmd: %s", alpineStopCmd)
 		out2, err = exec.Command("docker", alpineArgs...).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("failed to start update helper: %w\n%s", err, out2)
@@ -264,4 +267,33 @@ func shellQuote(s string) string {
 		return s
 	}
 	return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+}
+
+// buildRunArgList splits a flags string (as produced by buildRunFlags) into
+// a proper []string arg list for exec.Command, respecting double-quoted values.
+// This avoids word-splitting on spaces inside quoted env vars or paths.
+func buildRunArgList(flags string) []string {
+	var args []string
+	var cur strings.Builder
+	inQuote := false
+	for i := 0; i < len(flags); i++ {
+		c := flags[i]
+		switch {
+		case c == '"' && !inQuote:
+			inQuote = true
+		case c == '"' && inQuote:
+			inQuote = false
+		case c == ' ' && !inQuote:
+			if cur.Len() > 0 {
+				args = append(args, cur.String())
+				cur.Reset()
+			}
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	if cur.Len() > 0 {
+		args = append(args, cur.String())
+	}
+	return args
 }
