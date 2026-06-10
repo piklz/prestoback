@@ -13,7 +13,7 @@ ARG VERSION=dev
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build \
+RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w -X 'github.com/pi/prestoback/internal/config.Version=${VERSION}'" \
     -o /prestoback ./cmd/prestoback
 
