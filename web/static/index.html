@@ -259,7 +259,7 @@ select.fi{cursor:pointer}
 <aside class="sidebar">
   <div class="logo">
     <div class="logo-mark">Presto<span>Back</span></div>
-    <div class="logo-sub">v3 · Config Backup Manager</div>
+    <div class="logo-sub" id="logo-sub">· Config Backup Manager</div>
   </div>
   <nav>
     <div class="nav-sec">Main</div>
@@ -851,6 +851,7 @@ async function loadStatus() {
     const d = await api('/api/status');
     document.getElementById('ver-badge').textContent = 'v'+d.version;
     document.getElementById('upd-ver').textContent = 'v'+d.version;
+    document.getElementById('logo-sub').textContent = 'v'+d.version+' · Config Backup Manager';
     document.getElementById('upd-img').textContent = d.image || 'not set';
     document.getElementById('api-key-display').childNodes[0].textContent = S.apiKey;
     document.getElementById('curl-example').textContent =
