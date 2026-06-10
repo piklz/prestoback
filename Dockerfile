@@ -1,16 +1,18 @@
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
-FROM golang:1.25-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /src
 
-# FIX 1: Copy both go.mod AND go.sum
 COPY go.mod go.sum* ./
-
-# FIX 2: Remove '|| true' so failures aren't swallowed
 RUN go mod download
 
-COPY . .
+# ARG must be declared BEFORE the COPY that brings in source files.
+# This ensures a new VERSION value busts the layer cache so the build
+# step always re-runs with fresh code when the tag/version changes.
 ARG VERSION=dev
+
+COPY . .
+
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w -X 'github.com/pi/prestoback/internal/config.Version=${VERSION}'" \
     -o /prestoback ./cmd/prestoback
@@ -28,8 +30,6 @@ COPY --from=builder /prestoback .
 VOLUME ["/data", "/volumes"]
 EXPOSE 8765
 
-# Docker's own health check — hits /healthz every 30s.
-# If it fails 3 times in a row Docker marks the container unhealthy.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- http://localhost:8765/healthz || exit 1
 
