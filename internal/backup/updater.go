@@ -110,15 +110,17 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 		helperArgs = append(helperArgs, "-v", dir+":"+dir, "-w", dir)
 	}
 
+	// docker/compose includes both docker CLI and the compose plugin.
+	// This is the right image for helpers that need "docker compose".
 	helperArgs = append(helperArgs,
-		"docker:27-cli",
+		"docker/compose:latest",
 		"sh", "-c", helperScript,
 	)
 
 	out2, err := exec.Command("docker", helperArgs...).CombinedOutput()
 	if err != nil {
 		// Fallback to alpine if docker:27-cli isn't cached on this host
-		log.Printf("[updater] docker:27-cli failed (%v), trying alpine+apk", err)
+		log.Printf("[updater] docker/compose helper failed (%v), trying alpine+apk", err)
 		_ = exec.Command("docker", "rm", "-f", "prestoback-updater").Run()
 
 		alpineScript := fmt.Sprintf(
@@ -342,12 +344,37 @@ func InvalidateUpdateCache(image string) {
 
 // doCheckForUpdate is the uncached implementation of CheckForUpdate.
 func doCheckForUpdate(image string) (bool, string, string, error) {
-	// ── local digest ──────────────────────────────────────────────────────────
-	localOut, err := exec.Command("docker", "inspect", "--format={{.Id}}", image).Output()
+	// ── local digest via RepoDigests ──────────────────────────────────────────
+	// IMPORTANT: docker inspect --format={{.Id}} returns the IMAGE CONFIG digest,
+	// which is a different hash from the MANIFEST digest that the registry returns
+	// via Docker-Content-Digest. We must compare like-for-like, so we use
+	// RepoDigests which stores the manifest digest as "<image>@sha256:<hex>".
+	type imageInfo struct {
+		RepoDigests []string `json:"RepoDigests"`
+	}
+	localOut, err := exec.Command("docker", "inspect", "--format={{json .}}", image).Output()
 	if err != nil {
 		return false, "", "", fmt.Errorf("local image not found: %w", err)
 	}
-	localDigest := strings.TrimSpace(string(localOut))
+	// inspect returns an array
+	var arr []imageInfo
+	if err := json.Unmarshal(localOut, &arr); err != nil || len(arr) == 0 || len(arr[0].RepoDigests) == 0 {
+		// Freshly-built local image with no RepoDigests — treat as "unknown, no update"
+		// to avoid a false positive on every check.
+		return false, "local-build", "", nil
+	}
+
+	// RepoDigests[0] is e.g. "piklz/prestoback@sha256:abc123..."
+	localDigest := ""
+	for _, rd := range arr[0].RepoDigests {
+		if idx := strings.Index(rd, "@"); idx >= 0 {
+			localDigest = rd[idx+1:] // "sha256:abc123..."
+			break
+		}
+	}
+	if localDigest == "" {
+		return false, "local-build", "", nil
+	}
 
 	// ── remote digest via registry API (no pull, no docker CLI) ───────────────
 	remoteDigest, err := registryDigest(image)
@@ -355,13 +382,7 @@ func doCheckForUpdate(image string) (bool, string, string, error) {
 		return false, localDigest, "", fmt.Errorf("registry check failed: %w", err)
 	}
 
-	// docker inspect returns   sha256:<hex>
-	// registry API returns     sha256:<hex>
-	// Strip prefix for a clean comparison.
-	local := strings.TrimPrefix(localDigest, "sha256:")
-	remote := strings.TrimPrefix(remoteDigest, "sha256:")
-
-	return local != remote, localDigest, remoteDigest, nil
+	return localDigest != remoteDigest, localDigest, remoteDigest, nil
 }
 
 // ── Registry API ──────────────────────────────────────────────────────────────
