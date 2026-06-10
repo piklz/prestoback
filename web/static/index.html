@@ -73,11 +73,11 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 
 /* ── BACKUP CHIPS — reality-aware ── */
 .chips-wrap{display:flex;flex-direction:column;gap:10px;margin-bottom:18px}
-.chips-legend{display:flex;gap:14px;font-family:var(--mono);font-size:10px;color:var(--txt3);letter-spacing:.5px}
+.chips-legend{display:flex;align-items:center;gap:14px;font-family:var(--mono);font-size:10px;color:var(--txt3);letter-spacing:.5px}
 .lgi{display:flex;align-items:center;gap:5px}
 .lgi-dot{display:inline-block;width:7px;height:7px;border-radius:50%;flex-shrink:0}
 .lgi-dot.avail{background:var(--green)}
-.lgi-dot.empty{background:var(--bg4)}
+.lgi-dot.no-bk{background:var(--bg4)}
 .lgi-dot.orphan{background:var(--txt3)}
 .chips{display:flex;gap:8px;flex-wrap:wrap}
 .chip{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:99px;font-size:12px;font-weight:500;cursor:pointer;border:1px solid var(--line2);color:var(--txt2);background:var(--bg2);transition:all .15s}
@@ -356,7 +356,7 @@ select.fi{cursor:pointer}
     <div class="chips-wrap">
       <div class="chips-legend">
         <div class="lgi"><div class="lgi-dot avail"></div>has backups</div>
-        <div class="lgi"><div class="lgi-dot empty"></div>no backups</div>
+        <div class="lgi"><div class="lgi-dot no-bk"></div>no backups</div>
         <div class="lgi"><div class="lgi-dot orphan"></div>orphan (backups on disk, not in config)</div>
       </div>
       <div class="chips" id="app-chips"><div style="font-size:12px;color:var(--txt3)">Loading…</div></div>
