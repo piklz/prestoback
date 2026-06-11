@@ -360,10 +360,13 @@ func InvalidateUpdateCache(image string) {
 // So they match correctly.
 func doCheckForUpdate(image string) (bool, string, string, error) {
 	// ── Step 1: local digest from RepoDigests ────────────────────────────────
+	// Use "docker image inspect" which returns a JSON array reliably.
+	// (plain "docker inspect" on an image tag can return an object or array
+	// depending on Docker version — "docker image inspect" is always an array.)
 	type imageInfo struct {
 		RepoDigests []string `json:"RepoDigests"`
 	}
-	localOut, err := exec.Command("docker", "inspect", "--format={{json .}}", image).Output()
+	localOut, err := exec.Command("docker", "image", "inspect", image).Output()
 	if err != nil {
 		return false, "", "", fmt.Errorf("local image not found: %w", err)
 	}
