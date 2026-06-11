@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"os/exec"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -110,17 +109,15 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 		helperArgs = append(helperArgs, "-v", dir+":"+dir, "-w", dir)
 	}
 
-	// docker/compose includes both docker CLI and the compose plugin.
-	// This is the right image for helpers that need "docker compose".
 	helperArgs = append(helperArgs,
-		"docker/compose:latest",
+		"docker:27-cli",
 		"sh", "-c", helperScript,
 	)
 
 	out2, err := exec.Command("docker", helperArgs...).CombinedOutput()
 	if err != nil {
 		// Fallback to alpine if docker:27-cli isn't cached on this host
-		log.Printf("[updater] docker/compose helper failed (%v), trying alpine+apk", err)
+		log.Printf("[updater] docker:27-cli failed (%v), trying alpine+apk", err)
 		_ = exec.Command("docker", "rm", "-f", "prestoback-updater").Run()
 
 		alpineScript := fmt.Sprintf(
@@ -147,6 +144,11 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 
 	helperID := strings.TrimSpace(string(out2))
 	log.Printf("[updater] helper started: %s", helperID)
+
+	// Invalidate the update cache so when prestoback comes back up the UI
+	// correctly shows "up to date" rather than stale "update available".
+	InvalidateUpdateCache(image)
+
 	emit(UpdateResult{
 		Stage: "done",
 		Message: fmt.Sprintf(
@@ -343,12 +345,21 @@ func InvalidateUpdateCache(image string) {
 }
 
 // doCheckForUpdate is the uncached implementation of CheckForUpdate.
+//
+// Two-phase approach (same as Watchtower):
+//  1. HEAD request to registry → get remote manifest digest (no download)
+//  2. Compare against local RepoDigests from docker inspect
+//
+// Key insight: docker inspect RepoDigests stores the manifest digest as
+// "image@sha256:..." — this is the SAME digest the registry returns via
+// Docker-Content-Digest on a HEAD /v2/<repo>/manifests/<tag> request.
+// This is different from inspect .Id (config digest) which never matches.
+//
+// For multi-arch images the registry returns the manifest LIST digest.
+// RepoDigests also stores the manifest list digest after a pull.
+// So they match correctly.
 func doCheckForUpdate(image string) (bool, string, string, error) {
-	// ── local digest via RepoDigests ──────────────────────────────────────────
-	// IMPORTANT: docker inspect --format={{.Id}} returns the IMAGE CONFIG digest,
-	// which is a different hash from the MANIFEST digest that the registry returns
-	// via Docker-Content-Digest. We must compare like-for-like, so we use
-	// RepoDigests which stores the manifest digest as "<image>@sha256:<hex>".
+	// ── Step 1: local digest from RepoDigests ────────────────────────────────
 	type imageInfo struct {
 		RepoDigests []string `json:"RepoDigests"`
 	}
@@ -356,28 +367,28 @@ func doCheckForUpdate(image string) (bool, string, string, error) {
 	if err != nil {
 		return false, "", "", fmt.Errorf("local image not found: %w", err)
 	}
-	// inspect returns an array
 	var arr []imageInfo
-	if err := json.Unmarshal(localOut, &arr); err != nil || len(arr) == 0 || len(arr[0].RepoDigests) == 0 {
-		// Freshly-built local image with no RepoDigests — treat as "unknown, no update"
-		// to avoid a false positive on every check.
-		return false, "local-build", "", nil
+	if err := json.Unmarshal(localOut, &arr); err != nil || len(arr) == 0 {
+		return false, "", "", fmt.Errorf("inspect parse failed: %w", err)
 	}
 
-	// RepoDigests[0] is e.g. "piklz/prestoback@sha256:abc123..."
+	// Extract manifest digest from RepoDigests e.g. "piklz/prestoback@sha256:abc..."
 	localDigest := ""
 	for _, rd := range arr[0].RepoDigests {
 		if idx := strings.Index(rd, "@"); idx >= 0 {
-			localDigest = rd[idx+1:] // "sha256:abc123..."
+			localDigest = rd[idx+1:] // "sha256:abc..."
 			break
 		}
 	}
 	if localDigest == "" {
+		// Image was built locally and never pulled — no remote digest to compare.
+		// Treat as up-to-date to avoid false positives.
+		log.Printf("[updater] no RepoDigests for %s (locally built?) — skipping check", image)
 		return false, "local-build", "", nil
 	}
 
-	// ── remote digest via registry API (no pull, no docker CLI) ───────────────
-	remoteDigest, err := registryDigest(image)
+	// ── Step 2: remote digest via registry HEAD (no download) ─────────────────
+	remoteDigest, err := headRegistryDigest(image)
 	if err != nil {
 		return false, localDigest, "", fmt.Errorf("registry check failed: %w", err)
 	}
@@ -385,62 +396,48 @@ func doCheckForUpdate(image string) (bool, string, string, error) {
 	return localDigest != remoteDigest, localDigest, remoteDigest, nil
 }
 
-// ── Registry API ──────────────────────────────────────────────────────────────
-
-// registryDigest fetches the content-digest of an image tag from its registry
-// using a single HEAD request — no image data is transferred.
+// headRegistryDigest fetches the manifest digest from the registry using a
+// single HEAD request — no image layers are transferred.
 //
-// Supports:
-//   - Docker Hub official images  (e.g. "ubuntu:22.04")
-//   - Docker Hub user images      (e.g. "myorg/myapp:latest")
-//   - Third-party registries      (e.g. "ghcr.io/owner/repo:tag")
-//
-// Authentication uses the Bearer token flow: we first ask the registry's
-// token service for an anonymous (or credential-based) pull token, then HEAD
-// the manifest endpoint. Docker Hub credentials from `docker login` are NOT
-// read here; for private Hub repos the image should include a token via the
-// standard DOCKER_CONFIG / ~/.docker/config.json path (future work).
-func registryDigest(image string) (string, error) {
+// Works for Docker Hub public images and any OCI-compliant registry.
+// Returns the Docker-Content-Digest header value.
+func headRegistryDigest(image string) (string, error) {
 	registry, repository, tag := parseImageRef(image)
-
-	// Build the manifest URL for the target platform so the digest we get
-	// matches what `docker pull` would actually use on this host.
-	accept := manifestAcceptHeader()
-
-	// ── Attempt 1: anonymous HEAD (works for public images on any registry) ───
 	manifestURL := fmt.Sprintf("https://%s/v2/%s/manifests/%s", registry, repository, tag)
 
-	digest, err := headManifest(manifestURL, "", accept)
+	// Accept both manifest list (multi-arch) and single-platform manifests.
+	// Registries return the list digest when the Accept header includes the list
+	// media type — which matches what docker pull stores in RepoDigests.
+	accept := strings.Join([]string{
+		"application/vnd.docker.distribution.manifest.list.v2+json",
+		"application/vnd.oci.image.index.v1+json",
+		"application/vnd.docker.distribution.manifest.v2+json",
+		"application/vnd.oci.image.manifest.v1+json",
+	}, ", ")
+
+	// Attempt 1: anonymous HEAD
+	digest, err := doHeadManifest(manifestURL, "", accept)
 	if err == nil {
 		return digest, nil
 	}
 
-	// ── Attempt 2: Bearer token (Docker Hub + most OCI-compliant registries) ──
-	token, tokenErr := fetchRegistryToken(registry, repository)
+	// Attempt 2: Bearer token (Docker Hub requires this)
+	token, tokenErr := fetchBearerToken(registry, repository)
 	if tokenErr != nil {
-		// Return the original error — the token fetch is best-effort.
 		return "", fmt.Errorf("manifest HEAD: %w; token fetch: %v", err, tokenErr)
 	}
-
-	digest, err = headManifest(manifestURL, token, accept)
-	if err != nil {
-		return "", err
-	}
-	return digest, nil
+	return doHeadManifest(manifestURL, token, accept)
 }
 
-// headManifest sends a HEAD request to manifestURL and returns the
-// Docker-Content-Digest response header value.
-func headManifest(url, bearerToken, accept string) (string, error) {
+func doHeadManifest(url, token, accept string) (string, error) {
 	req, err := http.NewRequest(http.MethodHead, url, nil)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Accept", accept)
-	if bearerToken != "" {
-		req.Header.Set("Authorization", "Bearer "+bearerToken)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
-
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -449,24 +446,19 @@ func headManifest(url, bearerToken, accept string) (string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return "", fmt.Errorf("registry returned %d (auth required or insufficient permissions)", resp.StatusCode)
+		return "", fmt.Errorf("auth required (%d)", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("registry returned %d for %s", resp.StatusCode, url)
+		return "", fmt.Errorf("registry returned %d", resp.StatusCode)
 	}
-
 	digest := resp.Header.Get("Docker-Content-Digest")
 	if digest == "" {
-		return "", fmt.Errorf("registry did not return Docker-Content-Digest header")
+		return "", fmt.Errorf("no Docker-Content-Digest header in response")
 	}
 	return digest, nil
 }
 
-// fetchRegistryToken obtains an anonymous Bearer token from a registry's
-// token service. Works for Docker Hub and any registry that advertises
-// a Www-Authenticate: Bearer realm=… header on a 401 response.
-func fetchRegistryToken(registry, repository string) (string, error) {
-	// Trigger a 401 to discover the token endpoint.
+func fetchBearerToken(registry, repository string) (string, error) {
 	probeURL := fmt.Sprintf("https://%s/v2/", registry)
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(probeURL)
@@ -477,11 +469,10 @@ func fetchRegistryToken(registry, repository string) (string, error) {
 	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != http.StatusUnauthorized {
-		// Registry allows anonymous access — no token needed.
-		return "", nil
+		return "", nil // no auth needed
 	}
 
-	// Parse: Www-Authenticate: Bearer realm="https://…",service="…",scope="…"
+	// Parse: Www-Authenticate: Bearer realm="...",service="...",scope="..."
 	authHeader := resp.Header.Get("Www-Authenticate")
 	realm, service := parseWwwAuthenticate(authHeader)
 	if realm == "" {
@@ -497,7 +488,7 @@ func fetchRegistryToken(registry, repository string) (string, error) {
 
 	var payload struct {
 		Token       string `json:"token"`
-		AccessToken string `json:"access_token"` // some registries use this key
+		AccessToken string `json:"access_token"`
 	}
 	if err := json.NewDecoder(tresp.Body).Decode(&payload); err != nil {
 		return "", fmt.Errorf("token decode: %w", err)
@@ -508,26 +499,15 @@ func fetchRegistryToken(registry, repository string) (string, error) {
 	return payload.AccessToken, nil
 }
 
-// ── Image-ref parsing ─────────────────────────────────────────────────────────
-
-// parseImageRef splits an image reference into (registry, repository, tag).
-//
-// Examples:
-//
-//	"ubuntu:22.04"              → ("registry-1.docker.io", "library/ubuntu",    "22.04")
-//	"myorg/myapp:v1.2"         → ("registry-1.docker.io", "myorg/myapp",        "v1.2")
-//	"ghcr.io/owner/repo:main"  → ("ghcr.io",              "owner/repo",          "main")
+// parseImageRef splits "piklz/prestoback:dev" into
+// ("registry-1.docker.io", "piklz/prestoback", "dev")
 func parseImageRef(image string) (registry, repository, tag string) {
-	// Split off tag.
 	ref := image
 	tag = "latest"
 	if idx := strings.LastIndex(ref, ":"); idx > strings.LastIndex(ref, "/") {
 		tag = ref[idx+1:]
 		ref = ref[:idx]
 	}
-
-	// Detect whether the first component is a registry hostname.
-	// A registry hostname contains a dot or a colon, or equals "localhost".
 	parts := strings.SplitN(ref, "/", 2)
 	if len(parts) == 2 && (strings.ContainsAny(parts[0], ".:") || parts[0] == "localhost") {
 		registry = parts[0]
@@ -535,7 +515,6 @@ func parseImageRef(image string) (registry, repository, tag string) {
 	} else {
 		registry = "registry-1.docker.io"
 		if len(parts) == 1 {
-			// Official image: no slash → add "library/" prefix.
 			repository = "library/" + parts[0]
 		} else {
 			repository = ref
@@ -544,8 +523,6 @@ func parseImageRef(image string) (registry, repository, tag string) {
 	return
 }
 
-// parseWwwAuthenticate extracts realm and service from a Bearer challenge.
-// e.g. `Bearer realm="https://auth.docker.io/token",service="registry.docker.io"`
 func parseWwwAuthenticate(header string) (realm, service string) {
 	header = strings.TrimPrefix(header, "Bearer ")
 	for _, part := range strings.Split(header, ",") {
@@ -557,23 +534,6 @@ func parseWwwAuthenticate(header string) (realm, service string) {
 		}
 	}
 	return
-}
-
-// manifestAcceptHeader returns the Accept header value that asks the registry
-// for the manifest type matching this host's architecture. This ensures the
-// digest we compare is for the image variant that is actually running.
-func manifestAcceptHeader() string {
-	// OCI index / Docker manifest list — multi-platform wrapper.
-	// The registry resolves these to the correct platform digest server-side
-	// when we also send platform headers, but most registries return the index
-	// digest which matches what `docker inspect` reports after a pull.
-	_ = runtime.GOARCH // referenced so the import is used even if we keep it simple
-	return strings.Join([]string{
-		"application/vnd.docker.distribution.manifest.v2+json",
-		"application/vnd.docker.distribution.manifest.list.v2+json",
-		"application/vnd.oci.image.manifest.v1+json",
-		"application/vnd.oci.image.index.v1+json",
-	}, ", ")
 }
 
 // ── string helpers ────────────────────────────────────────────────────────────
