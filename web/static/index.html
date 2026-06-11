@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrestoBack DEV TEST</title>
+<title>PrestoBack</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#0c0e11;--bg2:#111418;--bg3:#181c22;--bg4:#1e2330;--line:rgba(255,255,255,.07);--line2:rgba(255,255,255,.13);--txt:#e8eaf0;--txt2:#8b90a0;--txt3:#555b6e;--accent:#4f9cf9;--accent2:#3b7ad4;--green:#3dd68c;--gd:rgba(61,214,140,.12);--red:#f05f5f;--rd:rgba(240,95,95,.12);--amber:#f5a623;--ad:rgba(245,166,35,.12);--bld:rgba(79,156,249,.12);--r:10px;--rs:6px;--mono:'IBM Plex Mono',monospace;--head:'Syne',sans-serif;--body:'DM Sans',sans-serif}
@@ -489,16 +489,22 @@ select.fi{cursor:pointer}
   <div class="ph"><div><div class="pt">Updates</div><div class="ps">Self-update PrestoBack from DockerHub</div></div></div>
   <div class="sec">
     <div class="card"><div class="ch"><div class="ct">Current version</div></div><div class="cb">
-      <div class="fr" style="margin-bottom:16px">
+      <div class="fr" style="margin-bottom:16px;flex-wrap:wrap;gap:16px">
         <div><div class="sl">Running</div><div style="font-family:var(--mono);font-size:15px" id="upd-ver">—</div></div>
         <div><div class="sl">Image</div><div style="font-family:var(--mono);font-size:11px;color:var(--txt2);margin-top:4px" id="upd-img">—</div></div>
+        <div><div class="sl">Local digest</div><div style="font-family:var(--mono);font-size:11px;color:var(--txt2);margin-top:4px" id="upd-local-digest">—</div></div>
+        <div><div class="sl">Image built</div><div style="font-family:var(--mono);font-size:11px;color:var(--txt2);margin-top:4px" id="upd-built">—</div></div>
+        <div><div class="sl">Last checked</div><div style="font-family:var(--mono);font-size:11px;color:var(--txt2);margin-top:4px" id="upd-checked">—</div></div>
       </div>
       <button class="btn btn-g btn-sm" id="check-btn" onclick="checkUpdate()">↺ Check for update</button>
     </div></div>
     <div class="card" id="upd-avail" style="display:none">
       <div class="ch"><div class="ct" style="color:var(--amber)">⭐ Update available</div></div>
       <div class="cb">
-        <div style="font-size:13px;color:var(--txt2);margin-bottom:14px" id="upd-digest"></div>
+        <div style="font-size:12px;color:var(--txt2);margin-bottom:14px;font-family:var(--mono);display:flex;flex-direction:column;gap:6px">
+          <div><span style="color:var(--txt3)">local&nbsp;&nbsp;</span><span id="upd-local-short">—</span></div>
+          <div><span style="color:var(--txt3)">remote </span><span id="upd-remote-short" style="color:var(--amber)">—</span></div>
+        </div>
         <button class="btn btn-w" onclick="openUpdModal()">Update now</button>
       </div>
     </div>
@@ -853,6 +859,10 @@ async function loadStatus() {
     document.getElementById('upd-ver').textContent = 'v'+d.version;
     document.getElementById('logo-sub').textContent = 'v'+d.version+' · Config Backup Manager';
     document.getElementById('upd-img').textContent = d.image || 'not set';
+    if (d.built_at) {
+      const builtDate = new Date(d.built_at);
+      document.getElementById('upd-built').textContent = isNaN(builtDate) ? d.built_at : builtDate.toLocaleString();
+    }
     document.getElementById('api-key-display').childNodes[0].textContent = S.apiKey;
     document.getElementById('curl-example').textContent =
       'curl -H "X-API-Key: '+S.apiKey+'" http://your-pi:8765/api/status';
@@ -1393,12 +1403,24 @@ async function checkUpdate() {
   btn.disabled=true; btn.textContent='Checking…';
   try {
     const r=await api('/api/update/check');
+    const now=new Date().toLocaleString();
+    document.getElementById('upd-checked').textContent=now;
+    // Always update local digest display from check result
+    if (r.local_digest && r.local_digest !== 'local-build') {
+      document.getElementById('upd-local-digest').textContent=r.local_digest.replace('sha256:','').slice(0,12)+'…';
+      document.getElementById('upd-local-short').textContent=r.local_digest.replace('sha256:','').slice(0,12)+'…';
+    }
     if (r.available) {
       document.getElementById('upd-avail').style.display='';
-      document.getElementById('upd-digest').textContent='Local: '+r.local_digest+'  →  Remote: '+r.remote_digest;
+      document.getElementById('upd-remote-short').textContent=r.remote_digest.replace('sha256:','').slice(0,12)+'…';
       document.getElementById('upd-dot').classList.add('show');
       toast('Update available!','warn');
-    } else { toast(r.error?'Check failed: '+r.error:'Already up to date ✓','info'); }
+    } else {
+      document.getElementById('upd-avail').style.display='none';
+      document.getElementById('upd-dot').classList.remove('show');
+      if (r.remote_digest) document.getElementById('upd-remote-short').textContent=r.remote_digest.replace('sha256:','').slice(0,12)+'…';
+      toast(r.error?'Check failed: '+r.error:'Already up to date ✓','info');
+    }
   } catch(e) { toast(e.message,'error'); }
   btn.disabled=false; btn.textContent='↺ Check for update';
 }
