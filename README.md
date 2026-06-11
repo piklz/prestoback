@@ -20,7 +20,7 @@ Open **http://your-pi-ip:8765** — paste the key when prompted.
 
 ---
 
-## What's new in v3
+## What's new 
 
 | Feature | Details |
 |---|---|
