@@ -408,9 +408,9 @@ func headRegistryDigest(image string) (string, error) {
 	registry, repository, tag := parseImageRef(image)
 	manifestURL := fmt.Sprintf("https://%s/v2/%s/manifests/%s", registry, repository, tag)
 
-	// Accept both manifest list (multi-arch) and single-platform manifests.
-	// Registries return the list digest when the Accept header includes the list
-	// media type — which matches what docker pull stores in RepoDigests.
+	// Must request manifest list type first — this is what docker pull stores
+	// in RepoDigests on multi-arch images. Without this the registry may return
+	// a platform-specific manifest digest which won't match RepoDigests.
 	accept := strings.Join([]string{
 		"application/vnd.docker.distribution.manifest.list.v2+json",
 		"application/vnd.oci.image.index.v1+json",
@@ -418,16 +418,18 @@ func headRegistryDigest(image string) (string, error) {
 		"application/vnd.oci.image.manifest.v1+json",
 	}, ", ")
 
-	// Attempt 1: anonymous HEAD
-	digest, err := doHeadManifest(manifestURL, "", accept)
-	if err == nil {
-		return digest, nil
+	// Always fetch a Bearer token first — Docker Hub's anonymous endpoint can
+	// return a platform-specific manifest digest instead of the list digest,
+	// which won't match RepoDigests and causes false "up to date" results.
+	token, err := fetchBearerToken(registry, repository)
+	if err != nil {
+		// If token fetch fails, fall back to anonymous — better than nothing.
+		log.Printf("[updater] bearer token fetch failed (%v), trying anonymous", err)
+		return doHeadManifest(manifestURL, "", accept)
 	}
-
-	// Attempt 2: Bearer token (Docker Hub requires this)
-	token, tokenErr := fetchBearerToken(registry, repository)
-	if tokenErr != nil {
-		return "", fmt.Errorf("manifest HEAD: %w; token fetch: %v", err, tokenErr)
+	if token == "" {
+		// Registry doesn't require auth (non-Hub registry) — anonymous is fine.
+		return doHeadManifest(manifestURL, "", accept)
 	}
 	return doHeadManifest(manifestURL, token, accept)
 }
