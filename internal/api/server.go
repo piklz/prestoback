@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -20,13 +21,13 @@ import (
 )
 
 type Server struct {
-	cfg       *config.Config
-	engine    *backup.Engine
-	hist      *history.Log
-	sched     *scheduler.Scheduler
-	mux       *http.ServeMux
-	image     string
-	selfName  string
+	cfg      *config.Config
+	engine   *backup.Engine
+	hist     *history.Log
+	sched    *scheduler.Scheduler
+	mux      *http.ServeMux
+	image    string
+	selfName string
 
 	sseClients map[chan backup.JobUpdate]struct{}
 	sseMu      sync.Mutex
@@ -72,7 +73,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/healthz", s.handleHealth)
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/api/health", s.handleHealth)
-	s.mux.HandleFunc("/api/status", s.handleStatus)   // public — used by UI before login & Docker healthcheck
+	s.mux.HandleFunc("/api/status", s.handleStatus)          // public — used by UI before login & Docker healthcheck
 	s.mux.HandleFunc("/api/auth/status", s.handleAuthStatus) // {setup_required, version}
 	s.mux.HandleFunc("/api/auth/setup", s.handleAuthSetup)   // first-run setup
 	s.mux.HandleFunc("/api/auth/login", s.handleAuthLogin)   // credential login → JWT
@@ -97,7 +98,6 @@ func (s *Server) routes() {
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
-
 
 // SSE uses query param auth so EventSource (no custom headers) works.
 // Accepts ?token=<jwt> or legacy ?api_key=<apikey>
@@ -181,6 +181,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // ── Status ────────────────────────────────────────────────────────────────────
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	// Get image build timestamp from docker inspect (best-effort)
+	builtAt := ""
+	if s.image != "" {
+		out, err := exec.Command("docker", "image", "inspect",
+			"--format={{.Created}}", s.image).Output()
+		if err == nil {
+			builtAt = strings.TrimSpace(string(out))
+		}
+	}
 	respond(w, 200, map[string]any{
 		"version":      config.Version,
 		"app_count":    s.cfg.AppCount(),
@@ -189,6 +198,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"backup_dir":   s.cfg.BackupDir(),
 		"image":        s.image,
 		"self_name":    s.selfName,
+		"built_at":     builtAt,
 		"time":         time.Now().UTC(),
 	})
 }
@@ -273,9 +283,9 @@ func (s *Server) handleListVolumes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type vol struct {
-		Name          string `json:"name"`
-		Path          string `json:"path"`           // container-internal path (use this for backup)
-		HostPathHint  string `json:"host_path_hint"` // informational only
+		Name         string `json:"name"`
+		Path         string `json:"path"`           // container-internal path (use this for backup)
+		HostPathHint string `json:"host_path_hint"` // informational only
 	}
 	var vols []vol
 	for _, e := range entries {
@@ -664,16 +674,20 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		respond(w, 200, map[string]any{"available": false, "reason": "PRESTOBACK_IMAGE not set"})
 		return
 	}
-	hasUpdate, local, remote, err := backup.CheckForUpdate(s.image)
+	// Always force a fresh registry check — never serve from cache.
+	// The cache (CheckForUpdate) is for background polling only.
+	// A user clicking "Check for update" must always get a live result.
+	hasUpdate, local, remote, err := backup.ForceCheckForUpdate(s.image)
 	if err != nil {
 		respond(w, 200, map[string]any{"available": false, "error": err.Error()})
 		return
 	}
 	respond(w, 200, map[string]any{
 		"available":     hasUpdate,
-		"local_digest":  safeSlice(local, 19),
-		"remote_digest": safeSlice(remote, 19),
+		"local_digest":  local,
+		"remote_digest": remote,
 		"image":         s.image,
+		"checked_at":    time.Now().UTC(),
 	})
 }
 
