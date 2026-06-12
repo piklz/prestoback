@@ -60,9 +60,11 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 
 	var restartCmd string
 	if inspectErr == nil && composeFile != "" {
-		// Compose path: atomically stops, removes, recreates with correct config
+		// Compose path: atomically stops, removes, recreates with correct config.
+		// --pull never: image was already pulled in step 1; skip redundant pull.
+		// --no-deps: only restart the prestoback service, not its dependencies.
 		restartCmd = fmt.Sprintf(
-			"docker compose -f %s up -d --pull always %s",
+			"docker compose -f %s up -d --pull never --no-deps %s",
 			composeFile, serviceName,
 		)
 		emit(UpdateResult{Stage: "stopping", Message: fmt.Sprintf(
@@ -90,38 +92,41 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 	// Pre-clean any leftover helper from a previous failed attempt.
 	_ = exec.Command("docker", "rm", "-f", "prestoback-updater").Run()
 
-	// The helper is NOT --rm so it stays after exit — inspect its logs with:
-	//   docker logs prestoback-updater
-	// if the update appears to fail.
-	helperScript := fmt.Sprintf("sleep 3; %s; echo prestoback-update-ok", restartCmd)
+	// sleep 5 — gives prestoback time to flush the SSE "done" response before
+	// the container is stopped. 3s was too tight under Pi load.
+	// The helper logs to stdout; inspect with: docker logs prestoback-updater
+	helperScript := fmt.Sprintf("sleep 5; %s && echo prestoback-update-ok || echo prestoback-update-FAILED", restartCmd)
 	log.Printf("[updater] helper script: %s", helperScript)
 
+	// Use docker/compose image — it ships BOTH docker CLI and the compose plugin.
+	// docker:27-cli only has the CLI; "docker compose" fails silently inside it.
 	helperArgs := []string{
 		"run", "-d",
 		"--name", "prestoback-updater",
 		"-v", "/var/run/docker.sock:/var/run/docker.sock",
 	}
 
-	// Mount the compose file directory so docker compose can resolve relative
-	// paths (e.g. .env files, named volumes defined in the compose file).
+	// Mount the compose project directory so compose can resolve .env files
+	// and relative volume paths. Use -w to set working dir to the same path.
 	if composeFile != "" {
 		dir := composeFileDir(composeFile)
-		helperArgs = append(helperArgs, "-v", dir+":"+dir, "-w", dir)
+		helperArgs = append(helperArgs, "-v", dir+":"+dir)
 	}
 
 	helperArgs = append(helperArgs,
-		"docker:27-cli",
+		"docker/compose:latest",
 		"sh", "-c", helperScript,
 	)
 
 	out2, err := exec.Command("docker", helperArgs...).CombinedOutput()
 	if err != nil {
-		// Fallback to alpine if docker:27-cli isn't cached on this host
-		log.Printf("[updater] docker:27-cli failed (%v), trying alpine+apk", err)
+		// Fallback: alpine + apk (slower but always available)
+		log.Printf("[updater] docker/compose helper failed (%v), trying alpine+apk", err)
 		_ = exec.Command("docker", "rm", "-f", "prestoback-updater").Run()
 
+		// docker-cli-compose provides the compose plugin on alpine
 		alpineScript := fmt.Sprintf(
-			"apk add --no-cache docker-cli docker-cli-compose -q; sleep 3; %s; echo prestoback-update-ok",
+			"apk add --no-cache docker-cli docker-cli-compose -q && sleep 5 && %s && echo prestoback-update-ok || echo prestoback-update-FAILED",
 			restartCmd,
 		)
 		alpineArgs := []string{
@@ -131,7 +136,7 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 		}
 		if composeFile != "" {
 			dir := composeFileDir(composeFile)
-			alpineArgs = append(alpineArgs, "-v", dir+":"+dir, "-w", dir)
+			alpineArgs = append(alpineArgs, "-v", dir+":"+dir)
 		}
 		alpineArgs = append(alpineArgs, "alpine", "sh", "-c", alpineScript)
 
@@ -187,12 +192,12 @@ type containerInspect struct {
 // inspectComposeInfo returns the compose file path and service name for the
 // given container, by reading com.docker.compose.* labels set by compose.
 func inspectComposeInfo(containerName string) (composeFile, service string, err error) {
-	raw, err := exec.Command("docker", "inspect", "--format={{json .}}", containerName).Output()
+	raw, err := exec.Command("docker", "container", "inspect", containerName).Output()
 	if err != nil {
-		return "", "", fmt.Errorf("docker inspect: %w", err)
+		return "", "", fmt.Errorf("docker container inspect: %w", err)
 	}
 
-	// docker inspect returns an array
+	// docker container inspect always returns a JSON array
 	var arr []containerInspect
 	if err := json.Unmarshal(raw, &arr); err != nil || len(arr) == 0 {
 		return "", "", fmt.Errorf("parse inspect: %w", err)
@@ -212,9 +217,9 @@ func inspectComposeInfo(containerName string) (composeFile, service string, err 
 // the docker run flags needed to recreate it with the new image.
 // Used only when compose info is unavailable.
 func inspectRunFlags(containerName, newImage string) (string, error) {
-	raw, err := exec.Command("docker", "inspect", "--format={{json .}}", containerName).Output()
+	raw, err := exec.Command("docker", "container", "inspect", containerName).Output()
 	if err != nil {
-		return "", fmt.Errorf("docker inspect %s: %w", containerName, err)
+		return "", fmt.Errorf("docker container inspect %s: %w", containerName, err)
 	}
 	var arr []containerInspect
 	if err := json.Unmarshal(raw, &arr); err != nil || len(arr) == 0 {
