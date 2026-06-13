@@ -6,7 +6,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -21,13 +20,13 @@ import (
 )
 
 type Server struct {
-	cfg      *config.Config
-	engine   *backup.Engine
-	hist     *history.Log
-	sched    *scheduler.Scheduler
-	mux      *http.ServeMux
-	image    string
-	selfName string
+	cfg       *config.Config
+	engine    *backup.Engine
+	hist      *history.Log
+	sched     *scheduler.Scheduler
+	mux       *http.ServeMux
+	image     string
+	selfName  string
 
 	sseClients map[chan backup.JobUpdate]struct{}
 	sseMu      sync.Mutex
@@ -73,7 +72,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/healthz", s.handleHealth)
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/api/health", s.handleHealth)
-	s.mux.HandleFunc("/api/status", s.handleStatus)          // public — used by UI before login & Docker healthcheck
+	s.mux.HandleFunc("/api/status", s.handleStatus)   // public — used by UI before login & Docker healthcheck
 	s.mux.HandleFunc("/api/auth/status", s.handleAuthStatus) // {setup_required, version}
 	s.mux.HandleFunc("/api/auth/setup", s.handleAuthSetup)   // first-run setup
 	s.mux.HandleFunc("/api/auth/login", s.handleAuthLogin)   // credential login → JWT
@@ -83,6 +82,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/auth/logout", s.authJWT(s.handleAuthLogout))
 	s.mux.HandleFunc("/api/auth/me", s.authJWT(s.handleAuthMe))
 	s.mux.HandleFunc("/api/volumes", s.authJWT(s.handleListVolumes))
+	s.mux.HandleFunc("/api/discover", s.authJWT(s.handleDiscover))
 	s.mux.HandleFunc("/api/validate-path", s.authJWT(s.handleValidatePath))
 	s.mux.HandleFunc("/api/apps", s.authJWT(s.handleApps))
 	s.mux.HandleFunc("/api/apps/", s.authJWT(s.handleApp))
@@ -98,6 +98,7 @@ func (s *Server) routes() {
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
+
 
 // SSE uses query param auth so EventSource (no custom headers) works.
 // Accepts ?token=<jwt> or legacy ?api_key=<apikey>
@@ -181,15 +182,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // ── Status ────────────────────────────────────────────────────────────────────
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	// Get image build timestamp from docker inspect (best-effort)
-	builtAt := ""
-	if s.image != "" {
-		out, err := exec.Command("docker", "image", "inspect",
-			"--format={{.Created}}", s.image).Output()
-		if err == nil {
-			builtAt = strings.TrimSpace(string(out))
-		}
-	}
 	respond(w, 200, map[string]any{
 		"version":      config.Version,
 		"app_count":    s.cfg.AppCount(),
@@ -198,7 +190,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"backup_dir":   s.cfg.BackupDir(),
 		"image":        s.image,
 		"self_name":    s.selfName,
-		"built_at":     builtAt,
 		"time":         time.Now().UTC(),
 	})
 }
@@ -277,33 +268,52 @@ func (s *Server) handleRegenKey(w http.ResponseWriter, r *http.Request) {
 // ── Volumes ───────────────────────────────────────────────────────────────────
 
 func (s *Server) handleListVolumes(w http.ResponseWriter, r *http.Request) {
+	// VolumesDir is optional — users with non-standard setups add apps manually
+	// via the custom path field. Return empty list gracefully if not set/mounted.
+	if s.cfg.VolumesDir == "" {
+		respond(w, 200, []any{})
+		return
+	}
 	entries, err := os.ReadDir(s.cfg.VolumesDir)
+	if os.IsNotExist(err) {
+		// Not mounted — not an error, just no auto-discovery available
+		respond(w, 200, []any{})
+		return
+	}
 	if err != nil {
 		errOut(w, 500, "cannot read volumes dir: "+err.Error())
 		return
 	}
 	type vol struct {
-		Name         string `json:"name"`
-		Path         string `json:"path"`           // container-internal path (use this for backup)
-		HostPathHint string `json:"host_path_hint"` // informational only
+		Name string `json:"name"`
+		Path string `json:"path"` // path inside the container (use this for backup)
 	}
 	var vols []vol
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
-		containerPath := filepath.Join(s.cfg.VolumesDir, e.Name())
-		// Host path hint: VolumesDir is mounted from ../volumes on the host,
-		// which resolves to /home/pi/presto/volumes on the Pi.
-		// We derive this from the container mount for display purposes only.
-		hostHint := filepath.Join("/home/pi/presto/volumes", e.Name())
 		vols = append(vols, vol{
-			Name:         e.Name(),
-			Path:         containerPath,
-			HostPathHint: hostHint,
+			Name: e.Name(),
+			Path: filepath.Join(s.cfg.VolumesDir, e.Name()),
 		})
 	}
 	respond(w, 200, vols)
+}
+
+// handleDiscover returns candidate apps discovered via Docker socket + volumes dir.
+// Replaces the old flat-dir-only /api/volumes discovery with Docker-aware discovery.
+func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
+	// Build set of already-registered paths so we can filter them out
+	alreadyRegistered := map[string]bool{}
+	for _, a := range s.cfg.ListApps() {
+		alreadyRegistered[a.Path] = true
+	}
+	candidates := backup.DiscoverApps(s.cfg.VolumesDir, alreadyRegistered)
+	if candidates == nil {
+		candidates = []backup.DiscoveredApp{}
+	}
+	respond(w, 200, candidates)
 }
 
 // handleValidatePath checks whether an arbitrary path is readable inside the container.
@@ -674,20 +684,16 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		respond(w, 200, map[string]any{"available": false, "reason": "PRESTOBACK_IMAGE not set"})
 		return
 	}
-	// Always force a fresh registry check — never serve from cache.
-	// The cache (CheckForUpdate) is for background polling only.
-	// A user clicking "Check for update" must always get a live result.
-	hasUpdate, local, remote, err := backup.ForceCheckForUpdate(s.image)
+	hasUpdate, local, remote, err := backup.CheckForUpdate(s.image)
 	if err != nil {
 		respond(w, 200, map[string]any{"available": false, "error": err.Error()})
 		return
 	}
 	respond(w, 200, map[string]any{
 		"available":     hasUpdate,
-		"local_digest":  local,
-		"remote_digest": remote,
+		"local_digest":  safeSlice(local, 19),
+		"remote_digest": safeSlice(remote, 19),
 		"image":         s.image,
-		"checked_at":    time.Now().UTC(),
 	})
 }
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrestoBack DEV </title>
+<title>PrestoBack</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#0c0e11;--bg2:#111418;--bg3:#181c22;--bg4:#1e2330;--line:rgba(255,255,255,.07);--line2:rgba(255,255,255,.13);--txt:#e8eaf0;--txt2:#8b90a0;--txt3:#555b6e;--accent:#4f9cf9;--accent2:#3b7ad4;--green:#3dd68c;--gd:rgba(61,214,140,.12);--red:#f05f5f;--rd:rgba(240,95,95,.12);--amber:#f5a623;--ad:rgba(245,166,35,.12);--bld:rgba(79,156,249,.12);--r:10px;--rs:6px;--mono:'IBM Plex Mono',monospace;--head:'Syne',sans-serif;--body:'DM Sans',sans-serif}
@@ -582,9 +582,13 @@ select.fi{cursor:pointer}
 
 <!-- Discover -->
 <div class="overlay hidden" id="m-discover">
-  <div class="modal">
-    <div class="mh"><div class="mt">Discover Volumes</div><button class="btn btn-g btn-ic" onclick="CM('m-discover')">✕</button></div>
-    <div class="mb"><div style="font-size:13px;color:var(--txt2);margin-bottom:14px">Directories found in your volumes folder. Tick the ones to add.</div><div id="disc-list"></div></div>
+  <div class="modal" style="max-width:560px">
+    <div class="mh"><div class="mt">Discover Apps</div><button class="btn btn-g btn-ic" onclick="CM('m-discover')">✕</button></div>
+    <div class="mb">
+      <div style="font-size:13px;color:var(--txt2);margin-bottom:6px">Running containers and their data directories, discovered via Docker socket.</div>
+      <div style="font-size:11px;color:var(--txt3);margin-bottom:14px;font-family:var(--mono)">Tip: add label <span style="color:var(--accent)">com.prestoback.backup=true</span> to your compose services to highlight them here.</div>
+      <div id="disc-list"></div>
+    </div>
     <div class="mf"><button class="btn btn-g" onclick="CM('m-discover')">Cancel</button><button class="btn btn-p" onclick="importDisc()">Import Selected</button></div>
   </div>
 </div>
@@ -1067,22 +1071,55 @@ async function submitEditApp() {
 
 // Discover
 async function openDiscover() {
+  const list = document.getElementById('disc-list');
+  list.innerHTML = '<div style="color:var(--txt3);font-size:13px">Scanning Docker containers…</div>';
+  OM('m-discover');
   try {
-    const vols = await api('/api/volumes');
-    const existing = new Set(S.apps.map(a=>a.path));
-    const fresh = vols.filter(v=>!existing.has(v.path));
-    const list=document.getElementById('disc-list');
-    if (!fresh.length) { list.innerHTML='<div style="color:var(--txt2);font-size:13px">All volumes are already configured.</div>'; }
-    else { list.innerHTML=fresh.map(v=>`<label style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line);cursor:pointer"><input type="checkbox" data-name="${esc(v.name)}" data-path="${esc(v.path)}" checked style="accent-color:var(--accent);width:15px;height:15px"><div><div style="font-weight:500">${esc(v.name)}</div><div style="font-family:var(--mono);font-size:11px;color:var(--accent)">${esc(v.path)}</div><div style="font-size:11px;color:var(--txt3)">host: ${esc(v.host_path_hint||'—')}</div></div></label>`).join(''); }
-    OM('m-discover');
-  } catch(e) { toast(e.message,'error'); }
+    const candidates = await api('/api/discover');
+    if (!candidates.length) {
+      list.innerHTML = '<div style="color:var(--txt2);font-size:13px">No new apps found. All running containers are already configured, or no bind mounts were detected.</div>';
+      return;
+    }
+    // Sort: label-hinted first, then by container name
+    candidates.sort((a,b) => (b.label_hinted - a.label_hinted) || a.name.localeCompare(b.name));
+    list.innerHTML = candidates.map(v => {
+      const src = v.source === 'docker'
+        ? `<span style="color:var(--txt3);font-size:10px;font-family:var(--mono)">${esc(v.container_name||'')} · ${esc(v.image||'')}</span>`
+        : `<span style="color:var(--txt3);font-size:10px;font-family:var(--mono)">volumes dir</span>`;
+      const hint = v.label_hinted
+        ? `<span style="color:var(--green);font-size:10px;margin-left:6px">● prestoback label</span>`
+        : '';
+      const status = v.running === false
+        ? `<span style="color:var(--amber);font-size:10px;margin-left:6px">stopped</span>`
+        : '';
+      return `<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 0;border-bottom:1px solid var(--line);cursor:pointer">
+        <input type="checkbox" data-name="${esc(v.name)}" data-path="${esc(v.path)}"
+          ${v.label_hinted ? 'checked' : ''} style="accent-color:var(--accent);width:15px;height:15px;margin-top:2px;flex-shrink:0">
+        <div>
+          <div style="font-weight:500;display:flex;align-items:center">${esc(v.name)}${hint}${status}</div>
+          <div style="font-family:var(--mono);font-size:11px;color:var(--accent);margin-top:2px">${esc(v.path)}</div>
+          <div style="margin-top:2px">${src}</div>
+        </div>
+      </label>`;
+    }).join('');
+  } catch(e) { toast(e.message,'error'); list.innerHTML=''; }
 }
 async function importDisc() {
   const checks=[...document.querySelectorAll('#disc-list input[type=checkbox]:checked')];
   if (!checks.length) { toast('Nothing selected','error'); return; }
-  let n=0;
-  for (const cb of checks) { try { await api('/api/apps',{method:'POST',body:JSON.stringify({name:cb.dataset.name,path:cb.dataset.path,retain:5})}); n++; } catch {} }
-  toast(n+' app(s) imported','success'); CM('m-discover'); loadApps();
+  let n=0, failed=0;
+  for (const cb of checks) {
+    try {
+      await api('/api/apps',{method:'POST',body:JSON.stringify({name:cb.dataset.name,path:cb.dataset.path,retain:5})});
+      n++;
+    } catch(e) {
+      failed++;
+      console.error('import failed for',cb.dataset.name,e);
+    }
+  }
+  if (failed) toast(`${n} imported, ${failed} failed (path may not be accessible inside container)`,'warn');
+  else toast(n+' app(s) imported','success');
+  CM('m-discover'); loadApps();
 }
 
 // ════════════════════ Backup modal ════════════════════
