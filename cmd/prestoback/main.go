@@ -5,18 +5,19 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 
 	"github.com/pi/prestoback/internal/api"
 	"github.com/pi/prestoback/internal/config"
 )
 
 func main() {
-	port       := flag.Int("port", 8765, "HTTP server port")
-	dataDir    := flag.String("data", "/data", "PrestoBack data directory")
+	port := flag.Int("port", 8765, "HTTP server port")
+	dataDir := flag.String("data", "/data", "PrestoBack data directory")
 	volumesDir := flag.String("volumes", "/volumes", "Presto volumes directory")
 	flag.Parse()
 
-	image    := envOr("PRESTOBACK_IMAGE", "")
+	image := envOr("PRESTOBACK_IMAGE", "")
 	selfName := envOr("PRESTOBACK_CONTAINER", "prestoback")
 
 	fmt.Printf("PrestoBack v%s\n", config.Version)
@@ -26,7 +27,7 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 	cfg.VolumesDir = *volumesDir
-	cfg.DataDir    = *dataDir
+	cfg.DataDir = *dataDir
 
 	if err := os.MkdirAll(cfg.BackupDir(), 0755); err != nil {
 		log.Fatalf("mkdir backup dir: %v", err)
@@ -36,6 +37,10 @@ func main() {
 	if err := cfg.Save(); err != nil {
 		log.Fatalf("config save: %v", err)
 	}
+
+	// Clean up any leftover updater helper container from a previous self-update.
+	// Runs silently — if the container doesn't exist this is a no-op.
+	_ = exec.Command("docker", "rm", "-f", "prestoback-updater").Run()
 
 	srv := api.NewServer(cfg, image, selfName)
 	if err := srv.Run(*port); err != nil {
