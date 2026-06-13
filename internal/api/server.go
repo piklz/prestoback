@@ -20,13 +20,13 @@ import (
 )
 
 type Server struct {
-	cfg      *config.Config
-	engine   *backup.Engine
-	hist     *history.Log
-	sched    *scheduler.Scheduler
-	mux      *http.ServeMux
-	image    string
-	selfName string
+	cfg       *config.Config
+	engine    *backup.Engine
+	hist      *history.Log
+	sched     *scheduler.Scheduler
+	mux       *http.ServeMux
+	image     string
+	selfName  string
 
 	sseClients map[chan backup.JobUpdate]struct{}
 	sseMu      sync.Mutex
@@ -72,7 +72,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/healthz", s.handleHealth)
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/api/health", s.handleHealth)
-	s.mux.HandleFunc("/api/status", s.handleStatus)          // public — used by UI before login & Docker healthcheck
+	s.mux.HandleFunc("/api/status", s.handleStatus)   // public — used by UI before login & Docker healthcheck
 	s.mux.HandleFunc("/api/auth/status", s.handleAuthStatus) // {setup_required, version}
 	s.mux.HandleFunc("/api/auth/setup", s.handleAuthSetup)   // first-run setup
 	s.mux.HandleFunc("/api/auth/login", s.handleAuthLogin)   // credential login → JWT
@@ -83,6 +83,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/auth/me", s.authJWT(s.handleAuthMe))
 	s.mux.HandleFunc("/api/volumes", s.authJWT(s.handleListVolumes))
 	s.mux.HandleFunc("/api/discover", s.authJWT(s.handleDiscover))
+	s.mux.HandleFunc("/api/suggest-excludes", s.authJWT(s.handleSuggestExcludes))
 	s.mux.HandleFunc("/api/validate-path", s.authJWT(s.handleValidatePath))
 	s.mux.HandleFunc("/api/apps", s.authJWT(s.handleApps))
 	s.mux.HandleFunc("/api/apps/", s.authJWT(s.handleApp))
@@ -98,6 +99,7 @@ func (s *Server) routes() {
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
+
 
 // SSE uses query param auth so EventSource (no custom headers) works.
 // Accepts ?token=<jwt> or legacy ?api_key=<apikey>
@@ -300,6 +302,20 @@ func (s *Server) handleListVolumes(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, vols)
 }
 
+// handleSuggestExcludes returns known cache patterns for a given image.
+// Called by the UI when adding/editing an app to pre-populate the excludes field.
+func (s *Server) handleSuggestExcludes(w http.ResponseWriter, r *http.Request) {
+	image := r.URL.Query().Get("image")
+	patterns := backup.SuggestExcludes(image)
+	if patterns == nil {
+		patterns = []string{}
+	}
+	respond(w, 200, map[string]any{
+		"image":    image,
+		"patterns": patterns,
+	})
+}
+
 // handleDiscover returns candidate apps discovered via Docker socket + volumes dir.
 // Replaces the old flat-dir-only /api/volumes discovery with Docker-aware discovery.
 func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
@@ -448,7 +464,7 @@ func (s *Server) runBackup(app config.AppConfig, remoteID string, scheduled bool
 	}
 	toRestart, _ := backup.StopContainers(containers, emit)
 
-	meta, err := s.engine.BackupApp(app.ID, app.Name, app.Path)
+	meta, err := s.engine.BackupApp(app.ID, app.Name, app.Path, app.Excludes)
 	backup.StartContainers(toRestart, emit)
 
 	dur := time.Since(start).Milliseconds()

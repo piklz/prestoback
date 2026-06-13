@@ -568,6 +568,11 @@ select.fi{cursor:pointer}
         <div class="fg"><label class="fl">App ID (read-only)</label><input class="fi" id="ea-id" disabled style="opacity:.5"></div>
       </div>
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
+        <div class="divlbl">Exclude patterns <span style="color:var(--txt3);font-weight:400;font-size:11px">(one per line — dirs: Cache/, globs: *.log)</span></div>
+        <textarea class="fi" id="ea-excludes" rows="3" placeholder="Cache/&#10;Transcodes/&#10;*.log" style="font-family:var(--mono);font-size:12px;resize:vertical"></textarea>
+        <div style="font-size:11px;color:var(--txt3);margin-top:4px" id="ea-suggest-hint"></div>
+      </div>
+      <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
         <div class="divlbl">Scheduled backup</div>
         <div class="ftog" onclick="togEditSched()"><div class="ftog-sw" id="edit-sched-tog"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable scheduled backup</div></div>
         <div id="edit-sched-fields" style="display:none">
@@ -1053,17 +1058,33 @@ function openEditApp(id) {
   S.editSchedOn=a.schedule?.enabled||false; setTog('edit-sched-tog',S.editSchedOn);
   document.getElementById('edit-sched-fields').style.display=S.editSchedOn?'':'none';
   S.editPinOn=a.pinned||false; setTog('edit-pin-tog',S.editPinOn);
+  document.getElementById('ea-excludes').value=(a.excludes||[]).join('\n');
+  // Fetch suggested excludes for this app's image (best-effort)
+  const hint = document.getElementById('ea-suggest-hint');
+  hint.textContent = '';
+  if (a.image) {
+    api('/api/suggest-excludes?image='+encodeURIComponent(a.image)).then(r => {
+      if (r.patterns && r.patterns.length) {
+        hint.innerHTML = '💡 Suggested for '+esc(a.image.split('/').pop())+': ' +
+          r.patterns.map(p=>`<code style="background:var(--bg3);padding:1px 5px;border-radius:3px">${esc(p)}</code>`).join(' ') +
+          ` <a href="#" onclick="document.getElementById('ea-excludes').value=${JSON.stringify(r.patterns.join('\n'))};return false" style="color:var(--accent)">apply</a>`;
+      }
+    }).catch(()=>{});
+  }
   OM('m-edit-app');
 }
 function togEditSched() { S.editSchedOn=!S.editSchedOn; setTog('edit-sched-tog',S.editSchedOn); document.getElementById('edit-sched-fields').style.display=S.editSchedOn?'':'none'; }
 function togEditPin() { S.editPinOn=!S.editPinOn; setTog('edit-pin-tog',S.editPinOn); }
 async function submitEditApp() {
+  const excludesRaw = (document.getElementById('ea-excludes').value||'')
+    .split('\n').map(s=>s.trim()).filter(Boolean);
   const a = {
     ...S.editApp,
     name:gv('ea-name'), path:gv('ea-path'),
     retain:parseInt(gv('ea-retain'))||5,
     pinned:S.editPinOn,
     schedule:{enabled:S.editSchedOn, cron_expr:gv('ea-cron')},
+    excludes: excludesRaw,
   };
   try { await api('/api/apps/'+a.id,{method:'PUT',body:JSON.stringify(a)}); toast('Saved','success'); CM('m-edit-app'); loadApps(); }
   catch(e) { toast(e.message,'error'); }
@@ -1089,7 +1110,9 @@ async function openDiscover() {
       const hint = v.label_hinted
         ? `<span style="color:var(--green);font-size:10px;margin-left:6px">● prestoback label</span>`
         : '';
-      const status = v.running === false
+      // Only show stopped badge for Docker-discovered entries — volumes_dir
+      // entries have no container state so we don't know if they're running.
+      const status = (v.source === 'docker' && v.running === false)
         ? `<span style="color:var(--amber);font-size:10px;margin-left:6px">stopped</span>`
         : '';
       return `<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 0;border-bottom:1px solid var(--line);cursor:pointer">

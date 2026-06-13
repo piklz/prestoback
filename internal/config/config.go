@@ -36,7 +36,8 @@ type AppConfig struct {
 	Retain        int      `json:"retain"`
 	Schedule      Schedule `json:"schedule"`
 	Pinned        bool     `json:"pinned"`                   // if true, skip scheduled backups
-	ContainerName string   `json:"container_name,omitempty"` // real Docker container name from discovery; used by FindContainers instead of guessing from app ID
+	ContainerName string   `json:"container_name,omitempty"` // real Docker container name from discovery
+	Excludes      []string `json:"excludes,omitempty"`       // glob patterns to skip during backup (e.g. "Cache/", "*.log")
 }
 
 // NotifyConfig holds all notification channel settings.

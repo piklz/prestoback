@@ -16,18 +16,18 @@ import (
 // DiscoveredApp is a candidate app found via Docker socket or volumes dir.
 type DiscoveredApp struct {
 	Name          string `json:"name"`
-	Path          string `json:"path"` // path INSIDE prestoback container
+	Path          string `json:"path"`           // path INSIDE prestoback container
 	ContainerName string `json:"container_name"`
 	Image         string `json:"image"`
 	Running       bool   `json:"running"`
 	LabelHinted   bool   `json:"label_hinted"`
-	Source        string `json:"source"`     // "docker" | "volumes_dir"
+	Source        string `json:"source"` // "docker" | "volumes_dir"
 	Accessible    bool   `json:"accessible"` // can prestoback actually reach this path?
 }
 
 type dockerContainer struct {
-	Name  string `json:"Name"`
-	State struct {
+	Name   string `json:"Name"`
+	State  struct {
 		Running bool `json:"Running"`
 	} `json:"State"`
 	Config struct {
@@ -226,6 +226,11 @@ func discoverFromDocker(selfName string, hostToContainer map[string]string, alre
 	return results
 }
 
+// skipDirNames are volume directory names that are never valid backup targets.
+var skipDirNames = map[string]bool{
+	"lost+found": true,
+}
+
 func discoverFromDir(dir string, alreadyRegistered map[string]bool, seen map[string]bool) []DiscoveredApp {
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
@@ -240,14 +245,35 @@ func discoverFromDir(dir string, alreadyRegistered map[string]bool, seen map[str
 		if !e.IsDir() {
 			continue
 		}
+		if skipDirNames[e.Name()] {
+			continue
+		}
 		path := filepath.Join(dir, e.Name())
 		if alreadyRegistered[path] || seen[path] {
 			continue
 		}
+		// Skip if Docker socket already found children inside this dir —
+		// e.g. Docker found /volumes/mosquitto/config and /volumes/mosquitto/data,
+		// so we don't also offer /volumes/mosquitto as a separate entry.
+		childFound := false
+		for seenPath := range seen {
+			if strings.HasPrefix(seenPath, path+"/") {
+				childFound = true
+				break
+			}
+		}
+		if childFound {
+			continue
+		}
 		seen[path] = true
+		// Running is always true for volumes_dir — we have no container state,
+		// so we never show the "stopped" badge for these entries.
 		results = append(results, DiscoveredApp{
-			Name: e.Name(), Path: path,
-			Source: "volumes_dir", Accessible: true,
+			Name:       e.Name(),
+			Path:       path,
+			Source:     "volumes_dir",
+			Accessible: true,
+			Running:    true,
 		})
 	}
 	return results

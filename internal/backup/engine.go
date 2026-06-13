@@ -65,11 +65,12 @@ func (e *Engine) Updates() <-chan JobUpdate { return e.updates }
 // ── Backup ────────────────────────────────────────────────────────────────────
 
 // BackupApp archives the app's directory into a .tar.gz and returns metadata.
-func (e *Engine) BackupApp(appID, appName, srcPath string) (*BackupMeta, error) {
-	return e.backupApp(appID, appName, srcPath, false)
+// excludes is a list of glob patterns relative to srcPath to skip (e.g. "Cache/", "*.log").
+func (e *Engine) BackupApp(appID, appName, srcPath string, excludes []string) (*BackupMeta, error) {
+	return e.backupApp(appID, appName, srcPath, excludes, false)
 }
 
-func (e *Engine) backupApp(appID, appName, srcPath string, preRestore bool) (*BackupMeta, error) {
+func (e *Engine) backupApp(appID, appName, srcPath string, excludes []string, preRestore bool) (*BackupMeta, error) {
 	e.mu.Lock()
 	if e.running[appID] {
 		e.mu.Unlock()
@@ -110,9 +111,13 @@ func (e *Engine) backupApp(appID, appName, srcPath string, preRestore bool) (*Ba
 	if preRestore {
 		label = "pre-restore snapshot"
 	}
-	e.emit(meta, fmt.Sprintf("Starting %s of %s", label, srcPath))
+	if len(excludes) > 0 {
+		e.emit(meta, fmt.Sprintf("Starting %s of %s (excluding: %s)", label, srcPath, strings.Join(excludes, ", ")))
+	} else {
+		e.emit(meta, fmt.Sprintf("Starting %s of %s", label, srcPath))
+	}
 
-	size, err := tarGz(srcPath, destFile)
+	size, err := tarGz(srcPath, destFile, excludes)
 	fin := time.Now()
 	meta.FinishedAt = &fin
 
@@ -207,7 +212,7 @@ func (e *Engine) backupAppLocked(appID, appName, srcPath string, preRestore bool
 		PreRestore: preRestore,
 	}
 
-	size, err := tarGz(srcPath, destFile)
+	size, err := tarGz(srcPath, destFile, nil) // pre-restore: always full backup
 	fin := time.Now()
 	meta.FinishedAt = &fin
 	if err != nil {
@@ -322,9 +327,67 @@ func (e *Engine) EmitLog(appID, msg string) {
 
 // ── Tar/Gzip ──────────────────────────────────────────────────────────────────
 
+// KnownCachePatterns maps image name fragments to exclude patterns.
+// Users can reference these or define their own per-app excludes.
+var KnownCachePatterns = map[string][]string{
+	"plex":      {"Cache/", "Transcodes/", "logs/"},
+	"jellyfin":  {"cache/", "log/"},
+	"sonarr":    {"logs/", "Backups/"},
+	"radarr":    {"logs/", "Backups/"},
+	"lidarr":    {"logs/", "Backups/"},
+	"prowlarr":  {"logs/", "Backups/"},
+	"readarr":   {"logs/", "Backups/"},
+	"bazarr":    {"log/"},
+	"nextcloud": {"cache/", "data/"},
+	"homeassistant": {".cache/", "home-assistant.log"},
+}
+
+// SuggestExcludes returns known cache patterns for a given image name.
+func SuggestExcludes(image string) []string {
+	imageLower := strings.ToLower(image)
+	for key, patterns := range KnownCachePatterns {
+		if strings.Contains(imageLower, key) {
+			return patterns
+		}
+	}
+	return nil
+}
+
+// matchesExclude returns true if relPath matches any of the exclude patterns.
+// Patterns ending in "/" match directories. Patterns with "*" are glob-matched.
+func matchesExclude(relPath string, excludes []string) bool {
+	for _, pattern := range excludes {
+		// Dir pattern: "Cache/" matches "Cache" dir and everything under it
+		if strings.HasSuffix(pattern, "/") {
+			dir := strings.TrimSuffix(pattern, "/")
+			// Match the dir itself or anything inside it
+			if relPath == dir || strings.HasPrefix(relPath, dir+"/") ||
+				strings.Contains(relPath, "/"+dir+"/") ||
+				strings.HasSuffix(relPath, "/"+dir) {
+				return true
+			}
+			continue
+		}
+		// Glob pattern: "*.log" matches any .log file
+		if strings.Contains(pattern, "*") {
+			base := filepath.Base(relPath)
+			if matched, _ := filepath.Match(pattern, base); matched {
+				return true
+			}
+			continue
+		}
+		// Exact match against base name or relative path
+		if relPath == pattern || filepath.Base(relPath) == pattern {
+			return true
+		}
+	}
+	return false
+}
+
 // tarGz creates a .tar.gz of srcDir at destFile, returns bytes written.
+// excludes is a list of patterns to skip (dir/ or glob or exact name).
 // srcDir is cleaned so trailing slashes never cause filepath.Rel to produce ".".
-func tarGz(srcDir, destFile string) (int64, error) {
+func tarGz(srcDir, destFile string, excludes []string) (int64, error) {
 	// Clean removes trailing slashes: "/volumes/plex/" -> "/volumes/plex"
 	srcDir = filepath.Clean(srcDir)
 
@@ -364,6 +427,19 @@ func tarGz(srcDir, destFile string) (int64, error) {
 		}
 		// Sanity check: rel must start with baseName
 		if rel == "." || rel == "" {
+			return nil
+		}
+
+		// Check exclude patterns — rel is "appname/subdir/file"
+		// Strip the top-level dir prefix for pattern matching
+		relFromApp := rel
+		if idx := strings.Index(rel, "/"); idx >= 0 {
+			relFromApp = rel[idx+1:]
+		}
+		if len(excludes) > 0 && relFromApp != "" && matchesExclude(relFromApp, excludes) {
+			if info.IsDir() {
+				return filepath.SkipDir // skip entire directory tree
+			}
 			return nil
 		}
 

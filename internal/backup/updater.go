@@ -113,11 +113,16 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 	log.Printf("[updater] run args: %v", runArgs)
 
 	// stop -t 30: give the app 30s to shut down cleanly.
-	// docker run args are passed as a single pre-quoted string because they go
-	// through sh -c. buildDockerRunArgs shell-quotes each arg individually.
+	// Each arg must be shell-escaped because it goes through sh -c.
+	// Without escaping, env vars like FOO=bar baz or label values with spaces
+	// get word-split by the shell into extra arguments, breaking docker run.
+	quotedArgs := make([]string, len(runArgs))
+	for i, a := range runArgs {
+		quotedArgs[i] = shellEscape(a)
+	}
 	stopScript := fmt.Sprintf(
 		"sleep 5 && docker stop -t 30 %s ; docker rm -f %s ; docker run %s",
-		selfName, selfName, strings.Join(runArgs, " "),
+		shellEscape(selfName), shellEscape(selfName), strings.Join(quotedArgs, " "),
 	)
 	log.Printf("[updater] helper script: %s", stopScript)
 	emit(UpdateResult{Stage: "stopping", Message: "Spawning update helper…"})
@@ -526,6 +531,12 @@ func parseWwwAuthenticate(header string) (realm, service string) {
 		}
 	}
 	return
+}
+
+// shellEscape wraps s in single quotes, escaping any embedded single quotes.
+// Required when building sh -c scripts from []string args.
+func shellEscape(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func min(a, b int) int {
