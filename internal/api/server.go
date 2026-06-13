@@ -485,7 +485,13 @@ func (s *Server) runBackup(app config.AppConfig, remoteID string, scheduled bool
 	}
 	// ── End pre-flight ─────────────────────────────────────────────────────
 
-	containers := backup.FindContainers(app.ContainerName, app.ID)
+	// Use the real Docker container name when available (set by discovery).
+	// Manually-added apps don't have this, so fall back to the app ID.
+	containerLookup := app.ContainerName
+	if containerLookup == "" {
+		containerLookup = app.ID
+	}
+	containers := backup.FindContainers(containerLookup)
 	if len(containers) == 0 {
 		emit("⚠  No running containers found — backing up live files")
 	}
@@ -556,7 +562,11 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, ba
 		emit := func(msg string) { s.engine.EmitLog(app.ID, msg) }
 		emit("━━━ Restore started: " + app.Name + " [" + backupID + "] ━━━")
 
-		containers := backup.FindContainers(app.ContainerName, app.ID)
+		containerLookup := app.ContainerName
+		if containerLookup == "" {
+			containerLookup = app.ID
+		}
+		containers := backup.FindContainers(containerLookup)
 		if len(containers) == 0 {
 			emit("⚠  No running containers found")
 		}

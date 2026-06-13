@@ -30,12 +30,13 @@ type Schedule struct {
 }
 
 type AppConfig struct {
-	ID       string   `json:"id"`
-	Name     string   `json:"name"`
-	Path     string   `json:"path"`
-	Retain   int      `json:"retain"`
-	Schedule Schedule `json:"schedule"`
-	Pinned   bool     `json:"pinned"` // if true, skip scheduled backups
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Path          string   `json:"path"`
+	Retain        int      `json:"retain"`
+	Schedule      Schedule `json:"schedule"`
+	Pinned        bool     `json:"pinned"`                   // if true, skip scheduled backups
+	ContainerName string   `json:"container_name,omitempty"` // real Docker container name from discovery; used by FindContainers instead of guessing from app ID
 }
 
 // NotifyConfig holds all notification channel settings.
@@ -51,8 +52,8 @@ type NotifyConfig struct {
 	DiscordEnabled bool   `json:"discord_enabled"`
 
 	// Ntfy
-	NtfyURL     string `json:"ntfy_url,omitempty"`     // e.g. https://ntfy.sh/my-topic
-	NtfyToken   string `json:"ntfy_token,omitempty"`   // optional auth token
+	NtfyURL     string `json:"ntfy_url,omitempty"`   // e.g. https://ntfy.sh/my-topic
+	NtfyToken   string `json:"ntfy_token,omitempty"` // optional auth token
 	NtfyEnabled bool   `json:"ntfy_enabled"`
 
 	// Generic webhook (POST JSON to any URL — Gotify, Home Assistant, etc.)
@@ -88,12 +89,12 @@ type Config struct {
 	DataDir    string
 	VolumesDir string
 
-	mu           sync.RWMutex
-	apiKey       string
-	apps         map[string]AppConfig
-	remotes      map[string]RemoteTarget
-	notify       NotifyConfig
-	users        map[string]User
+	mu            sync.RWMutex
+	apiKey        string
+	apps          map[string]AppConfig
+	remotes       map[string]RemoteTarget
+	notify        NotifyConfig
+	users         map[string]User
 	revokedTokens map[string]struct{} // in-memory revocation set
 }
 
@@ -102,10 +103,10 @@ func Load(dataDir string) (*Config, error) {
 		return nil, err
 	}
 	c := &Config{
-		DataDir: dataDir,
-		apps:    make(map[string]AppConfig),
-		remotes: make(map[string]RemoteTarget),
-		users:   make(map[string]User),
+		DataDir:       dataDir,
+		apps:          make(map[string]AppConfig),
+		remotes:       make(map[string]RemoteTarget),
+		users:         make(map[string]User),
 		revokedTokens: make(map[string]struct{}),
 	}
 	path := filepath.Join(dataDir, "config.json")
@@ -148,8 +149,8 @@ func Load(dataDir string) (*Config, error) {
 func (c *Config) Save() error {
 	c.mu.RLock()
 	d := disk{
-		APIKey:  c.apiKey,
-		Notify:  c.notify,
+		APIKey: c.apiKey,
+		Notify: c.notify,
 	}
 	for _, a := range c.apps {
 		d.Apps = append(d.Apps, a)
@@ -300,7 +301,7 @@ func (c *Config) SetNotify(n NotifyConfig) {
 
 // ── Misc ──────────────────────────────────────────────────────────────────────
 
-func (c *Config) BackupDir() string { return filepath.Join(c.DataDir, "backups") }
+func (c *Config) BackupDir() string   { return filepath.Join(c.DataDir, "backups") }
 func (c *Config) HistoryFile() string { return filepath.Join(c.DataDir, "history.json") }
 
 func generateKey() string {
