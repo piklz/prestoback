@@ -308,7 +308,7 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 	for _, a := range s.cfg.ListApps() {
 		alreadyRegistered[a.Path] = true
 	}
-	candidates := backup.DiscoverApps(s.cfg.VolumesDir, alreadyRegistered)
+	candidates := backup.DiscoverApps(s.selfName, s.cfg.VolumesDir, alreadyRegistered)
 	if candidates == nil {
 		candidates = []backup.DiscoveredApp{}
 	}
@@ -442,56 +442,7 @@ func (s *Server) runBackup(app config.AppConfig, remoteID string, scheduled bool
 	}
 	emit(fmt.Sprintf("━━━ %s backup started: %s ━━━", prefix, app.Name))
 
-	// ── Pre-flight: validate path before touching Docker or the tar engine ─
-	if app.Path == "" {
-		msg := "backup aborted: no path configured for this app"
-		emit("✗ " + msg)
-		s.hist.Append(history.Entry{
-			Event: history.EventBackupFail, AppID: app.ID, AppName: app.Name,
-			Detail: msg, DurationMs: time.Since(start).Milliseconds(),
-		})
-		s.dispatchNotify(notify.Event{Kind: "backup_fail", AppName: app.Name, Detail: msg, IsError: true})
-		return
-	}
-	if isDangerousPath(app.Path) {
-		msg := fmt.Sprintf("backup aborted: refusing to back up dangerous path %q — this would tar the entire filesystem", app.Path)
-		emit("✗ " + msg)
-		s.hist.Append(history.Entry{
-			Event: history.EventBackupFail, AppID: app.ID, AppName: app.Name,
-			Detail: msg, DurationMs: time.Since(start).Milliseconds(),
-		})
-		s.dispatchNotify(notify.Event{Kind: "backup_fail", AppName: app.Name, Detail: msg, IsError: true})
-		return
-	}
-	if info, err := os.Stat(app.Path); err != nil {
-		msg := fmt.Sprintf("backup aborted: path %q is not accessible inside this container: %v", app.Path, err)
-		emit("✗ " + msg)
-		emit("  Tip: the path must be mounted into prestoback, not just exist on the host.")
-		s.hist.Append(history.Entry{
-			Event: history.EventBackupFail, AppID: app.ID, AppName: app.Name,
-			Detail: msg, DurationMs: time.Since(start).Milliseconds(),
-		})
-		s.dispatchNotify(notify.Event{Kind: "backup_fail", AppName: app.Name, Detail: msg, IsError: true})
-		return
-	} else if !info.IsDir() {
-		msg := fmt.Sprintf("backup aborted: path %q is not a directory", app.Path)
-		emit("✗ " + msg)
-		s.hist.Append(history.Entry{
-			Event: history.EventBackupFail, AppID: app.ID, AppName: app.Name,
-			Detail: msg, DurationMs: time.Since(start).Milliseconds(),
-		})
-		s.dispatchNotify(notify.Event{Kind: "backup_fail", AppName: app.Name, Detail: msg, IsError: true})
-		return
-	}
-	// ── End pre-flight ─────────────────────────────────────────────────────
-
-	// Use the real Docker container name when available (set by discovery).
-	// Manually-added apps don't have this, so fall back to the app ID.
-	containerLookup := app.ContainerName
-	if containerLookup == "" {
-		containerLookup = app.ID
-	}
-	containers := backup.FindContainers(containerLookup)
+	containers := backup.FindContainers(app.ID)
 	if len(containers) == 0 {
 		emit("⚠  No running containers found — backing up live files")
 	}
@@ -562,11 +513,7 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, ba
 		emit := func(msg string) { s.engine.EmitLog(app.ID, msg) }
 		emit("━━━ Restore started: " + app.Name + " [" + backupID + "] ━━━")
 
-		containerLookup := app.ContainerName
-		if containerLookup == "" {
-			containerLookup = app.ID
-		}
-		containers := backup.FindContainers(containerLookup)
+		containers := backup.FindContainers(app.ID)
 		if len(containers) == 0 {
 			emit("⚠  No running containers found")
 		}
@@ -998,25 +945,4 @@ func safeSlice(s string, n int) string {
 		return s
 	}
 	return s[:n]
-}
-
-// isDangerousPath returns true for paths that must never be backed up because
-// tarring them would capture the entire OS or a critical system tree.
-func isDangerousPath(path string) bool {
-	// Trim trailing slashes so "/" and "//" both match.
-	p := strings.TrimRight(path, "/")
-	if p == "" {
-		return true // bare root
-	}
-	blocked := []string{
-		"/proc", "/sys", "/dev", "/run", "/tmp",
-		"/var/run", "/usr", "/bin", "/sbin", "/lib",
-		"/boot", "/lost+found", "/etc",
-	}
-	for _, b := range blocked {
-		if p == b || strings.HasPrefix(p, b+"/") {
-			return true
-		}
-	}
-	return false
 }

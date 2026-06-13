@@ -1,17 +1,8 @@
 package backup
 
 // discover.go — finds running containers and their bind-mount paths via the
-// Docker socket. This lets PrestoBack work with any directory layout, not
-// just a flat /volumes tree.
-//
-// Two discovery sources, merged and deduplicated:
-//   1. Docker socket  — queries running containers for bind mounts
-//   2. VolumesDir scan — existing flat-directory fallback (optional)
-//
-// Label convention (same pattern as offen/docker-volume-backup):
-//   com.prestoback.backup=true   — include this container in discovery
-//   com.prestoback.path=/data    — override which bind mount to back up
-//   com.prestoback.name=MyApp   — friendly name override
+// Docker socket, translating host paths into paths accessible inside the
+// prestoback container via its own volume mounts.
 
 import (
 	"encoding/json"
@@ -25,15 +16,15 @@ import (
 // DiscoveredApp is a candidate app found via Docker socket or volumes dir.
 type DiscoveredApp struct {
 	Name          string `json:"name"`
-	Path          string `json:"path"`           // path inside prestoback container
-	ContainerName string `json:"container_name"` // source Docker container (if any) — persist this into AppConfig.ContainerName so FindContainers can look up the real container rather than guessing from the app ID
-	Image         string `json:"image"`          // container image (informational)
+	Path          string `json:"path"` // path INSIDE prestoback container
+	ContainerName string `json:"container_name"`
+	Image         string `json:"image"`
 	Running       bool   `json:"running"`
-	LabelHinted   bool   `json:"label_hinted"` // had explicit prestoback label
-	Source        string `json:"source"`       // "docker" | "volumes_dir"
+	LabelHinted   bool   `json:"label_hinted"`
+	Source        string `json:"source"`     // "docker" | "volumes_dir"
+	Accessible    bool   `json:"accessible"` // can prestoback actually reach this path?
 }
 
-// dockerContainer is the subset of docker inspect we care about.
 type dockerContainer struct {
 	Name  string `json:"Name"`
 	State struct {
@@ -44,27 +35,32 @@ type dockerContainer struct {
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
 	HostConfig struct {
-		Binds []string `json:"Binds"` // "hostpath:containerpath[:options]"
+		Binds []string `json:"Binds"`
 	} `json:"HostConfig"`
 }
 
 // DiscoverApps queries the Docker socket for running containers and returns
-// candidate apps for the user to confirm and import.
+// candidate apps the user can confirm and import.
 //
-// volumesDir is the optional flat-directory mount (legacy / your setup).
-// Pass "" to skip the directory scan.
-//
-// alreadyRegistered is a set of paths already in the prestoback config —
-// these are filtered out so the UI only shows new candidates.
-func DiscoverApps(volumesDir string, alreadyRegistered map[string]bool) []DiscoveredApp {
+// selfName is the prestoback container name — used to read its own mounts
+// so we can translate host paths into container-internal paths.
+// volumesDir is the optional flat-directory mount fallback.
+// alreadyRegistered is a set of paths already in config (filtered out).
+func DiscoverApps(selfName, volumesDir string, alreadyRegistered map[string]bool) []DiscoveredApp {
+	// ── Step 1: learn prestoback's own host→container path mappings ──────────
+	// e.g. /home/pi/presto/volumes → /volumes
+	//      /data → /data
+	hostToContainer := inspectSelfMounts(selfName)
+	log.Printf("[discover] own mounts: %v", hostToContainer)
+
 	var results []DiscoveredApp
 	seen := map[string]bool{}
 
-	// ── Source 1: Docker socket ──────────────────────────────────────────────
-	dockerResults := discoverFromDocker(alreadyRegistered, seen)
+	// ── Step 2: Docker socket discovery ──────────────────────────────────────
+	dockerResults := discoverFromDocker(selfName, hostToContainer, alreadyRegistered, seen)
 	results = append(results, dockerResults...)
 
-	// ── Source 2: VolumesDir flat scan (fallback / legacy) ──────────────────
+	// ── Step 3: VolumesDir flat scan (fallback) ───────────────────────────────
 	if volumesDir != "" {
 		dirResults := discoverFromDir(volumesDir, alreadyRegistered, seen)
 		results = append(results, dirResults...)
@@ -73,9 +69,55 @@ func DiscoverApps(volumesDir string, alreadyRegistered map[string]bool) []Discov
 	return results
 }
 
-// discoverFromDocker queries `docker ps -a` then inspects each container.
-func discoverFromDocker(alreadyRegistered map[string]bool, seen map[string]bool) []DiscoveredApp {
-	// Get all container IDs (running + stopped so user can see everything)
+// inspectSelfMounts returns a map of hostPath→containerPath for the prestoback
+// container itself, so we can translate other containers' host paths.
+func inspectSelfMounts(selfName string) map[string]string {
+	result := map[string]string{}
+	if selfName == "" {
+		return result
+	}
+	raw, err := exec.Command("docker", "container", "inspect", selfName).Output()
+	if err != nil {
+		log.Printf("[discover] could not inspect self (%s): %v", selfName, err)
+		return result
+	}
+	var arr []dockerContainer
+	if err := json.Unmarshal(raw, &arr); err != nil || len(arr) == 0 {
+		return result
+	}
+	for _, bind := range arr[0].HostConfig.Binds {
+		hostPath, containerPath, _ := parseBindMount(bind)
+		if hostPath != "" && containerPath != "" && !isSystemPath(hostPath) {
+			result[filepath.Clean(hostPath)] = filepath.Clean(containerPath)
+		}
+	}
+	return result
+}
+
+// translateHostPath converts a host path to a path accessible inside the
+// prestoback container using its known mount mappings.
+// Returns ("", false) if the path is not accessible.
+func translateHostPath(hostPath string, hostToContainer map[string]string) (string, bool) {
+	hostPath = filepath.Clean(hostPath)
+
+	// Direct match
+	if cp, ok := hostToContainer[hostPath]; ok {
+		return cp, true
+	}
+
+	// Check if hostPath is under any of our mounted host dirs
+	// e.g. hostPath=/home/pi/presto/volumes/plex, mount=/home/pi/presto/volumes→/volumes
+	// result = /volumes/plex
+	for hostMount, containerMount := range hostToContainer {
+		if strings.HasPrefix(hostPath, hostMount+"/") {
+			rel := strings.TrimPrefix(hostPath, hostMount)
+			return filepath.Join(containerMount, rel), true
+		}
+	}
+	return "", false
+}
+
+func discoverFromDocker(selfName string, hostToContainer map[string]string, alreadyRegistered map[string]bool, seen map[string]bool) []DiscoveredApp {
 	out, err := exec.Command("docker", "ps", "-a", "--format={{.ID}}").Output()
 	if err != nil {
 		log.Printf("[discover] docker ps failed: %v — is Docker socket mounted?", err)
@@ -92,7 +134,6 @@ func discoverFromDocker(alreadyRegistered map[string]bool, seen map[string]bool)
 		return nil
 	}
 
-	// Inspect all containers in one call
 	args := append([]string{"inspect"}, ids...)
 	raw, err := exec.Command("docker", args...).Output()
 	if err != nil {
@@ -108,97 +149,83 @@ func discoverFromDocker(alreadyRegistered map[string]bool, seen map[string]bool)
 
 	var results []DiscoveredApp
 	for _, c := range containers {
-		// Clean container name (docker prefixes with /)
 		name := strings.TrimPrefix(c.Name, "/")
 
-		// Skip prestoback itself and its updater helper
-		if name == "prestoback" || name == "prestoback-updater" {
+		// Skip prestoback itself and its helper
+		if name == selfName || name == "prestoback" || name == "prestoback-updater" {
 			continue
 		}
 
 		labels := c.Config.Labels
-
-		// Check for explicit opt-out label
 		if labels["com.prestoback.ignore"] == "true" {
 			continue
 		}
 
-		// Friendly name — label override or container name
 		friendlyName := labels["com.prestoback.name"]
 		if friendlyName == "" {
 			friendlyName = cleanContainerName(name)
 		}
 
-		// Explicit path label — highest priority
+		// Explicit path label — translate from host path if needed
 		if explicitPath := labels["com.prestoback.path"]; explicitPath != "" {
-			if !alreadyRegistered[explicitPath] && !seen[explicitPath] {
-				seen[explicitPath] = true
+			containerPath, accessible := translateHostPath(explicitPath, hostToContainer)
+			if !accessible {
+				// Try using it directly (might already be a container-internal path)
+				containerPath = explicitPath
+				accessible = pathAccessible(explicitPath)
+			}
+			key := containerPath
+			if !alreadyRegistered[key] && !seen[key] {
+				seen[key] = true
 				results = append(results, DiscoveredApp{
-					Name:          friendlyName,
-					Path:          explicitPath,
-					ContainerName: name,
-					Image:         c.Config.Image,
-					Running:       c.State.Running,
-					LabelHinted:   true,
-					Source:        "docker",
+					Name: friendlyName, Path: containerPath,
+					ContainerName: name, Image: c.Config.Image,
+					Running: c.State.Running, LabelHinted: true,
+					Source: "docker", Accessible: accessible,
 				})
 			}
-			continue // explicit path set — don't also scan bind mounts
+			continue
 		}
 
-		// Scan bind mounts for useful data directories
+		// Scan bind mounts
 		for _, bind := range c.HostConfig.Binds {
-			hostPath, containerPath := parseBindMount(bind)
-			if hostPath == "" || containerPath == "" {
+			hostPath, _, _ := parseBindMount(bind)
+			if hostPath == "" {
+				continue
+			}
+			if isSystemPath(hostPath) {
 				continue
 			}
 
-			// Skip system/socket mounts
-			if isSystemPath(hostPath) || isSystemPath(containerPath) {
+			// Translate host path → container-internal path
+			containerPath, accessible := translateHostPath(hostPath, hostToContainer)
+			if !accessible {
+				// Not mounted into prestoback — skip, can't back it up
+				log.Printf("[discover] skipping %s bind %s — not accessible inside prestoback", name, hostPath)
 				continue
 			}
 
-			// The path prestoback uses is the HOST path as seen inside our
-			// container. If the user mounted /home/pi/stacks:/stacks into
-			// prestoback, then hostPath "/home/pi/stacks/plex/config" is
-			// accessible inside prestoback as "/stacks/plex/config".
-			// We validate accessibility right here so we never register a
-			// path that will fail at backup time.
-			info, statErr := os.Stat(hostPath)
-			if statErr != nil {
-				log.Printf("[discover] %s bind-mount %q not accessible inside prestoback container (not passed through?): %v",
-					name, hostPath, statErr)
-				continue
-			}
-			if !info.IsDir() {
-				// Bind-mounted a single file rather than a directory — skip.
+			if alreadyRegistered[containerPath] || seen[containerPath] {
 				continue
 			}
 
-			if alreadyRegistered[hostPath] || seen[hostPath] {
-				continue
-			}
-
-			// Only include if com.prestoback.backup=true label is set,
-			// OR if no label set (show everything, user can filter)
 			labelBacked := labels["com.prestoback.backup"] == "true"
-
-			seen[hostPath] = true
+			seen[containerPath] = true
 			results = append(results, DiscoveredApp{
-				Name:          friendlyName + " (" + filepath.Base(containerPath) + ")",
-				Path:          hostPath,
+				Name:          friendlyName,
+				Path:          containerPath,
 				ContainerName: name,
 				Image:         c.Config.Image,
 				Running:       c.State.Running,
 				LabelHinted:   labelBacked,
 				Source:        "docker",
+				Accessible:    true,
 			})
 		}
 	}
 	return results
 }
 
-// discoverFromDir scans a flat directory (the legacy /volumes approach).
 func discoverFromDir(dir string, alreadyRegistered map[string]bool, seen map[string]bool) []DiscoveredApp {
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
@@ -208,7 +235,6 @@ func discoverFromDir(dir string, alreadyRegistered map[string]bool, seen map[str
 		log.Printf("[discover] read volumes dir %s: %v", dir, err)
 		return nil
 	}
-
 	var results []DiscoveredApp
 	for _, e := range entries {
 		if !e.IsDir() {
@@ -220,9 +246,8 @@ func discoverFromDir(dir string, alreadyRegistered map[string]bool, seen map[str
 		}
 		seen[path] = true
 		results = append(results, DiscoveredApp{
-			Name:   e.Name(),
-			Path:   path,
-			Source: "volumes_dir",
+			Name: e.Name(), Path: path,
+			Source: "volumes_dir", Accessible: true,
 		})
 	}
 	return results
@@ -230,47 +255,50 @@ func discoverFromDir(dir string, alreadyRegistered map[string]bool, seen map[str
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// parseBindMount splits "hostpath:containerpath:options" into its parts.
-func parseBindMount(bind string) (hostPath, containerPath string) {
+func parseBindMount(bind string) (hostPath, containerPath, options string) {
 	parts := strings.SplitN(bind, ":", 3)
 	if len(parts) < 2 {
-		return "", ""
+		return "", "", ""
 	}
-	return parts[0], parts[1]
+	if len(parts) == 3 {
+		return parts[0], parts[1], parts[2]
+	}
+	return parts[0], parts[1], ""
 }
 
-// isSystemPath returns true for paths that are never useful to back up.
-// "/" must be caught explicitly — backing it up tars the entire OS.
 func isSystemPath(path string) bool {
-	// Normalize away any trailing slash so "/proc/" and "/proc" both match.
-	path = strings.TrimRight(path, "/")
-	if path == "" {
-		// An empty string or bare "/" after trimming is the root filesystem.
-		return true
+	// Exact matches for things that should never be backed up
+	systemExact := []string{
+		"/", "/proc", "/sys", "/dev", "/run", "/tmp",
+		"/var/run/docker.sock", "/etc/localtime", "/etc/timezone",
 	}
+	for _, p := range systemExact {
+		if path == p {
+			return true
+		}
+	}
+	// Prefix matches
 	systemPrefixes := []string{
-		"/proc", "/sys", "/dev", "/run", "/tmp",
-		"/var/run/docker.sock",
-		"/etc/localtime", "/etc/timezone",
-		"/usr", "/bin", "/sbin", "/lib",
-		// Common whole-host mount points that appear when / is bind-mounted.
-		"/boot", "/lost+found",
+		"/proc/", "/sys/", "/dev/", "/run/",
+		"/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/",
 	}
 	for _, prefix := range systemPrefixes {
-		if path == prefix || strings.HasPrefix(path, prefix+"/") {
+		if strings.HasPrefix(path, prefix) {
 			return true
 		}
 	}
 	return false
 }
 
-// cleanContainerName turns "presto-plex-1" or "presto_plex_1" into "plex".
+func pathAccessible(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 func cleanContainerName(name string) string {
-	// Strip common compose prefix patterns: "projectname-service-N" or "projectname_service_N"
 	name = strings.ReplaceAll(name, "_", "-")
 	parts := strings.Split(name, "-")
-
-	// If last part is a number (replica index), drop it
+	// Drop trailing replica number
 	if len(parts) > 1 {
 		last := parts[len(parts)-1]
 		allDigits := true
@@ -284,16 +312,13 @@ func cleanContainerName(name string) string {
 			parts = parts[:len(parts)-1]
 		}
 	}
-
-	// If more than 2 parts, drop the first (project name)
+	// Drop leading project name if 3+ parts
 	if len(parts) > 2 {
 		parts = parts[1:]
 	}
-
 	result := strings.Join(parts, "-")
 	if result == "" {
 		return name
 	}
-	// Title case first letter
 	return strings.ToUpper(result[:1]) + result[1:]
 }

@@ -40,13 +40,6 @@ func getComposeInfo(c containerInspect) *composeInfo {
 	return &composeInfo{Project: project, Service: service, WorkDir: workDir}
 }
 
-// shellQuote wraps a string in single quotes for safe use inside sh -c scripts.
-// Assumes the path contains no single-quote characters (true for all normal
-// Docker Compose working directories on Linux).
-func shellQuote(s string) string {
-	return "'" + s + "'"
-}
-
 // SelfUpdate performs a safe in-place update of the prestoback container.
 //
 // Approach:
@@ -81,7 +74,7 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 		emit(UpdateResult{Stage: "draining", Message: "No active jobs ✓"})
 	}
 
-	// ── Step 3: inspect container — detect Compose vs standalone ──────────────
+	// ── Step 3: inspect current container ───────────────────────────────────────
 	raw, err := exec.Command("docker", "container", "inspect", selfName).Output()
 	if err != nil {
 		return fmt.Errorf("could not inspect current container: %w", err)
@@ -92,57 +85,49 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 	}
 	ci := arr[0]
 
-	// ── Step 4: build helper script based on deployment type ──────────────────
-	_ = exec.Command("docker", "rm", "-f", "prestoback-updater").Run()
-
-	// Socket mount is always required; compose path adds the project dir.
-	helperMounts := []string{"/var/run/docker.sock:/var/run/docker.sock"}
-	var stopScript string
-
+	// ── Step 4: spawn helper that does stop → rm → run ────────────────────────
+	//
+	// We use docker stop/rm/run for BOTH compose-managed and standalone containers.
+	// Why not "docker compose up" inside the helper?
+	//   docker:cli does not ship the compose plugin — compose commands fail silently.
+	//
+	// Why does stop/rm/run work for compose-managed containers?
+	//   "restart: unless-stopped" means Docker will NOT auto-restart after a manual
+	//   docker stop. There is no compose daemon running between deployments.
+	//   The brief gap between rm and run is safe.
+	//
+	// We preserve ALL original labels (including com.docker.compose.*) in the
+	// reconstructed docker run command — exactly as Watchtower does. This means
+	// compose still recognises and manages the container on the next
+	// "docker compose up -d".
+	runArgs, err := buildDockerRunArgs(ci, selfName, image)
+	if err != nil {
+		return fmt.Errorf("could not reconstruct docker run args: %w", err)
+	}
 	if info := getComposeInfo(ci); info != nil {
-		// ── Compose-managed ───────────────────────────────────────────────────
-		// Let Compose own the recreation. Using docker run here races Compose's
-		// restart policy — Compose recreates the container between our rm and run,
-		// causing the "container name already in use" conflict.
-		// --pull never : image already on disk from Step 1.
-		// --no-deps   : restart only this service, leave others untouched.
-		stopScript = fmt.Sprintf(
-			"sleep 5 && docker compose -p %s --project-directory %s up -d --no-deps --pull never %s",
-			shellQuote(info.Project), shellQuote(info.WorkDir), shellQuote(info.Service),
-		)
-		// Mount the project directory so compose can read the config file(s).
-		helperMounts = append(helperMounts, info.WorkDir+":"+info.WorkDir)
-		log.Printf("[updater] compose mode: project=%s service=%s workdir=%s",
-			info.Project, info.Service, info.WorkDir)
 		emit(UpdateResult{Stage: "stopping", Message: fmt.Sprintf(
-			"Compose project detected (%s / %s) — handing restart to compose",
+			"Compose project detected (%s / %s) — preserving compose labels in restart",
 			info.Project, info.Service,
 		)})
-	} else {
-		// ── Standalone ────────────────────────────────────────────────────────
-		runArgs, err := buildDockerRunArgs(ci, selfName, image)
-		if err != nil {
-			return fmt.Errorf("could not reconstruct docker run args: %w", err)
-		}
-		stopScript = fmt.Sprintf(
-			"sleep 5 && docker stop -t 30 %s ; docker rm -f %s ; docker run %s",
-			selfName, selfName, strings.Join(runArgs, " "),
-		)
-		log.Printf("[updater] standalone mode: reconstructed run args: %v", runArgs)
-		emit(UpdateResult{Stage: "stopping", Message: fmt.Sprintf(
-			"Standalone container — reconstructed %d flags", len(runArgs),
-		)})
 	}
+	log.Printf("[updater] run args: %v", runArgs)
 
+	// stop -t 30: give the app 30s to shut down cleanly.
+	// docker run args are passed as a single pre-quoted string because they go
+	// through sh -c. buildDockerRunArgs shell-quotes each arg individually.
+	stopScript := fmt.Sprintf(
+		"sleep 5 && docker stop -t 30 %s ; docker rm -f %s ; docker run %s",
+		selfName, selfName, strings.Join(runArgs, " "),
+	)
 	log.Printf("[updater] helper script: %s", stopScript)
 	emit(UpdateResult{Stage: "stopping", Message: "Spawning update helper…"})
+	_ = exec.Command("docker", "rm", "-f", "prestoback-updater").Run()
 
-	// Build docker run args for the helper — mounts are now dynamic.
-	helperArgs := []string{"run", "-d", "--name", "prestoback-updater"}
-	for _, m := range helperMounts {
-		helperArgs = append(helperArgs, "-v", m)
+	helperArgs := []string{
+		"run", "-d", "--name", "prestoback-updater",
+		"-v", "/var/run/docker.sock:/var/run/docker.sock",
+		"docker:cli", "sh", "-c", stopScript,
 	}
-	helperArgs = append(helperArgs, "docker:cli", "sh", "-c", stopScript)
 
 	helperOut, err := exec.Command("docker", helperArgs...).CombinedOutput()
 	if err != nil {
@@ -177,12 +162,13 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 }
 
 // buildDockerRunArgs inspects the running container and returns the exact
-// []string args needed to recreate it with a new image, suitable for passing
-// directly to exec.Command("docker", args...).
-// Using a []string avoids all shell quoting and word-splitting issues.
+// []string args needed to recreate it with a new image.
+//
+// Each arg is a separate string — no shell involved, no quoting issues.
+// Labels are preserved (including com.docker.compose.*) so compose still
+// recognises the container after the update, exactly as Watchtower does.
 func buildDockerRunArgs(c containerInspect, containerName, newImage string) ([]string, error) {
-	args := []string{"-d"}
-	args = append(args, "--name", containerName)
+	args := []string{"-d", "--name", containerName}
 
 	// Restart policy
 	if rp := c.HostConfig.RestartPolicy.Name; rp != "" && rp != "no" {
@@ -199,7 +185,7 @@ func buildDockerRunArgs(c containerInspect, containerName, newImage string) ([]s
 		}
 	}
 
-	// Networks — skip "bridge" (added automatically by Docker)
+	// Networks — skip "bridge" (Docker adds it automatically)
 	for netName := range c.NetworkSettings.Networks {
 		if netName != "bridge" {
 			args = append(args, "--network", netName)
@@ -219,6 +205,27 @@ func buildDockerRunArgs(c containerInspect, containerName, newImage string) ([]s
 		key := strings.SplitN(env, "=", 2)[0]
 		if !skipEnv[key] {
 			args = append(args, "-e", env)
+		}
+	}
+
+	// Labels — preserve ALL labels including com.docker.compose.* so compose
+	// continues to own and recognise this container after the update.
+	// Skip Docker-internal desktop and buildkit labels.
+	skipLabelPrefixes := []string{
+		"com.docker.desktop.",
+		"org.opencontainers.image.",
+		"com.docker.compose.config-hash", // will be stale after update anyway
+	}
+	for k, v := range c.Config.Labels {
+		skip := false
+		for _, prefix := range skipLabelPrefixes {
+			if strings.HasPrefix(k, prefix) {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			args = append(args, "--label", k+"="+v)
 		}
 	}
 
