@@ -19,23 +19,46 @@ type UpdateResult struct {
 	Error   string `json:"error,omitempty"`
 }
 
+// composeInfo holds Compose metadata from container labels.
+// Set only when the container was started by Docker Compose.
+type composeInfo struct {
+	Project string // com.docker.compose.project
+	Service string // com.docker.compose.service
+	WorkDir string // com.docker.compose.project.working_dir
+}
+
+// getComposeInfo returns Compose metadata when the container carries Compose
+// labels, or nil for standalone containers.
+func getComposeInfo(c containerInspect) *composeInfo {
+	labels := c.Config.Labels
+	project := labels["com.docker.compose.project"]
+	service := labels["com.docker.compose.service"]
+	workDir := labels["com.docker.compose.project.working_dir"]
+	if project == "" || service == "" || workDir == "" {
+		return nil
+	}
+	return &composeInfo{Project: project, Service: service, WorkDir: workDir}
+}
+
+// shellQuote wraps a string in single quotes for safe use inside sh -c scripts.
+// Assumes the path contains no single-quote characters (true for all normal
+// Docker Compose working directories on Linux).
+func shellQuote(s string) string {
+	return "'" + s + "'"
+}
+
 // SelfUpdate performs a safe in-place update of the prestoback container.
 //
-// Approach (same pattern as Watchtower/Dockge):
+// Approach:
 //  1. Pull the new image
 //  2. Drain active jobs (max 60s)
-//  3. Inspect the current container to get its exact run flags
-//  4. Spawn a detached helper container (via Docker socket) that:
-//     - Sleeps 5s so prestoback can flush the SSE response
-//     - Stops + removes the current prestoback container
-//     - docker run with the same flags but new image
-//
-// Why helper and not compose? The helper uses plain docker CLI which is always
-// available via docker:cli. Compose adds dependency on plugin availability
-// inside the helper and requires the compose file to be accessible.
-// Plain docker stop/rm/run is simpler and more reliable.
-//
-// On restart, Docker's --restart=unless-stopped ensures prestoback comes back up.
+//  3. Inspect the current container — detect Compose vs standalone
+//  4. Spawn a detached helper (via Docker socket) that restarts correctly:
+//     - Compose-managed: docker compose up -d --no-deps --pull never <service>
+//     Hands control back to Compose, avoiding the "container name already in
+//     use" conflict caused by Compose's restart policy recreating the container
+//     between our docker rm and docker run.
+//     - Standalone: docker stop → docker rm → docker run (original behaviour)
 func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateResult)) error {
 	emit(UpdateResult{Stage: "pulling", Message: "Pulling " + image + "…"})
 
@@ -58,49 +81,81 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 		emit(UpdateResult{Stage: "draining", Message: "No active jobs ✓"})
 	}
 
-	// ── Step 3: build the docker run command from current container inspect ────
-	// We reconstruct the exact flags used to start the current container so the
-	// new one is identical except for the image digest.
-	runArgs, err := buildDockerRunArgs(selfName, image)
+	// ── Step 3: inspect container — detect Compose vs standalone ──────────────
+	raw, err := exec.Command("docker", "container", "inspect", selfName).Output()
 	if err != nil {
 		return fmt.Errorf("could not inspect current container: %w", err)
 	}
-	log.Printf("[updater] reconstructed run args: %v", runArgs)
-	emit(UpdateResult{Stage: "stopping", Message: fmt.Sprintf("Container config read (%d flags)", len(runArgs))})
+	var arr []containerInspect
+	if err := json.Unmarshal(raw, &arr); err != nil || len(arr) == 0 {
+		return fmt.Errorf("could not parse container inspect output: %w", err)
+	}
+	ci := arr[0]
 
-	// ── Step 4: spawn detached helper via docker:cli ───────────────────────────
-	// docker:cli is a minimal image with just the Docker CLI binary.
-	// It does NOT need compose — we use plain docker stop/rm/run.
-	//
-	// The helper is NOT --rm so it persists after exit for log inspection:
-	//   docker logs prestoback-updater
+	// ── Step 4: build helper script based on deployment type ──────────────────
 	_ = exec.Command("docker", "rm", "-f", "prestoback-updater").Run()
 
-	// Build the stop+rm+run command. Each step is separate so failures are visible.
-	// We pass the docker run args as individual arguments to avoid shell quoting issues.
-	stopScript := fmt.Sprintf(
-		"sleep 5 && docker stop -t 30 %s ; docker rm -f %s ; docker run %s",
-		selfName, selfName, strings.Join(runArgs, " "),
-	)
+	// Socket mount is always required; compose path adds the project dir.
+	helperMounts := []string{"/var/run/docker.sock:/var/run/docker.sock"}
+	var stopScript string
+
+	if info := getComposeInfo(ci); info != nil {
+		// ── Compose-managed ───────────────────────────────────────────────────
+		// Let Compose own the recreation. Using docker run here races Compose's
+		// restart policy — Compose recreates the container between our rm and run,
+		// causing the "container name already in use" conflict.
+		// --pull never : image already on disk from Step 1.
+		// --no-deps   : restart only this service, leave others untouched.
+		stopScript = fmt.Sprintf(
+			"sleep 5 && docker compose -p %s --project-directory %s up -d --no-deps --pull never %s",
+			shellQuote(info.Project), shellQuote(info.WorkDir), shellQuote(info.Service),
+		)
+		// Mount the project directory so compose can read the config file(s).
+		helperMounts = append(helperMounts, info.WorkDir+":"+info.WorkDir)
+		log.Printf("[updater] compose mode: project=%s service=%s workdir=%s",
+			info.Project, info.Service, info.WorkDir)
+		emit(UpdateResult{Stage: "stopping", Message: fmt.Sprintf(
+			"Compose project detected (%s / %s) — handing restart to compose",
+			info.Project, info.Service,
+		)})
+	} else {
+		// ── Standalone ────────────────────────────────────────────────────────
+		runArgs, err := buildDockerRunArgs(ci, selfName, image)
+		if err != nil {
+			return fmt.Errorf("could not reconstruct docker run args: %w", err)
+		}
+		stopScript = fmt.Sprintf(
+			"sleep 5 && docker stop -t 30 %s ; docker rm -f %s ; docker run %s",
+			selfName, selfName, strings.Join(runArgs, " "),
+		)
+		log.Printf("[updater] standalone mode: reconstructed run args: %v", runArgs)
+		emit(UpdateResult{Stage: "stopping", Message: fmt.Sprintf(
+			"Standalone container — reconstructed %d flags", len(runArgs),
+		)})
+	}
+
 	log.Printf("[updater] helper script: %s", stopScript)
 	emit(UpdateResult{Stage: "stopping", Message: "Spawning update helper…"})
 
-	helperOut, err := exec.Command("docker", "run", "-d",
-		"--name", "prestoback-updater",
-		"-v", "/var/run/docker.sock:/var/run/docker.sock",
-		"docker:cli",
-		"sh", "-c", stopScript,
-	).CombinedOutput()
+	// Build docker run args for the helper — mounts are now dynamic.
+	helperArgs := []string{"run", "-d", "--name", "prestoback-updater"}
+	for _, m := range helperMounts {
+		helperArgs = append(helperArgs, "-v", m)
+	}
+	helperArgs = append(helperArgs, "docker:cli", "sh", "-c", stopScript)
 
+	helperOut, err := exec.Command("docker", helperArgs...).CombinedOutput()
 	if err != nil {
 		log.Printf("[updater] docker:cli failed (%v: %s), trying docker:latest", err, helperOut)
 		_ = exec.Command("docker", "rm", "-f", "prestoback-updater").Run()
-		helperOut, err = exec.Command("docker", "run", "-d",
-			"--name", "prestoback-updater",
-			"-v", "/var/run/docker.sock:/var/run/docker.sock",
-			"docker:latest",
-			"sh", "-c", stopScript,
-		).CombinedOutput()
+		// Swap docker:cli → docker:latest and retry.
+		for i, a := range helperArgs {
+			if a == "docker:cli" {
+				helperArgs[i] = "docker:latest"
+				break
+			}
+		}
+		helperOut, err = exec.Command("docker", helperArgs...).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("failed to start update helper: %w\n%s", err, helperOut)
 		}
@@ -125,17 +180,7 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 // []string args needed to recreate it with a new image, suitable for passing
 // directly to exec.Command("docker", args...).
 // Using a []string avoids all shell quoting and word-splitting issues.
-func buildDockerRunArgs(containerName, newImage string) ([]string, error) {
-	raw, err := exec.Command("docker", "container", "inspect", containerName).Output()
-	if err != nil {
-		return nil, fmt.Errorf("docker container inspect: %w", err)
-	}
-	var arr []containerInspect
-	if err := json.Unmarshal(raw, &arr); err != nil || len(arr) == 0 {
-		return nil, fmt.Errorf("parse inspect output: %w", err)
-	}
-	c := arr[0]
-
+func buildDockerRunArgs(c containerInspect, containerName, newImage string) ([]string, error) {
 	args := []string{"-d"}
 	args = append(args, "--name", containerName)
 
@@ -173,7 +218,7 @@ func buildDockerRunArgs(containerName, newImage string) ([]string, error) {
 	for _, env := range c.Config.Env {
 		key := strings.SplitN(env, "=", 2)[0]
 		if !skipEnv[key] {
-			args = append(args, "-e", env) // pass as separate arg — no quoting needed
+			args = append(args, "-e", env)
 		}
 	}
 
