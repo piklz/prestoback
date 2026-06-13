@@ -26,17 +26,17 @@ import (
 type DiscoveredApp struct {
 	Name          string `json:"name"`
 	Path          string `json:"path"`           // path inside prestoback container
-	ContainerName string `json:"container_name"` // source Docker container (if any)
+	ContainerName string `json:"container_name"` // source Docker container (if any) — persist this into AppConfig.ContainerName so FindContainers can look up the real container rather than guessing from the app ID
 	Image         string `json:"image"`          // container image (informational)
 	Running       bool   `json:"running"`
-	LabelHinted   bool   `json:"label_hinted"`   // had explicit prestoback label
-	Source        string `json:"source"`         // "docker" | "volumes_dir"
+	LabelHinted   bool   `json:"label_hinted"` // had explicit prestoback label
+	Source        string `json:"source"`       // "docker" | "volumes_dir"
 }
 
 // dockerContainer is the subset of docker inspect we care about.
 type dockerContainer struct {
-	Name   string `json:"Name"`
-	State  struct {
+	Name  string `json:"Name"`
+	State struct {
 		Running bool `json:"Running"`
 	} `json:"State"`
 	Config struct {
@@ -162,8 +162,19 @@ func discoverFromDocker(alreadyRegistered map[string]bool, seen map[string]bool)
 			// container. If the user mounted /home/pi/stacks:/stacks into
 			// prestoback, then hostPath "/home/pi/stacks/plex/config" is
 			// accessible inside prestoback as "/stacks/plex/config".
-			// We can't know the mapping, so we present both and let the user
-			// confirm via validate-path.
+			// We validate accessibility right here so we never register a
+			// path that will fail at backup time.
+			info, statErr := os.Stat(hostPath)
+			if statErr != nil {
+				log.Printf("[discover] %s bind-mount %q not accessible inside prestoback container (not passed through?): %v",
+					name, hostPath, statErr)
+				continue
+			}
+			if !info.IsDir() {
+				// Bind-mounted a single file rather than a directory — skip.
+				continue
+			}
+
 			if alreadyRegistered[hostPath] || seen[hostPath] {
 				continue
 			}
@@ -229,15 +240,24 @@ func parseBindMount(bind string) (hostPath, containerPath string) {
 }
 
 // isSystemPath returns true for paths that are never useful to back up.
+// "/" must be caught explicitly — backing it up tars the entire OS.
 func isSystemPath(path string) bool {
+	// Normalize away any trailing slash so "/proc/" and "/proc" both match.
+	path = strings.TrimRight(path, "/")
+	if path == "" {
+		// An empty string or bare "/" after trimming is the root filesystem.
+		return true
+	}
 	systemPrefixes := []string{
 		"/proc", "/sys", "/dev", "/run", "/tmp",
 		"/var/run/docker.sock",
 		"/etc/localtime", "/etc/timezone",
-		"/usr/", "/bin/", "/sbin/", "/lib/",
+		"/usr", "/bin", "/sbin", "/lib",
+		// Common whole-host mount points that appear when / is bind-mounted.
+		"/boot", "/lost+found",
 	}
 	for _, prefix := range systemPrefixes {
-		if path == prefix || strings.HasPrefix(path, prefix) {
+		if path == prefix || strings.HasPrefix(path, prefix+"/") {
 			return true
 		}
 	}

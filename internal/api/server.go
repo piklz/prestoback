@@ -20,13 +20,13 @@ import (
 )
 
 type Server struct {
-	cfg       *config.Config
-	engine    *backup.Engine
-	hist      *history.Log
-	sched     *scheduler.Scheduler
-	mux       *http.ServeMux
-	image     string
-	selfName  string
+	cfg      *config.Config
+	engine   *backup.Engine
+	hist     *history.Log
+	sched    *scheduler.Scheduler
+	mux      *http.ServeMux
+	image    string
+	selfName string
 
 	sseClients map[chan backup.JobUpdate]struct{}
 	sseMu      sync.Mutex
@@ -72,7 +72,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/healthz", s.handleHealth)
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/api/health", s.handleHealth)
-	s.mux.HandleFunc("/api/status", s.handleStatus)   // public — used by UI before login & Docker healthcheck
+	s.mux.HandleFunc("/api/status", s.handleStatus)          // public — used by UI before login & Docker healthcheck
 	s.mux.HandleFunc("/api/auth/status", s.handleAuthStatus) // {setup_required, version}
 	s.mux.HandleFunc("/api/auth/setup", s.handleAuthSetup)   // first-run setup
 	s.mux.HandleFunc("/api/auth/login", s.handleAuthLogin)   // credential login → JWT
@@ -98,7 +98,6 @@ func (s *Server) routes() {
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
-
 
 // SSE uses query param auth so EventSource (no custom headers) works.
 // Accepts ?token=<jwt> or legacy ?api_key=<apikey>
@@ -443,7 +442,50 @@ func (s *Server) runBackup(app config.AppConfig, remoteID string, scheduled bool
 	}
 	emit(fmt.Sprintf("━━━ %s backup started: %s ━━━", prefix, app.Name))
 
-	containers := backup.FindContainers(app.ID)
+	// ── Pre-flight: validate path before touching Docker or the tar engine ─
+	if app.Path == "" {
+		msg := "backup aborted: no path configured for this app"
+		emit("✗ " + msg)
+		s.hist.Append(history.Entry{
+			Event: history.EventBackupFail, AppID: app.ID, AppName: app.Name,
+			Detail: msg, DurationMs: time.Since(start).Milliseconds(),
+		})
+		s.dispatchNotify(notify.Event{Kind: "backup_fail", AppName: app.Name, Detail: msg, IsError: true})
+		return
+	}
+	if isDangerousPath(app.Path) {
+		msg := fmt.Sprintf("backup aborted: refusing to back up dangerous path %q — this would tar the entire filesystem", app.Path)
+		emit("✗ " + msg)
+		s.hist.Append(history.Entry{
+			Event: history.EventBackupFail, AppID: app.ID, AppName: app.Name,
+			Detail: msg, DurationMs: time.Since(start).Milliseconds(),
+		})
+		s.dispatchNotify(notify.Event{Kind: "backup_fail", AppName: app.Name, Detail: msg, IsError: true})
+		return
+	}
+	if info, err := os.Stat(app.Path); err != nil {
+		msg := fmt.Sprintf("backup aborted: path %q is not accessible inside this container: %v", app.Path, err)
+		emit("✗ " + msg)
+		emit("  Tip: the path must be mounted into prestoback, not just exist on the host.")
+		s.hist.Append(history.Entry{
+			Event: history.EventBackupFail, AppID: app.ID, AppName: app.Name,
+			Detail: msg, DurationMs: time.Since(start).Milliseconds(),
+		})
+		s.dispatchNotify(notify.Event{Kind: "backup_fail", AppName: app.Name, Detail: msg, IsError: true})
+		return
+	} else if !info.IsDir() {
+		msg := fmt.Sprintf("backup aborted: path %q is not a directory", app.Path)
+		emit("✗ " + msg)
+		s.hist.Append(history.Entry{
+			Event: history.EventBackupFail, AppID: app.ID, AppName: app.Name,
+			Detail: msg, DurationMs: time.Since(start).Milliseconds(),
+		})
+		s.dispatchNotify(notify.Event{Kind: "backup_fail", AppName: app.Name, Detail: msg, IsError: true})
+		return
+	}
+	// ── End pre-flight ─────────────────────────────────────────────────────
+
+	containers := backup.FindContainers(app.ContainerName, app.ID)
 	if len(containers) == 0 {
 		emit("⚠  No running containers found — backing up live files")
 	}
@@ -514,7 +556,7 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, ba
 		emit := func(msg string) { s.engine.EmitLog(app.ID, msg) }
 		emit("━━━ Restore started: " + app.Name + " [" + backupID + "] ━━━")
 
-		containers := backup.FindContainers(app.ID)
+		containers := backup.FindContainers(app.ContainerName, app.ID)
 		if len(containers) == 0 {
 			emit("⚠  No running containers found")
 		}
@@ -946,4 +988,25 @@ func safeSlice(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+// isDangerousPath returns true for paths that must never be backed up because
+// tarring them would capture the entire OS or a critical system tree.
+func isDangerousPath(path string) bool {
+	// Trim trailing slashes so "/" and "//" both match.
+	p := strings.TrimRight(path, "/")
+	if p == "" {
+		return true // bare root
+	}
+	blocked := []string{
+		"/proc", "/sys", "/dev", "/run", "/tmp",
+		"/var/run", "/usr", "/bin", "/sbin", "/lib",
+		"/boot", "/lost+found", "/etc",
+	}
+	for _, b := range blocked {
+		if p == b || strings.HasPrefix(p, b+"/") {
+			return true
+		}
+	}
+	return false
 }
