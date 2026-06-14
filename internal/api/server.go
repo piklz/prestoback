@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -21,13 +22,13 @@ import (
 )
 
 type Server struct {
-	cfg       *config.Config
-	engine    *backup.Engine
-	hist      *history.Log
-	sched     *scheduler.Scheduler
-	mux       *http.ServeMux
-	image     string
-	selfName  string
+	cfg      *config.Config
+	engine   *backup.Engine
+	hist     *history.Log
+	sched    *scheduler.Scheduler
+	mux      *http.ServeMux
+	image    string
+	selfName string
 
 	sseClients map[chan backup.JobUpdate]struct{}
 	sseMu      sync.Mutex
@@ -73,7 +74,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/healthz", s.handleHealth)
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/api/health", s.handleHealth)
-	s.mux.HandleFunc("/api/status", s.handleStatus)   // public — used by UI before login & Docker healthcheck
+	s.mux.HandleFunc("/api/status", s.handleStatus)          // public — used by UI before login & Docker healthcheck
 	s.mux.HandleFunc("/api/auth/status", s.handleAuthStatus) // {setup_required, version}
 	s.mux.HandleFunc("/api/auth/setup", s.handleAuthSetup)   // first-run setup
 	s.mux.HandleFunc("/api/auth/login", s.handleAuthLogin)   // credential login → JWT
@@ -101,7 +102,6 @@ func (s *Server) routes() {
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
-
 
 // SSE uses query param auth so EventSource (no custom headers) works.
 // Accepts ?token=<jwt> or legacy ?api_key=<apikey>
@@ -404,10 +404,10 @@ func (s *Server) handleDirSize(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	respond(w, 200, map[string]any{
-		"path":        path,
-		"bytes":       totalBytes,
-		"file_count":  fileCount,
-		"human":       humanBytes(totalBytes),
+		"path":       path,
+		"bytes":      totalBytes,
+		"file_count": fileCount,
+		"human":      humanBytes(totalBytes),
 	})
 }
 
