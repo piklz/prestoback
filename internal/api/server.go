@@ -763,7 +763,7 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		respond(w, 200, map[string]any{"available": false, "reason": "PRESTOBACK_IMAGE not set"})
 		return
 	}
-	hasUpdate, local, remote, err := backup.CheckForUpdate(s.image)
+	hasUpdate, local, remote, err := backup.ForceCheckForUpdate(s.image)
 	if err != nil {
 		respond(w, 200, map[string]any{"available": false, "error": err.Error()})
 		return
@@ -773,6 +773,7 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		"local_digest":  safeSlice(local, 19),
 		"remote_digest": safeSlice(remote, 19),
 		"image":         s.image,
+		"locally_built": local == "local-build",
 	})
 }
 

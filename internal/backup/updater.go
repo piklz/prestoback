@@ -383,10 +383,16 @@ func doCheckForUpdate(image string) (bool, string, string, error) {
 		}
 	}
 	if localDigest == "" {
-		// Image was built locally and never pulled — no remote digest to compare.
-		// Treat as up-to-date to avoid false positives.
-		log.Printf("[updater] no RepoDigests for %s (locally built?) — skipping check", image)
-		return false, "local-build", "", nil
+		// Image was built locally (docker build / compose build) and has never
+		// been pulled from a registry — no manifest digest to compare locally.
+		// Still fetch the remote digest so we can tell the user a registry
+		// version exists and let them pull it.
+		log.Printf("[updater] no RepoDigests for %s (locally built) — fetching remote digest anyway", image)
+		remoteDigest, err := headRegistryDigest(image)
+		if err != nil {
+			return false, "local-build", "", fmt.Errorf("registry check failed: %w", err)
+		}
+		return true, "local-build", remoteDigest, nil
 	}
 
 	// ── Step 2: remote digest via registry HEAD (no download) ─────────────────
