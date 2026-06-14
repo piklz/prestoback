@@ -120,9 +120,12 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 	for i, a := range runArgs {
 		quotedArgs[i] = shellEscape(a)
 	}
+	// docker rm -f atomically force-stops and removes in one operation.
+	// This avoids a race condition with restart:always policies where the
+	// container restarts between a docker stop and docker rm.
 	stopScript := fmt.Sprintf(
-		"sleep 5 && docker stop -t 30 %s ; docker rm -f %s ; docker run %s",
-		shellEscape(selfName), shellEscape(selfName), strings.Join(quotedArgs, " "),
+		"sleep 5 && docker rm -f %s && docker run %s",
+		shellEscape(selfName), strings.Join(quotedArgs, " "),
 	)
 	log.Printf("[updater] helper script: %s", stopScript)
 	emit(UpdateResult{Stage: "stopping", Message: "Spawning update helper…"})
@@ -216,10 +219,14 @@ func buildDockerRunArgs(c containerInspect, containerName, newImage string) ([]s
 	// Labels — preserve ALL labels including com.docker.compose.* so compose
 	// continues to own and recognise this container after the update.
 	// Skip Docker-internal desktop and buildkit labels.
+	// Preserve ALL compose labels including config-hash.
+	// Without config-hash, compose treats the container as a foreign orphan and
+	// tries to CREATE a new one rather than stop+rm+recreate → name conflict.
+	// With a stale config-hash, compose sees "owned, config changed" → correctly
+	// stops the existing container then recreates with a fresh hash.
 	skipLabelPrefixes := []string{
 		"com.docker.desktop.",
 		"org.opencontainers.image.",
-		"com.docker.compose.config-hash", // will be stale after update anyway
 	}
 	for k, v := range c.Config.Labels {
 		skip := false
