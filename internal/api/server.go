@@ -48,7 +48,6 @@ func NewServer(cfg *config.Config, image, selfName string) *Server {
 	}
 	s.routes()
 	s.loadSchedules()
-	sched.Start()
 	go s.broadcastUpdates()
 	go s.runTelegramBot()
 	return s
@@ -64,7 +63,7 @@ func (s *Server) Run(port int) error {
 	return http.ListenAndServe(fmt.Sprintf(":%d", port), s.mux)
 }
 
-// ── Routes ────────────────────────────────────────────────────────────────────
+// ── Routes ───────────────────────────────────────────────────────────��[...]
 
 func (s *Server) routes() {
 	// Public — no auth
@@ -89,7 +88,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/update/apply", s.auth(s.handleUpdateApply))
 }
 
-// ── Auth middleware ───────────────────────────────────────────────────────────
+// ── Auth middleware ────────────────────────────────────────────────────────��[...]
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -164,13 +163,13 @@ func (s *Server) broadcastUpdates() {
 	}
 }
 
-// ── Health ────────────────────────────────────────────────────────────────────
+// ── Health ───────────────────────────────────────────────────────────�[...]
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]string{"status": "ok", "version": config.Version})
 }
 
-// ── Status ────────────────────────────────────────────────────────────────────
+// ── Status ───────────────────────────────────────────────────────────�[...]
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]any{
@@ -185,13 +184,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ── History ───────────────────────────────────────────────────────────────────
+// ── History ───────────────────────────────────────────────────────────[...]
 
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, s.hist.List(100))
 }
 
-// ── Notifications ─────────────────────────────────────────────────────────────
+// ── Notifications ─────────────────────────────────────────────────────────[...]
 
 func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -245,7 +244,7 @@ func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ── API key regen ─────────────────────────────────────────────────────────────
+// ── API key regen ─────────────────────────────────────────────────────────[...]
 
 func (s *Server) handleRegenKey(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -256,7 +255,7 @@ func (s *Server) handleRegenKey(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]string{"api_key": newKey})
 }
 
-// ── Volumes ───────────────────────────────────────────────────────────────────
+// ── Volumes ───────────────────────────────────────────────────────────[...]
 
 func (s *Server) handleListVolumes(w http.ResponseWriter, r *http.Request) {
 	entries, err := os.ReadDir(s.cfg.VolumesDir)
@@ -308,7 +307,7 @@ func (s *Server) handleValidatePath(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ── Apps ──────────────────────────────────────────────────────────────────────
+// ── Apps ────────────────────────────────────────────────────────────[...]
 
 func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -388,7 +387,7 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ── Backup ────────────────────────────────────────────────────────────────────
+// ── Backup ───────────────────────────────────────────────────────────�[...]
 
 func (s *Server) handleTriggerBackup(w http.ResponseWriter, r *http.Request, appID string) {
 	app, ok := s.cfg.GetApp(appID)
@@ -462,7 +461,7 @@ func (s *Server) runBackup(app config.AppConfig, remoteID string, scheduled bool
 	emit("━━━ Backup complete ━━━")
 }
 
-// ── Restore ───────────────────────────────────────────────────────────────────
+// ── Restore ───────────────────────────────────────────────────────────[...]
 
 func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, backupID string) {
 	app, ok := s.cfg.GetApp(appID)
@@ -514,7 +513,7 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, ba
 	}()
 }
 
-// ── Backups ───────────────────────────────────────────────────────────────────
+// ── Backups ───────────────────────────────────────────────────────────[...]
 
 func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
 	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/api/backups/"), "/", 3)
@@ -589,7 +588,7 @@ func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ── Remotes ───────────────────────────────────────────────────────────────────
+// ── Remotes ───────────────────────────────────────────────────────────[...]
 
 func (s *Server) handleRemotes(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -649,7 +648,7 @@ func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
 	errOut(w, 405, "method not allowed")
 }
 
-// ── Self-update ───────────────────────────────────────────────────────────────
+// ── Self-update ─────────────────────────────────────────────────────────��[...]
 
 func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	if s.image == "" {
@@ -687,7 +686,7 @@ func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
-// ── Scheduler ─────────────────────────────────────────────────────────────────
+// ── Scheduler ──────────────────────────────────────────────────────────�[...]
 
 func (s *Server) loadSchedules() {
 	for _, app := range s.cfg.ListApps() {
@@ -718,7 +717,7 @@ func (s *Server) syncSchedule(app config.AppConfig) {
 	})
 }
 
-// ── Telegram bot ──────────────────────────────────────────────────────────────
+// ── Telegram bot ─────────────────────────────────────────────────────────�[...]
 
 func (s *Server) runTelegramBot() {
 	offset := 0
@@ -866,7 +865,7 @@ func (s *Server) findAppByNameFragment(fragment string) *config.AppConfig {
 	return nil
 }
 
-// ── Notify dispatch ───────────────────────────────────────────────────────────
+// ── Notify dispatch ────────────────────────────────────────────────────────[...]
 
 func (s *Server) dispatchNotify(ev notify.Event) {
 	nc := s.cfg.GetNotify()
@@ -888,7 +887,7 @@ func (s *Server) dispatchNotify(ev notify.Event) {
 	}, ev)
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────[...]
 
 func respond(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
