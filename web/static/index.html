@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrestoBack devla</title>
+<title>PrestoBack</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#0c0e11;--bg2:#111418;--bg3:#181c22;--bg4:#1e2330;--line:rgba(255,255,255,.07);--line2:rgba(255,255,255,.13);--txt:#e8eaf0;--txt2:#8b90a0;--txt3:#555b6e;--accent:#4f9cf9;--accent2:#3b7ad4;--green:#3dd68c;--gd:rgba(61,214,140,.12);--red:#f05f5f;--rd:rgba(240,95,95,.12);--amber:#f5a623;--ad:rgba(245,166,35,.12);--bld:rgba(79,156,249,.12);--r:10px;--rs:6px;--mono:'IBM Plex Mono',monospace;--head:'Syne',sans-serif;--body:'DM Sans',sans-serif}
@@ -313,6 +313,18 @@ select.fi{cursor:pointer}
       <div class="stat"><div class="sl">Remotes</div><div class="sv" id="s-rem">0</div></div>
       <div class="stat"><div class="sl">Total Backups</div><div class="sv g" id="s-total">—</div></div>
       <div class="stat"><div class="sl">Scheduled Jobs</div><div class="sv am" id="s-sched">0</div></div>
+      <div class="stat" id="s-disk-stat" style="display:none">
+        <div class="sl">Backup disk free</div>
+        <div class="sv" id="s-disk" style="font-size:16px">—</div>
+        <div style="height:4px;background:var(--bg3);border-radius:2px;margin-top:6px;overflow:hidden">
+          <div id="s-disk-bar" style="height:100%;background:var(--green);border-radius:2px;transition:width .5s"></div>
+        </div>
+      </div>
+      <div class="stat" id="s-next-stat" style="display:none">
+        <div class="sl">Next scheduled backup</div>
+        <div class="sv" id="s-next" style="font-size:13px;font-family:var(--mono)">—</div>
+        <div style="font-size:11px;color:var(--txt3);margin-top:3px" id="s-next-app"></div>
+      </div>
     </div>
     <div class="card">
       <div class="ch"><div class="ct">Live activity</div><span class="pill pg"><span class="pd"></span>SSE</span></div>
@@ -644,6 +656,7 @@ select.fi{cursor:pointer}
       </div>
       <div class="fg" style="margin-top:16px"><label class="fl">Push to remote after backup (optional)</label><select class="fi" id="bk-rem"><option value="">Local only</option></select></div>
       <div id="bk-prog" style="display:none"><div style="font-size:12px;color:var(--txt2);margin-bottom:6px">Running — watch the activity log</div><div class="pw"><div class="pb2"></div></div></div>
+      <div id="bk-size-warn" style="font-size:12px;margin-top:8px"></div>
     </div>
     <div class="mf"><button class="btn btn-g" onclick="CM('m-bk')">Cancel</button><button class="btn btn-p" id="bk-run" onclick="runBackup()">▶ Start Backup</button></div>
   </div>
@@ -903,6 +916,46 @@ async function loadStatus() {
     if (d.built_at) {
       const builtDate = new Date(d.built_at);
       document.getElementById('upd-built').textContent = isNaN(builtDate) ? d.built_at : builtDate.toLocaleString();
+    }
+    // Disk space
+    if (d.disk_total_bytes && d.disk_total_bytes > 0) {
+      const free = d.disk_free_bytes, total = d.disk_total_bytes;
+      const pctUsed = ((total - free) / total) * 100;
+      const freeGb = (free / (1024*1024*1024)).toFixed(1);
+      const totalGb = (total / (1024*1024*1024)).toFixed(1);
+      const diskEl = document.getElementById('s-disk');
+      if (diskEl) {
+        diskEl.textContent = freeGb + ' GB free';
+        diskEl.style.color = pctUsed > 90 ? 'var(--red)' : pctUsed > 75 ? 'var(--amber)' : 'var(--txt)';
+        const bar = document.getElementById('s-disk-bar');
+        if (bar) {
+          bar.style.width = Math.min(pctUsed, 100) + '%';
+          bar.style.background = pctUsed > 90 ? 'var(--red)' : pctUsed > 75 ? 'var(--amber)' : 'var(--green)';
+        }
+        const diskSub = document.createElement('div');
+        diskEl.title = freeGb + ' GB free of ' + totalGb + ' GB';
+        document.getElementById('s-disk-stat').style.display = '';
+      }
+    }
+    // Next scheduled run
+    if (d.next_runs && d.next_runs.length) {
+      const upcoming = d.next_runs
+        .filter(r => r.next_run)
+        .sort((a,b) => new Date(a.next_run) - new Date(b.next_run));
+      if (upcoming.length) {
+        const next = upcoming[0];
+        const app = S.apps.find(a => a.id === next.app_id);
+        const nextDate = new Date(next.next_run);
+        const mins = Math.round((nextDate - Date.now()) / 60000);
+        const timeStr = mins < 60
+          ? `in ${mins}m`
+          : mins < 1440
+          ? `in ${Math.round(mins/60)}h`
+          : nextDate.toLocaleDateString();
+        document.getElementById('s-next').textContent = timeStr;
+        document.getElementById('s-next-app').textContent = app ? app.name : next.app_id;
+        document.getElementById('s-next-stat').style.display = '';
+      }
     }
     document.getElementById('api-key-display').childNodes[0].textContent = S.apiKey;
     document.getElementById('curl-example').textContent =
@@ -1184,7 +1237,22 @@ function openBkModal(id,name) {
   document.getElementById('bk-rem').innerHTML='<option value="">Local only</option>'+S.remotes.map(r=>`<option value="${r.id}">${esc(r.label)} (${esc(r.host)})</option>`).join('');
   document.getElementById('bk-prog').style.display='none';
   document.getElementById('bk-run').disabled=false;
+  document.getElementById('bk-size-warn').textContent='';
   OM('m-bk');
+  // Async size check — shows after modal opens
+  const app = S.apps.find(a=>a.id===id);
+  if (app && app.path) {
+    api('/api/dir-size?path='+encodeURIComponent(app.path)).then(sz => {
+      if (!sz || !sz.bytes) return;
+      const gb = sz.bytes/(1024*1024*1024);
+      if (gb < 0.1) return; // < 100MB — no warning needed
+      const hasExcludes = app.excludes && app.excludes.length > 0;
+      const warn = document.getElementById('bk-size-warn');
+      warn.innerHTML = `⚠ Source: <strong>${sz.human}</strong> (${sz.file_count.toLocaleString()} files)`
+        + (gb > 2 && !hasExcludes ? ' — tip: add exclude patterns in app settings to skip cache dirs' : '');
+      warn.style.color = gb > 2 ? 'var(--amber)' : 'var(--txt2)';
+    }).catch(()=>{});
+  }
 }
 async function runBackup() {
   const rem=document.getElementById('bk-rem').value;

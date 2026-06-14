@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/pi/prestoback/internal/backup"
@@ -85,6 +86,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/discover", s.authJWT(s.handleDiscover))
 	s.mux.HandleFunc("/api/suggest-excludes", s.authJWT(s.handleSuggestExcludes))
 	s.mux.HandleFunc("/api/validate-path", s.authJWT(s.handleValidatePath))
+	s.mux.HandleFunc("/api/dir-size", s.authJWT(s.handleDirSize))
 	s.mux.HandleFunc("/api/apps", s.authJWT(s.handleApps))
 	s.mux.HandleFunc("/api/apps/", s.authJWT(s.handleApp))
 	s.mux.HandleFunc("/api/backups/", s.authJWT(s.handleBackups))
@@ -183,16 +185,66 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // ── Status ────────────────────────────────────────────────────────────────────
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	// Image build timestamp (best-effort)
+	builtAt := ""
+	if s.image != "" {
+		if out, err := exec.Command("docker", "image", "inspect",
+			"--format={{.Created}}", s.image).Output(); err == nil {
+			builtAt = strings.TrimSpace(string(out))
+		}
+	}
+
+	// Disk space on the backup volume
+	var diskFreeBytes, diskTotalBytes uint64
+	if stat, err := diskUsage(s.cfg.BackupDir()); err == nil {
+		diskFreeBytes = stat.free
+		diskTotalBytes = stat.total
+	}
+
+	// Next scheduled run per app
+	nextRuns := s.sched.NextRuns()
+
 	respond(w, 200, map[string]any{
-		"version":      config.Version,
-		"app_count":    s.cfg.AppCount(),
-		"remote_count": len(s.cfg.ListRemotes()),
-		"volumes_dir":  s.cfg.VolumesDir,
-		"backup_dir":   s.cfg.BackupDir(),
-		"image":        s.image,
-		"self_name":    s.selfName,
-		"time":         time.Now().UTC(),
+		"version":          config.Version,
+		"app_count":        s.cfg.AppCount(),
+		"remote_count":     len(s.cfg.ListRemotes()),
+		"volumes_dir":      s.cfg.VolumesDir,
+		"backup_dir":       s.cfg.BackupDir(),
+		"image":            s.image,
+		"self_name":        s.selfName,
+		"built_at":         builtAt,
+		"time":             time.Now().UTC(),
+		"disk_free_bytes":  diskFreeBytes,
+		"disk_total_bytes": diskTotalBytes,
+		"next_runs":        nextRuns,
 	})
+}
+
+// diskStat holds free and total bytes for a filesystem.
+type diskStat struct{ free, total uint64 }
+
+func diskUsage(path string) (diskStat, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return diskStat{}, err
+	}
+	return diskStat{
+		free:  stat.Bavail * uint64(stat.Bsize),
+		total: stat.Blocks * uint64(stat.Bsize),
+	}, nil
+}
+
+func humanBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 // ── History ───────────────────────────────────────────────────────────────────
@@ -329,6 +381,47 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 		candidates = []backup.DiscoveredApp{}
 	}
 	respond(w, 200, candidates)
+}
+
+// handleDirSize returns the approximate size of a directory in bytes.
+// Used by the UI to warn before backing up very large directories.
+func (s *Server) handleDirSize(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		errOut(w, 400, "path required")
+		return
+	}
+	var totalBytes int64
+	fileCount := 0
+	_ = filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil || info == nil {
+			return nil
+		}
+		if info.Mode().IsRegular() {
+			totalBytes += info.Size()
+			fileCount++
+		}
+		return nil
+	})
+	respond(w, 200, map[string]any{
+		"path":        path,
+		"bytes":       totalBytes,
+		"file_count":  fileCount,
+		"human":       humanBytes(totalBytes),
+	})
+}
+
+func humanBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 // handleValidatePath checks whether an arbitrary path is readable inside the container.
