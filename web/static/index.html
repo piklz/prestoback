@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrestoBack dev</title>
+<title>PrestoBack devla</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#0c0e11;--bg2:#111418;--bg3:#181c22;--bg4:#1e2330;--line:rgba(255,255,255,.07);--line2:rgba(255,255,255,.13);--txt:#e8eaf0;--txt2:#8b90a0;--txt3:#555b6e;--accent:#4f9cf9;--accent2:#3b7ad4;--green:#3dd68c;--gd:rgba(61,214,140,.12);--red:#f05f5f;--rd:rgba(240,95,95,.12);--amber:#f5a623;--ad:rgba(245,166,35,.12);--bld:rgba(79,156,249,.12);--r:10px;--rs:6px;--mono:'IBM Plex Mono',monospace;--head:'Syne',sans-serif;--body:'DM Sans',sans-serif}
@@ -488,36 +488,68 @@ select.fi{cursor:pointer}
 <div id="view-upd" class="view-hidden">
   <div class="ph"><div><div class="pt">Updates</div><div class="ps">Self-update PrestoBack from DockerHub</div></div></div>
   <div class="sec">
-    <div class="card"><div class="ch"><div class="ct">Current version</div></div><div class="cb">
-      <div class="fr" style="margin-bottom:16px;flex-wrap:wrap;gap:16px">
-        <div><div class="sl">Running</div><div style="font-family:var(--mono);font-size:15px" id="upd-ver">—</div></div>
-        <div><div class="sl">Image</div><div style="font-family:var(--mono);font-size:11px;color:var(--txt2);margin-top:4px" id="upd-img">—</div></div>
-        <div><div class="sl">Local digest</div><div style="font-family:var(--mono);font-size:11px;color:var(--txt2);margin-top:4px" id="upd-local-digest">—</div></div>
-        <div><div class="sl">Image built</div><div style="font-family:var(--mono);font-size:11px;color:var(--txt2);margin-top:4px" id="upd-built">—</div></div>
-        <div><div class="sl">Last checked</div><div style="font-family:var(--mono);font-size:11px;color:var(--txt2);margin-top:4px" id="upd-checked">—</div></div>
+
+    <!-- Current version card -->
+    <div class="card"><div class="ch"><div class="ct">Running version</div></div><div class="cb">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px;margin-bottom:18px">
+        <div><div class="sl">Version</div><div style="font-family:var(--mono);font-size:15px;margin-top:3px" id="upd-ver">—</div></div>
+        <div><div class="sl">Image</div><div style="font-family:var(--mono);font-size:11px;color:var(--txt2);margin-top:3px;word-break:break-all" id="upd-img">—</div></div>
+        <div><div class="sl">Built</div><div style="font-family:var(--mono);font-size:11px;color:var(--txt2);margin-top:3px" id="upd-built">—</div></div>
       </div>
       <button class="btn btn-g btn-sm" id="check-btn" onclick="checkUpdate()">↺ Check for update</button>
+      <span style="font-size:11px;color:var(--txt3);margin-left:12px" id="upd-checked"></span>
     </div></div>
-    <div class="card" id="upd-avail" style="display:none">
-      <div class="ch"><div class="ct" style="color:var(--amber)">⭐ Update available</div></div>
+
+    <!-- Digest comparison table — always visible after first check -->
+    <div class="card" id="upd-digest-card" style="display:none">
+      <div class="ch" style="display:flex;align-items:center;justify-content:space-between">
+        <div class="ct" id="upd-status-title">Digest comparison</div>
+        <div id="upd-status-badge"></div>
+      </div>
       <div class="cb">
-        <div style="font-size:12px;color:var(--txt2);margin-bottom:14px;font-family:var(--mono);display:flex;flex-direction:column;gap:6px">
-          <div><span style="color:var(--txt3)">local&nbsp;&nbsp;</span><span id="upd-local-short">—</span></div>
-          <div><span style="color:var(--txt3)">remote </span><span id="upd-remote-short" style="color:var(--amber)">—</span></div>
+        <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px">
+          <thead>
+            <tr style="color:var(--txt3);font-size:10px;letter-spacing:.5px;text-transform:uppercase">
+              <th style="text-align:left;padding:0 0 8px 0;width:70px">Source</th>
+              <th style="text-align:left;padding:0 0 8px 0">Digest (sha256)</th>
+              <th style="text-align:left;padding:0 0 8px 0;width:180px">Checked</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="border-top:1px solid var(--line)">
+              <td style="padding:10px 0;color:var(--txt3)">local</td>
+              <td style="padding:10px 8px 10px 0"><span id="upd-local-full" style="color:var(--txt2)">—</span></td>
+              <td style="padding:10px 0;color:var(--txt3)" id="upd-local-time">—</td>
+            </tr>
+            <tr style="border-top:1px solid var(--line)">
+              <td style="padding:10px 0;color:var(--txt3)">remote</td>
+              <td style="padding:10px 8px 10px 0"><span id="upd-remote-full" style="color:var(--txt2)">—</span></td>
+              <td style="padding:10px 0;color:var(--txt3)" id="upd-remote-time">—</td>
+            </tr>
+          </tbody>
+        </table>
+        <div id="upd-update-btn-row" style="display:none;margin-top:14px">
+          <button class="btn btn-w" onclick="openUpdModal()">⬆ Update now</button>
+          <span style="font-size:12px;color:var(--txt2);margin-left:12px">New image available on DockerHub</span>
         </div>
-        <button class="btn btn-w" onclick="openUpdModal()">Update now</button>
       </div>
     </div>
+
+    <!-- How it works -->
     <div class="card"><div class="ch"><div class="ct">How self-update works</div></div><div class="cb" style="color:var(--txt2);font-size:13px">
       <div class="steps">
-        <div class="step"><div class="sn">1</div>Pulls new image from DockerHub</div>
-        <div class="step"><div class="sn">2</div>Drains active jobs (max 60s)</div>
+        <div class="step"><div class="sn">1</div>Checks DockerHub registry digest via API (no download)</div>
+        <div class="step"><div class="sn">2</div>If different: pulls new image, drains active jobs (max 60s)</div>
         <div class="step"><div class="sn">3</div>Spawns a detached helper container via Docker socket</div>
-        <div class="step"><div class="sn">4</div>Helper stops this container, removes it, starts new one with same flags</div>
-        <div class="step"><div class="sn">5</div>PrestoBack is back up in ~15–20s — config and backups untouched</div>
+        <div class="step"><div class="sn">4</div>Helper force-removes this container then starts new one with same flags + labels</div>
+        <div class="step"><div class="sn">5</div>PrestoBack is back up in ~15s — config, backups, and compose ownership untouched</div>
       </div>
-      <div class="info-b" style="margin-top:14px"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg><div class="info-t">After clicking Apply, this page will briefly disconnect. <strong>Wait ~20 seconds then refresh manually.</strong> The helper container (<code>prestoback-updater</code>) stops itself automatically once the new container is running.</div></div>
+      <div class="info-b" style="margin-top:14px">
+        <svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>
+        <div class="info-t">After clicking Update, this page will briefly disconnect. <strong>Wait ~20s then refresh.</strong> If PrestoBack doesn't return, check: <code>docker logs prestoback-updater</code></div>
+      </div>
     </div></div>
+
   </div>
 </div>
 
@@ -1458,31 +1490,60 @@ async function regenKey() {
 }
 
 // ════════════════════ Updates ════════════════════
+function fmtDigest(d) {
+  // Show full sha256 hash, space-separated into groups of 8 for readability
+  if (!d || d === 'local-build') return d || '—';
+  const hex = d.replace('sha256:','');
+  return 'sha256: ' + hex.match(/.{1,8}/g).join(' ');
+}
 async function checkUpdate() {
-  const btn=document.getElementById('check-btn');
-  btn.disabled=true; btn.textContent='Checking…';
+  const btn = document.getElementById('check-btn');
+  btn.disabled = true; btn.textContent = 'Checking…';
   try {
-    const r=await api('/api/update/check');
-    const now=new Date().toLocaleString();
-    document.getElementById('upd-checked').textContent=now;
-    // Always update local digest display from check result
-    if (r.local_digest && r.local_digest !== 'local-build') {
-      document.getElementById('upd-local-digest').textContent=r.local_digest.replace('sha256:','').slice(0,12)+'…';
-      document.getElementById('upd-local-short').textContent=r.local_digest.replace('sha256:','').slice(0,12)+'…';
+    const r = await api('/api/update/check');
+    const now = new Date();
+    const nowStr = now.toLocaleString();
+
+    // Show checked timestamp next to button
+    document.getElementById('upd-checked').textContent = 'Last checked: ' + nowStr;
+
+    // Show digest comparison card
+    const card = document.getElementById('upd-digest-card');
+    card.style.display = '';
+
+    // Local digest row
+    const localDigest = r.local_digest && r.local_digest !== 'local-build' ? r.local_digest : null;
+    document.getElementById('upd-local-full').textContent = localDigest ? fmtDigest(localDigest) : 'local build (no registry digest)';
+    document.getElementById('upd-local-time').textContent = nowStr;
+
+    // Remote digest row
+    if (r.remote_digest) {
+      document.getElementById('upd-remote-full').textContent = fmtDigest(r.remote_digest);
+      document.getElementById('upd-remote-time').textContent = nowStr;
     }
-    if (r.available) {
-      document.getElementById('upd-avail').style.display='';
-      document.getElementById('upd-remote-short').textContent=r.remote_digest.replace('sha256:','').slice(0,12)+'…';
+
+    if (r.error) {
+      document.getElementById('upd-status-title').textContent = 'Check failed';
+      document.getElementById('upd-status-badge').innerHTML = '<span style="color:var(--red);font-size:12px">⚠ ' + esc(r.error) + '</span>';
+      document.getElementById('upd-update-btn-row').style.display = 'none';
+      toast('Check failed: ' + r.error, 'error');
+    } else if (r.available) {
+      document.getElementById('upd-status-title').textContent = '⭐ Update available';
+      document.getElementById('upd-status-badge').innerHTML = '<span style="background:var(--amber);color:#000;font-size:11px;font-weight:600;padding:2px 8px;border-radius:99px">NEW</span>';
+      document.getElementById('upd-remote-full').style.color = 'var(--amber)';
+      document.getElementById('upd-update-btn-row').style.display = '';
       document.getElementById('upd-dot').classList.add('show');
-      toast('Update available!','warn');
+      toast('Update available!', 'warn');
     } else {
-      document.getElementById('upd-avail').style.display='none';
+      document.getElementById('upd-status-title').textContent = 'Digest comparison';
+      document.getElementById('upd-status-badge').innerHTML = '<span style="color:var(--green);font-size:12px">✓ Up to date</span>';
+      document.getElementById('upd-remote-full').style.color = 'var(--green)';
+      document.getElementById('upd-update-btn-row').style.display = 'none';
       document.getElementById('upd-dot').classList.remove('show');
-      if (r.remote_digest) document.getElementById('upd-remote-short').textContent=r.remote_digest.replace('sha256:','').slice(0,12)+'…';
-      toast(r.error?'Check failed: '+r.error:'Already up to date ✓','info');
+      toast('Already up to date ✓', 'info');
     }
-  } catch(e) { toast(e.message,'error'); }
-  btn.disabled=false; btn.textContent='↺ Check for update';
+  } catch(e) { toast(e.message, 'error'); }
+  btn.disabled = false; btn.textContent = '↺ Check for update';
 }
 function openUpdModal() { OM('m-upd'); }
 async function applyUpdate() {
