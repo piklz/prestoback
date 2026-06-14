@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/pi/prestoback/internal/backup"
@@ -50,7 +49,6 @@ func NewServer(cfg *config.Config, image, selfName string) *Server {
 	}
 	s.routes()
 	s.loadSchedules()
-	sched.Start()
 	go s.broadcastUpdates()
 	go s.runTelegramBot()
 	return s
@@ -218,33 +216,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"disk_total_bytes": diskTotalBytes,
 		"next_runs":        nextRuns,
 	})
-}
-
-// diskStat holds free and total bytes for a filesystem.
-type diskStat struct{ free, total uint64 }
-
-func diskUsage(path string) (diskStat, error) {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
-		return diskStat{}, err
-	}
-	return diskStat{
-		free:  stat.Bavail * uint64(stat.Bsize),
-		total: stat.Blocks * uint64(stat.Bsize),
-	}, nil
-}
-
-func humanBytes(b int64) string {
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 // ── History ───────────────────────────────────────────────────────────────────
