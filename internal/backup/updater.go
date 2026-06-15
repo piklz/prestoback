@@ -391,14 +391,17 @@ func doCheckForUpdate(image string) (bool, string, string, error) {
 		if err != nil {
 			return false, "local-build", "", fmt.Errorf("registry check failed: %w", err)
 		}
+		log.Printf("[updater] remote digest: %.19s (locally-built container — update available)", remoteDigest)
 		return true, "local-build", remoteDigest, nil
 	}
+	log.Printf("[updater] local  digest: %.19s", localDigest)
 
 	// ── Step 2: remote digest via registry HEAD (no download) ─────────────────
 	remoteDigest, err := headRegistryDigest(image)
 	if err != nil {
 		return false, localDigest, "", fmt.Errorf("registry check failed: %w", err)
 	}
+	log.Printf("[updater] remote digest: %.19s  hasUpdate=%v", remoteDigest, localDigest != remoteDigest)
 
 	return localDigest != remoteDigest, localDigest, remoteDigest, nil
 }
@@ -433,8 +436,10 @@ func headRegistryDigest(image string) (string, error) {
 	}
 	if token == "" {
 		// Registry doesn't require auth (non-Hub registry) — anonymous is fine.
+		log.Printf("[updater] registry %s needs no auth — anonymous HEAD", registry)
 		return doHeadManifest(manifestURL, "", accept)
 	}
+	log.Printf("[updater] bearer token obtained for %s/%s — sending HEAD manifest request", registry, repository)
 	return doHeadManifest(manifestURL, token, accept)
 }
 
