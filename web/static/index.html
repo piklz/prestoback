@@ -1186,47 +1186,160 @@ async function openDiscover() {
       list.innerHTML = '<div style="color:var(--txt2);font-size:13px">No new apps found. All running containers are already configured, or no bind mounts were detected.</div>';
       return;
     }
-    // Sort: label-hinted first, then by container name
     candidates.sort((a,b) => (b.label_hinted - a.label_hinted) || a.name.localeCompare(b.name));
-    list.innerHTML = candidates.map(v => {
-      const src = v.source === 'docker'
-        ? `<span style="color:var(--txt3);font-size:10px;font-family:var(--mono)">${esc(v.container_name||'')} · ${esc(v.image||'')}</span>`
+
+    // Group by container_name (docker) or treat each as its own group (volumes_dir)
+    const groupMap = new Map();
+    for (const v of candidates) {
+      const key = (v.source === 'docker' && v.container_name) ? v.container_name : '\x00' + v.path;
+      if (!groupMap.has(key)) groupMap.set(key, []);
+      groupMap.get(key).push(v);
+    }
+
+    // Longest common ancestor that all paths are direct children of
+    function commonParent(paths) {
+      if (paths.length < 2) return null;
+      const segs = p => p.split('/').filter(Boolean);
+      const base = segs(paths[0]);
+      let depth = base.length;
+      for (const p of paths.slice(1)) {
+        const ps = segs(p);
+        let d = 0;
+        while (d < depth && d < ps.length && ps[d] === base[d]) d++;
+        depth = d;
+      }
+      if (depth === 0) return null;
+      const parent = '/' + base.slice(0, depth).join('/');
+      return paths.every(p => p.startsWith(parent + '/')) ? parent : null;
+    }
+
+    let html = '';
+    let gIdx = 0;
+    const pendingGroups = []; // groups to wire up after innerHTML set
+
+    for (const [, items] of groupMap) {
+      const first = items[0];
+      const isGroup = items.length > 1;
+      const parentPath = isGroup ? commonParent(items.map(v => v.path)) : null;
+      const gid = 'dg' + (gIdx++);
+
+      const hint = first.label_hinted
+        ? `<span style="color:var(--green);font-size:10px;margin-left:6px">● label</span>` : '';
+      const stopped = (first.source === 'docker' && first.running === false)
+        ? `<span style="color:var(--amber);font-size:10px;margin-left:6px">stopped</span>` : '';
+      const srcMeta = first.source === 'docker'
+        ? `<span style="color:var(--txt3);font-size:10px;font-family:var(--mono)">${esc(first.container_name||'')} · ${esc(first.image||'')}</span>`
         : `<span style="color:var(--txt3);font-size:10px;font-family:var(--mono)">volumes dir</span>`;
-      const hint = v.label_hinted
-        ? `<span style="color:var(--green);font-size:10px;margin-left:6px">● prestoback label</span>`
-        : '';
-      // Only show stopped badge for Docker-discovered entries — volumes_dir
-      // entries have no container state so we don't know if they're running.
-      const status = (v.source === 'docker' && v.running === false)
-        ? `<span style="color:var(--amber);font-size:10px;margin-left:6px">stopped</span>`
-        : '';
-      return `<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 0;border-bottom:1px solid var(--line);cursor:pointer">
-        <input type="checkbox" data-name="${esc(v.name)}" data-path="${esc(v.path)}"
-          ${v.label_hinted ? 'checked' : ''} style="accent-color:var(--accent);width:15px;height:15px;margin-top:2px;flex-shrink:0">
-        <div>
-          <div style="font-weight:500;display:flex;align-items:center">${esc(v.name)}${hint}${status}</div>
-          <div style="font-family:var(--mono);font-size:11px;color:var(--accent);margin-top:2px">${esc(v.path)}</div>
-          <div style="margin-top:2px">${src}</div>
-        </div>
-      </label>`;
-    }).join('');
+
+      if (!isGroup) {
+        // ── Single-mount app — flat row ───────────────────────────────────
+        html += `<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 0;border-bottom:1px solid var(--line);cursor:pointer">
+          <input type="checkbox" class="disc-flat" data-name="${esc(first.name)}" data-path="${esc(first.path)}"
+            ${first.label_hinted ? 'checked' : ''} style="accent-color:var(--accent);width:15px;height:15px;margin-top:2px;flex-shrink:0">
+          <div>
+            <div style="font-weight:500;display:flex;align-items:center">${esc(first.name)}${hint}${stopped}</div>
+            <div style="font-family:var(--mono);font-size:11px;color:var(--accent);margin-top:2px">${esc(first.path)}</div>
+            <div style="margin-top:2px">${srcMeta}</div>
+          </div>
+        </label>`;
+      } else {
+        // ── Multi-mount app — tree group ──────────────────────────────────
+        pendingGroups.push({ gid, items });
+        const anyHinted = items.some(v => v.label_hinted);
+
+        // Parent path badge + import hint
+        const parentBadge = parentPath
+          ? `<span style="font-family:var(--mono);font-size:10px;color:var(--txt3);margin-left:6px">${esc(parentPath)}</span>` : '';
+        const importHint = parentPath
+          ? `<div style="font-size:10px;color:var(--txt3);margin-top:2px">
+               Select all → imports <span style="font-family:var(--mono);color:var(--accent)">${esc(parentPath)}</span> as one app &nbsp;·&nbsp; select individually for separate backups
+             </div>` : '';
+
+        html += `<div style="border-bottom:1px solid var(--line);padding:8px 0 4px">
+          <div style="display:flex;align-items:flex-start;gap:10px;padding:4px 0 2px">
+            <input type="checkbox" id="${gid}_p" class="disc-parent"
+              data-gid="${gid}" data-parent-path="${esc(parentPath||'')}" data-parent-name="${esc(first.name)}"
+              ${anyHinted ? 'checked' : ''}
+              style="accent-color:var(--accent);width:15px;height:15px;margin-top:3px;flex-shrink:0">
+            <div style="min-width:0">
+              <div style="font-weight:600;display:flex;align-items:center;flex-wrap:wrap;gap:4px">
+                ${esc(first.name)}${parentBadge}${hint}${stopped}
+              </div>
+              <div style="margin-top:2px">${srcMeta}</div>
+              ${importHint}
+            </div>
+          </div>
+          <div style="padding-left:25px">
+            ${items.map(v => {
+              // Show just the subfolder name as the label, full path as secondary
+              const sub = parentPath ? v.path.slice(parentPath.length + 1) : v.path.split('/').pop();
+              return `<label style="display:flex;align-items:center;gap:8px;padding:5px 0;border-top:1px solid var(--line);cursor:pointer">
+                <input type="checkbox" class="disc-child" data-gid="${gid}"
+                  data-name="${esc(first.name + ' (' + sub + ')')}" data-path="${esc(v.path)}"
+                  ${v.label_hinted ? 'checked' : ''}
+                  style="accent-color:var(--accent);width:13px;height:13px;flex-shrink:0">
+                <div style="display:flex;align-items:baseline;gap:8px;min-width:0;overflow:hidden">
+                  <span style="font-size:12px;font-weight:500;color:var(--txt2);white-space:nowrap">— ${esc(sub)}</span>
+                  <span style="font-family:var(--mono);font-size:10px;color:var(--accent);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(v.path)}</span>
+                </div>
+              </label>`;
+            }).join('')}
+          </div>
+        </div>`;
+      }
+    }
+
+    list.innerHTML = html;
+
+    // Wire up parent ↔ child checkboxes for each group
+    const syncParent = (pChk, cChks) => {
+      const n = cChks.filter(c => c.checked).length;
+      pChk.indeterminate = n > 0 && n < cChks.length;
+      pChk.checked = n > 0;
+    };
+    for (const { gid, items } of pendingGroups) {
+      const pChk = document.getElementById(gid + '_p');
+      const cChks = [...document.querySelectorAll(`.disc-child[data-gid="${gid}"]`)];
+      pChk.addEventListener('change', () => {
+        cChks.forEach(c => c.checked = pChk.checked);
+        pChk.indeterminate = false;
+      });
+      cChks.forEach(c => c.addEventListener('change', () => syncParent(pChk, cChks)));
+      syncParent(pChk, cChks); // set initial indeterminate state
+    }
+
   } catch(e) { toast(e.message,'error'); list.innerHTML=''; }
 }
 async function importDisc() {
-  const checks=[...document.querySelectorAll('#disc-list input[type=checkbox]:checked')];
-  if (!checks.length) { toast('Nothing selected','error'); return; }
-  let n=0, failed=0;
-  for (const cb of checks) {
-    try {
-      await api('/api/apps',{method:'POST',body:JSON.stringify({name:cb.dataset.name,path:cb.dataset.path,retain:5})});
-      n++;
-    } catch(e) {
-      failed++;
-      console.error('import failed for',cb.dataset.name,e);
+  const toImport = [];
+  const handledGroups = new Set();
+
+  // Fully-checked parent → import whole parent dir as one app
+  for (const pChk of document.querySelectorAll('#disc-list .disc-parent')) {
+    if (pChk.checked && !pChk.indeterminate && pChk.dataset.parentPath) {
+      toImport.push({ name: pChk.dataset.parentName, path: pChk.dataset.parentPath });
+      handledGroups.add(pChk.dataset.gid);
     }
   }
-  if (failed) toast(`${n} imported, ${failed} failed (path may not be accessible inside container)`,'warn');
-  else toast(n+' app(s) imported','success');
+  // Partial / individual children (groups not fully selected above)
+  for (const cChk of document.querySelectorAll('#disc-list .disc-child:checked')) {
+    if (!handledGroups.has(cChk.dataset.gid))
+      toImport.push({ name: cChk.dataset.name, path: cChk.dataset.path });
+  }
+  // Flat single-mount items
+  for (const fChk of document.querySelectorAll('#disc-list .disc-flat:checked'))
+    toImport.push({ name: fChk.dataset.name, path: fChk.dataset.path });
+
+  if (!toImport.length) { toast('Nothing selected', 'error'); return; }
+  let n = 0, failed = 0;
+  for (const { name, path } of toImport) {
+    try {
+      await api('/api/apps', { method:'POST', body: JSON.stringify({ name, path, retain: 5 }) });
+      n++;
+    } catch(e) { failed++; console.error('import failed', name, e); }
+  }
+  if (failed) toast(`${n} imported, ${failed} failed (path may not be accessible inside container)`, 'warn');
+  else toast(n + ' app(s) imported', 'success');
   CM('m-discover'); loadApps();
 }
 
