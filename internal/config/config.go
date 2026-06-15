@@ -55,10 +55,16 @@ type AppConfig struct {
 	ContainerName string         `json:"container_name,omitempty"`
 	Volumes       []VolumeConfig `json:"volumes"`
 
-	// ── Legacy fields — read-only, never written ──────────────────────────────
-	// Present in old config.json files. Promoted to Volumes on load.
-	LegacyPath     string   `json:"path,omitempty"`
-	LegacyExcludes []string `json:"excludes,omitempty"`
+	// Path is a computed convenience field (first enabled volume path).
+	// It is written to JSON so the existing frontend keeps working unchanged.
+	// On disk it is also used as the legacy single-path for old entries —
+	// the Load() migration reads it and promotes it into Volumes, then
+	// re-populates it from PrimaryPath() before serialising.
+	Path string `json:"path,omitempty"`
+
+	// Excludes is the legacy top-level excludes list (old single-path schema).
+	// Read during migration only; never written after that.
+	Excludes []string `json:"excludes,omitempty"`
 }
 
 // PrimaryPath returns the path of the first enabled volume, for display.
@@ -171,17 +177,20 @@ func Load(dataDir string) (*Config, error) {
 			a.Retain = 5
 		}
 		// ── Migration: promote legacy single-path → Volumes ───────────────────
-		if len(a.Volumes) == 0 && a.LegacyPath != "" {
-			slug := slugFromPath(a.LegacyPath)
+		// Old schema: app had a top-level `path` and `excludes`.
+		// New schema: app has `volumes[]`. If we loaded an old entry, promote it.
+		if len(a.Volumes) == 0 && a.Path != "" {
+			slug := slugFromPath(a.Path)
 			a.Volumes = []VolumeConfig{{
 				Slug:     slug,
-				Path:     a.LegacyPath,
+				Path:     a.Path,
 				Label:    slug,
-				Excludes: a.LegacyExcludes,
+				Excludes: a.Excludes,
 				Enabled:  true,
 			}}
+			a.Excludes = nil // now lives inside the volume
 		}
-		// Ensure all volumes have enabled=true by default (new field may be zero-value false)
+		// Normalise all volumes
 		for i := range a.Volumes {
 			if a.Volumes[i].Slug == "" {
 				a.Volumes[i].Slug = slugFromPath(a.Volumes[i].Path)
@@ -189,15 +198,18 @@ func Load(dataDir string) (*Config, error) {
 			if a.Volumes[i].Label == "" {
 				a.Volumes[i].Label = a.Volumes[i].Slug
 			}
-			// A volume with a path but Enabled==false is almost certainly a
-			// zero-value from JSON (new field). Default to enabled.
-			if !a.Volumes[i].Enabled && a.Volumes[i].Path != "" {
+			// Enabled is a new field — JSON zero value is false, but any volume
+			// with a non-empty path should default to enabled. We unconditionally
+			// set true here so a config.json saved by the old broken version
+			// (which wrote Enabled:false) is automatically healed on next load.
+			if a.Volumes[i].Path != "" {
 				a.Volumes[i].Enabled = true
 			}
 		}
-		// Clear legacy fields so they're not re-written
-		a.LegacyPath = ""
-		a.LegacyExcludes = nil
+		// Always keep the top-level Path field in sync with the first enabled
+		// volume so the existing frontend (reads app.path) keeps working.
+		a.Path = a.PrimaryPath()
+		a.Excludes = nil // legacy field; now lives inside each VolumeConfig
 		c.apps[a.ID] = a
 	}
 	for _, r := range d.Remotes {
@@ -304,6 +316,7 @@ func (c *Config) AddApp(a AppConfig) error {
 			a.Volumes[i].Enabled = true
 		}
 	}
+	a.Path = a.PrimaryPath()
 	c.apps[a.ID] = a
 	return nil
 }
@@ -323,6 +336,7 @@ func (c *Config) UpdateApp(a AppConfig) error {
 			a.Volumes[i].Label = a.Volumes[i].Slug
 		}
 	}
+	a.Path = a.PrimaryPath()
 	c.apps[a.ID] = a
 	return nil
 }
