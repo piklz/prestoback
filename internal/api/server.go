@@ -67,18 +67,18 @@ func (s *Server) Run(port int) error {
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 func (s *Server) routes() {
-	// Public — no auth (healthcheck, auth flow, status)
+	// Public
 	s.mux.Handle("/", http.FileServer(http.FS(web.StaticFS())))
 	s.mux.HandleFunc("/healthz", s.handleHealth)
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/api/health", s.handleHealth)
-	s.mux.HandleFunc("/api/status", s.handleStatus)          // public — used by UI before login & Docker healthcheck
-	s.mux.HandleFunc("/api/auth/status", s.handleAuthStatus) // {setup_required, version}
-	s.mux.HandleFunc("/api/auth/setup", s.handleAuthSetup)   // first-run setup
-	s.mux.HandleFunc("/api/auth/login", s.handleAuthLogin)   // credential login → JWT
-	s.mux.HandleFunc("/api/events", s.handleSSE)             // SSE — auth via query param
+	s.mux.HandleFunc("/api/status", s.handleStatus)
+	s.mux.HandleFunc("/api/auth/status", s.handleAuthStatus)
+	s.mux.HandleFunc("/api/auth/setup", s.handleAuthSetup)
+	s.mux.HandleFunc("/api/auth/login", s.handleAuthLogin)
+	s.mux.HandleFunc("/api/events", s.handleSSE)
 
-	// Auth-required API (JWT or legacy X-API-Key)
+	// Auth-required
 	s.mux.HandleFunc("/api/auth/logout", s.authJWT(s.handleAuthLogout))
 	s.mux.HandleFunc("/api/auth/me", s.authJWT(s.handleAuthMe))
 	s.mux.HandleFunc("/api/volumes", s.authJWT(s.handleListVolumes))
@@ -89,6 +89,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/apps", s.authJWT(s.handleApps))
 	s.mux.HandleFunc("/api/apps/", s.authJWT(s.handleApp))
 	s.mux.HandleFunc("/api/backups/", s.authJWT(s.handleBackups))
+	s.mux.HandleFunc("/api/backups-orphans", s.authJWT(s.handleOrphans))
 	s.mux.HandleFunc("/api/remotes", s.authJWT(s.handleRemotes))
 	s.mux.HandleFunc("/api/remotes/", s.authJWT(s.handleRemote))
 	s.mux.HandleFunc("/api/history", s.authJWT(s.handleHistory))
@@ -99,12 +100,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/update/apply", s.authJWT(s.handleUpdateApply))
 }
 
-// ── Auth middleware ───────────────────────────────────────────────────────────
+// ── SSE ───────────────────────────────────────────────────────────────────────
 
-// SSE uses query param auth so EventSource (no custom headers) works.
-// Accepts ?token=<jwt> or legacy ?api_key=<apikey>
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
-	// JWT token param
 	token := r.URL.Query().Get("token")
 	if token != "" {
 		if !s.cfg.IsTokenRevoked(token) {
@@ -115,7 +113,6 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", 401)
 		return
 	}
-	// Legacy API key param
 	if key := r.URL.Query().Get("api_key"); key == s.cfg.APIKey() {
 		goto authorized
 	}
@@ -183,7 +180,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // ── Status ────────────────────────────────────────────────────────────────────
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	// Image build timestamp (best-effort)
 	builtAt := ""
 	if s.image != "" {
 		if out, err := exec.Command("docker", "image", "inspect",
@@ -191,17 +187,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			builtAt = strings.TrimSpace(string(out))
 		}
 	}
-
-	// Disk space on the backup volume
 	var diskFreeBytes, diskTotalBytes uint64
 	if stat, err := diskUsage(s.cfg.BackupDir()); err == nil {
 		diskFreeBytes = stat.free
 		diskTotalBytes = stat.total
 	}
-
-	// Next scheduled run per app
 	nextRuns := s.sched.NextRuns()
-
 	respond(w, 200, map[string]any{
 		"version":          config.Version,
 		"app_count":        s.cfg.AppCount(),
@@ -292,15 +283,12 @@ func (s *Server) handleRegenKey(w http.ResponseWriter, r *http.Request) {
 // ── Volumes ───────────────────────────────────────────────────────────────────
 
 func (s *Server) handleListVolumes(w http.ResponseWriter, r *http.Request) {
-	// VolumesDir is optional — users with non-standard setups add apps manually
-	// via the custom path field. Return empty list gracefully if not set/mounted.
 	if s.cfg.VolumesDir == "" {
 		respond(w, 200, []any{})
 		return
 	}
 	entries, err := os.ReadDir(s.cfg.VolumesDir)
 	if os.IsNotExist(err) {
-		// Not mounted — not an error, just no auto-discovery available
 		respond(w, 200, []any{})
 		return
 	}
@@ -310,7 +298,7 @@ func (s *Server) handleListVolumes(w http.ResponseWriter, r *http.Request) {
 	}
 	type vol struct {
 		Name string `json:"name"`
-		Path string `json:"path"` // path inside the container (use this for backup)
+		Path string `json:"path"`
 	}
 	var vols []vol
 	for _, e := range entries {
@@ -325,8 +313,6 @@ func (s *Server) handleListVolumes(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, vols)
 }
 
-// handleSuggestExcludes returns known cache patterns for a given image.
-// Called by the UI when adding/editing an app to pre-populate the excludes field.
 func (s *Server) handleSuggestExcludes(w http.ResponseWriter, r *http.Request) {
 	image := r.URL.Query().Get("image")
 	patterns := backup.SuggestExcludes(image)
@@ -339,13 +325,12 @@ func (s *Server) handleSuggestExcludes(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleDiscover returns candidate apps discovered via Docker socket + volumes dir.
-// Replaces the old flat-dir-only /api/volumes discovery with Docker-aware discovery.
 func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
-	// Build set of already-registered paths so we can filter them out
 	alreadyRegistered := map[string]bool{}
 	for _, a := range s.cfg.ListApps() {
-		alreadyRegistered[a.Path] = true
+		for _, v := range a.Volumes {
+			alreadyRegistered[v.Path] = true
+		}
 	}
 	candidates := backup.DiscoverApps(s.selfName, s.cfg.VolumesDir, alreadyRegistered)
 	if candidates == nil {
@@ -354,8 +339,6 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, candidates)
 }
 
-// handleDirSize returns the approximate size of a directory in bytes.
-// Used by the UI to warn before backing up very large directories.
 func (s *Server) handleDirSize(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	if path == "" {
@@ -395,8 +378,6 @@ func humanBytes(b int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
-// handleValidatePath checks whether an arbitrary path is readable inside the container.
-// Used by the UI when the user types a custom path.
 func (s *Server) handleValidatePath(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	if path == "" {
@@ -417,6 +398,11 @@ func (s *Server) handleValidatePath(w http.ResponseWriter, r *http.Request) {
 
 // ── Apps ──────────────────────────────────────────────────────────────────────
 
+// GET /api/apps        → []AppConfig
+// POST /api/apps       → create app (body: AppConfig with Volumes[])
+//
+// POST /api/apps also accepts a legacy body with a single `path` field for
+// backwards compat with any existing scripts; it is promoted to a Volumes entry.
 func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -427,8 +413,25 @@ func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 			errOut(w, 400, err.Error())
 			return
 		}
-		if a.Name == "" || a.Path == "" {
-			errOut(w, 400, "name and path are required")
+		if a.Name == "" {
+			errOut(w, 400, "name is required")
+			return
+		}
+		// Legacy single-path promotion
+		if len(a.Volumes) == 0 && a.LegacyPath != "" {
+			slug := slugFromPath(a.LegacyPath)
+			a.Volumes = []config.VolumeConfig{{
+				Slug:     slug,
+				Path:     a.LegacyPath,
+				Label:    slug,
+				Excludes: a.LegacyExcludes,
+				Enabled:  true,
+			}}
+			a.LegacyPath = ""
+			a.LegacyExcludes = nil
+		}
+		if len(a.Volumes) == 0 {
+			errOut(w, 400, "at least one volume is required")
 			return
 		}
 		if a.ID == "" {
@@ -446,17 +449,38 @@ func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleApp routes sub-paths under /api/apps/{id}/...
+//
+//	GET    /api/apps/{id}                  → AppConfig
+//	PUT    /api/apps/{id}                  → update AppConfig
+//	DELETE /api/apps/{id}[?purge=1]        → remove app; purge=1 also deletes backup dir
+//	POST   /api/apps/{id}/backup           → trigger backup of all enabled volumes
+//	POST   /api/apps/{id}/restore/{backupID} → restore a single volume archive
+//	POST   /api/apps/{id}/volumes          → add a volume to an existing app
+//	DELETE /api/apps/{id}/volumes/{slug}   → remove a volume from an app
 func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 	tail := strings.TrimPrefix(r.URL.Path, "/api/apps/")
-	parts := strings.SplitN(tail, "/", 3)
+	parts := strings.SplitN(tail, "/", 4)
 	appID := parts[0]
 
+	// POST /api/apps/{id}/backup
 	if len(parts) == 2 && parts[1] == "backup" && r.Method == http.MethodPost {
 		s.handleTriggerBackup(w, r, appID)
 		return
 	}
+	// POST /api/apps/{id}/restore/{backupID}
 	if len(parts) == 3 && parts[1] == "restore" && r.Method == http.MethodPost {
 		s.handleRestore(w, r, appID, parts[2])
+		return
+	}
+	// POST /api/apps/{id}/volumes  — add volume to existing app
+	if len(parts) == 2 && parts[1] == "volumes" && r.Method == http.MethodPost {
+		s.handleAddVolume(w, r, appID)
+		return
+	}
+	// DELETE /api/apps/{id}/volumes/{slug}  — remove volume from app
+	if len(parts) == 3 && parts[1] == "volumes" && r.Method == http.MethodDelete {
+		s.handleRemoveVolume(w, r, appID, parts[2])
 		return
 	}
 
@@ -468,6 +492,7 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		respond(w, 200, a)
+
 	case http.MethodPut:
 		var a config.AppConfig
 		if err := parseJSON(r, &a); err != nil {
@@ -475,6 +500,19 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.ID = appID
+		// Legacy single-path promotion on PUT too
+		if len(a.Volumes) == 0 && a.LegacyPath != "" {
+			slug := slugFromPath(a.LegacyPath)
+			a.Volumes = []config.VolumeConfig{{
+				Slug:     slug,
+				Path:     a.LegacyPath,
+				Label:    slug,
+				Excludes: a.LegacyExcludes,
+				Enabled:  true,
+			}}
+			a.LegacyPath = ""
+			a.LegacyExcludes = nil
+		}
 		if err := s.cfg.UpdateApp(a); err != nil {
 			errOut(w, 404, err.Error())
 			return
@@ -482,17 +520,97 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 		_ = s.cfg.Save()
 		s.syncSchedule(a)
 		respond(w, 200, a)
+
 	case http.MethodDelete:
+		// ?purge=1 also removes the backup directory
+		purge := r.URL.Query().Get("purge") == "1"
 		if err := s.cfg.DeleteApp(appID); err != nil {
 			errOut(w, 404, err.Error())
 			return
 		}
 		_ = s.cfg.Save()
 		s.sched.Remove(appID)
-		respond(w, 200, map[string]string{"deleted": appID})
+		if purge {
+			if err := s.engine.DeleteAppBackups(appID); err != nil {
+				log.Printf("[delete] could not purge backup dir for %s: %v", appID, err)
+			}
+		}
+		respond(w, 200, map[string]any{"deleted": appID, "purged": purge})
+
 	default:
 		errOut(w, 405, "method not allowed")
 	}
+}
+
+// handleAddVolume adds a new VolumeConfig to an existing app.
+// Body: {"path": "/volumes/mosquitto/log", "label": "log", "excludes": []}
+func (s *Server) handleAddVolume(w http.ResponseWriter, r *http.Request, appID string) {
+	app, ok := s.cfg.GetApp(appID)
+	if !ok {
+		errOut(w, 404, "app not found")
+		return
+	}
+	var v config.VolumeConfig
+	if err := parseJSON(r, &v); err != nil {
+		errOut(w, 400, err.Error())
+		return
+	}
+	if v.Path == "" {
+		errOut(w, 400, "path is required")
+		return
+	}
+	if v.Slug == "" {
+		v.Slug = slugFromPath(v.Path)
+	}
+	if v.Label == "" {
+		v.Label = v.Slug
+	}
+	v.Enabled = true
+	// Check for duplicate slug within this app
+	for _, existing := range app.Volumes {
+		if existing.Slug == v.Slug {
+			errOut(w, 409, fmt.Sprintf("volume slug '%s' already exists in app '%s'", v.Slug, appID))
+			return
+		}
+	}
+	app.Volumes = append(app.Volumes, v)
+	if err := s.cfg.UpdateApp(app); err != nil {
+		errOut(w, 500, err.Error())
+		return
+	}
+	_ = s.cfg.Save()
+	respond(w, 201, app)
+}
+
+// handleRemoveVolume removes a volume by slug from an app.
+// The backup archives for that volume are NOT deleted automatically (use the
+// backups endpoint to tidy up). The UI can offer a "also delete backups" checkbox.
+func (s *Server) handleRemoveVolume(w http.ResponseWriter, r *http.Request, appID, slug string) {
+	app, ok := s.cfg.GetApp(appID)
+	if !ok {
+		errOut(w, 404, "app not found")
+		return
+	}
+	found := false
+	filtered := app.Volumes[:0]
+	for _, v := range app.Volumes {
+		if v.Slug == slug {
+			found = true
+		} else {
+			filtered = append(filtered, v)
+		}
+	}
+	if !found {
+		errOut(w, 404, fmt.Sprintf("volume slug '%s' not found in app '%s'", slug, appID))
+		return
+	}
+	app.Volumes = filtered
+	if err := s.cfg.UpdateApp(app); err != nil {
+		errOut(w, 500, err.Error())
+		return
+	}
+	_ = s.cfg.Save()
+	respond(w, 200, app)
 }
 
 // ── Backup ────────────────────────────────────────────────────────────────────
@@ -522,45 +640,83 @@ func (s *Server) runBackup(app config.AppConfig, remoteID string, scheduled bool
 	}
 	emit(fmt.Sprintf("━━━ %s backup started: %s ━━━", prefix, app.Name))
 
+	vols := app.EnabledVolumes()
+	if len(vols) == 0 {
+		emit("⚠  No enabled volumes — nothing to back up")
+		return
+	}
+	emit(fmt.Sprintf("Backing up %d volume(s): %s", len(vols), volumeNames(vols)))
+
 	containers := backup.FindContainers(app.ID)
 	if len(containers) == 0 {
 		emit("⚠  No running containers found — backing up live files")
 	}
 	toRestart, _ := backup.StopContainers(containers, emit)
 
-	meta, err := s.engine.BackupApp(app.ID, app.Name, app.Path, app.Excludes)
+	// Build VolumeTarget list
+	targets := make([]backup.VolumeTarget, len(vols))
+	for i, v := range vols {
+		targets[i] = backup.VolumeTarget{
+			Slug:     v.Slug,
+			Path:     v.Path,
+			Excludes: v.Excludes,
+		}
+	}
+
+	metas, err := s.engine.BackupVolumes(app.ID, app.Name, targets)
 	backup.StartContainers(toRestart, emit)
 
 	dur := time.Since(start).Milliseconds()
 
 	if err != nil {
-		emit("✗ Backup failed: " + err.Error())
+		// Partial failure: some volumes may have succeeded
+		failedSlugs := []string{}
+		var totalSize int64
+		for _, m := range metas {
+			if m.Status == backup.StatusFailed {
+				failedSlugs = append(failedSlugs, m.VolumeSlug)
+			} else {
+				totalSize += m.SizeBytes
+			}
+		}
+		detail := fmt.Sprintf("failed volumes: %s", strings.Join(failedSlugs, ", "))
+		emit("✗ Backup partially failed: " + detail)
 		s.hist.Append(history.Entry{
 			Event: history.EventBackupFail, AppID: app.ID, AppName: app.Name,
-			Detail: err.Error(), DurationMs: dur,
+			Detail: detail, DurationMs: dur,
 		})
-		s.dispatchNotify(notify.Event{Kind: "backup_fail", AppName: app.Name, Detail: err.Error(), IsError: true})
-		return
+		s.dispatchNotify(notify.Event{Kind: "backup_fail", AppName: app.Name, Detail: detail, IsError: true})
+		// Still prune what succeeded
+		_ = s.engine.PruneBackups(app.ID, app.Retain)
+	} else {
+		var totalSize int64
+		for _, m := range metas {
+			totalSize += m.SizeBytes
+		}
+		detail := fmt.Sprintf("%d volume(s), %.1f MB total, %dms", len(metas), float64(totalSize)/1e6, dur)
+		s.hist.Append(history.Entry{
+			Event: history.EventBackupSuccess, AppID: app.ID, AppName: app.Name,
+			Detail: detail, SizeBytes: totalSize, DurationMs: dur,
+		})
+		s.dispatchNotify(notify.Event{Kind: "backup_success", AppName: app.Name, Detail: detail})
+		_ = s.engine.PruneBackups(app.ID, app.Retain)
 	}
 
-	_ = s.engine.PruneBackups(app.ID, app.Retain)
-	detail := fmt.Sprintf("%s (%.1f MB, %dms)", meta.ID, float64(meta.SizeBytes)/1e6, dur)
-	s.hist.Append(history.Entry{
-		Event: history.EventBackupSuccess, AppID: app.ID, AppName: app.Name,
-		Detail: detail, SizeBytes: meta.SizeBytes, DurationMs: dur,
-	})
-	s.dispatchNotify(notify.Event{Kind: "backup_success", AppName: app.Name, Detail: detail})
-
-	if remoteID != "" {
+	if remoteID != "" && len(metas) > 0 {
 		for _, rem := range s.cfg.ListRemotes() {
 			if rem.ID == remoteID {
-				emit("Pushing to remote: " + rem.Label)
-				if pushErr := backup.PushToRemote(meta.FilePath, rem); pushErr != nil {
-					emit("✗ Push failed: " + pushErr.Error())
-					s.dispatchNotify(notify.Event{Kind: "push_fail", AppName: app.Name, Detail: pushErr.Error(), IsError: true})
-				} else {
-					emit("✓ Remote push complete: " + rem.Label)
-					s.dispatchNotify(notify.Event{Kind: "push_success", AppName: app.Name, Detail: rem.Label})
+				for _, m := range metas {
+					if m.Status != backup.StatusSuccess {
+						continue
+					}
+					emit("Pushing " + m.VolumeSlug + " to remote: " + rem.Label)
+					if pushErr := backup.PushToRemote(m.FilePath, rem); pushErr != nil {
+						emit("✗ Push failed (" + m.VolumeSlug + "): " + pushErr.Error())
+						s.dispatchNotify(notify.Event{Kind: "push_fail", AppName: app.Name, Detail: pushErr.Error(), IsError: true})
+					} else {
+						emit("✓ Remote push complete (" + m.VolumeSlug + "): " + rem.Label)
+						s.dispatchNotify(notify.Event{Kind: "push_success", AppName: app.Name, Detail: rem.Label})
+					}
 				}
 				break
 			}
@@ -569,7 +725,24 @@ func (s *Server) runBackup(app config.AppConfig, remoteID string, scheduled bool
 	emit("━━━ Backup complete ━━━")
 }
 
+// volumeNames returns a comma-separated list of volume slugs for logging.
+func volumeNames(vols []config.VolumeConfig) string {
+	names := make([]string, len(vols))
+	for i, v := range vols {
+		names[i] = v.Slug
+	}
+	return strings.Join(names, ", ")
+}
+
 // ── Restore ───────────────────────────────────────────────────────────────────
+//
+// POST /api/apps/{id}/restore/{backupID}
+//
+// The backupID encodes both volume and timestamp:
+//   mosquitto_config_20250615_120000
+//
+// We look up the app, find which volume the archive belongs to (by slug),
+// and restore into that volume's path.
 
 func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, backupID string) {
 	app, ok := s.cfg.GetApp(appID)
@@ -586,19 +759,41 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, ba
 		errOut(w, 404, "backup archive not found")
 		return
 	}
-	respond(w, 202, map[string]string{"status": "accepted", "backup_id": backupID})
+
+	// Determine which volume this archive belongs to, and thus its restore path.
+	// backupID format: {appID}_{volumeSlug}_{timestamp}[_prerestore]
+	volumeSlug := volumeSlugFromBackupID(appID, backupID)
+	destPath := ""
+	for _, v := range app.Volumes {
+		if v.Slug == volumeSlug {
+			destPath = v.Path
+			break
+		}
+	}
+	if destPath == "" {
+		// Fallback: if we can't identify the volume, let the caller supply ?path=
+		destPath = r.URL.Query().Get("path")
+		if destPath == "" {
+			errOut(w, 400, fmt.Sprintf(
+				"cannot determine restore path for volume slug '%s' — volume not found in app config. Add ?path=/volumes/... to override",
+				volumeSlug))
+			return
+		}
+	}
+
+	respond(w, 202, map[string]string{"status": "accepted", "backup_id": backupID, "volume": volumeSlug, "dest": destPath})
 
 	go func() {
 		start := time.Now()
 		emit := func(msg string) { s.engine.EmitLog(app.ID, msg) }
-		emit("━━━ Restore started: " + app.Name + " [" + backupID + "] ━━━")
+		emit(fmt.Sprintf("━━━ Restore started: %s [%s → %s] ━━━", app.Name, backupID, destPath))
 
 		containers := backup.FindContainers(app.ID)
 		if len(containers) == 0 {
 			emit("⚠  No running containers found")
 		}
 		toRestart, _ := backup.StopContainers(containers, emit)
-		err := s.engine.RestoreApp(app.ID, app.Name, archivePath, app.Path)
+		err := s.engine.RestoreVolume(app.ID, app.Name, volumeSlug, archivePath, destPath)
 		backup.StartContainers(toRestart, emit)
 
 		dur := time.Since(start).Milliseconds()
@@ -611,7 +806,7 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, ba
 			s.dispatchNotify(notify.Event{Kind: "restore_fail", AppName: app.Name, Detail: err.Error(), IsError: true})
 			return
 		}
-		detail := fmt.Sprintf("Restored from %s (%dms)", backupID, dur)
+		detail := fmt.Sprintf("Restored %s from %s (%dms)", volumeSlug, backupID, dur)
 		s.hist.Append(history.Entry{
 			Event: history.EventRestoreSuccess, AppID: app.ID, AppName: app.Name,
 			Detail: detail, DurationMs: dur,
@@ -621,7 +816,33 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, ba
 	}()
 }
 
+// volumeSlugFromBackupID extracts the slug from a backup ID.
+// "mosquitto_config_20250615_120000"            → "config"
+// "mosquitto_config_20250615_120000_prerestore"  → "config"
+func volumeSlugFromBackupID(appID, backupID string) string {
+	prefix := appID + "_"
+	if !strings.HasPrefix(backupID, prefix) {
+		return ""
+	}
+	rest := strings.TrimPrefix(backupID, prefix)
+	rest = strings.TrimSuffix(rest, "_prerestore")
+	// Strip trailing _YYYYMMDD_HHMMSS (two underscore-separated segments)
+	parts := strings.Split(rest, "_")
+	if len(parts) < 3 {
+		if len(parts) >= 1 {
+			return parts[0]
+		}
+		return rest
+	}
+	slugParts := parts[:len(parts)-2]
+	return strings.Join(slugParts, "_")
+}
+
 // ── Backups ───────────────────────────────────────────────────────────────────
+//
+// GET    /api/backups/{appID}                    → list archives (all volumes)
+// DELETE /api/backups/{appID}/{backupID}         → delete one archive
+// POST   /api/backups/{appID}/{backupID}/push    → push one archive to remote
 
 func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
 	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/api/backups/"), "/", 3)
@@ -691,6 +912,78 @@ func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		respond(w, 200, map[string]string{"deleted": parts[1]})
+	default:
+		errOut(w, 405, "method not allowed")
+	}
+}
+
+// ── Orphan backup directories ─────────────────────────────────────────────────
+//
+// GET  /api/backups-orphans          → list dir names with no registered app
+// DELETE /api/backups-orphans/{dir}  → remove an orphaned backup directory
+
+func (s *Server) handleOrphans(w http.ResponseWriter, r *http.Request) {
+	// Build set of registered app IDs
+	registered := map[string]bool{}
+	for _, a := range s.cfg.ListApps() {
+		registered[a.ID] = true
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		orphans, err := s.engine.OrphanedBackupDirs(registered)
+		if err != nil {
+			errOut(w, 500, err.Error())
+			return
+		}
+		// Enrich with size info
+		type orphanInfo struct {
+			DirName   string `json:"dir_name"`
+			SizeBytes int64  `json:"size_bytes"`
+			Human     string `json:"human"`
+		}
+		var result []orphanInfo
+		for _, name := range orphans {
+			dir := filepath.Join(s.cfg.BackupDir(), name)
+			var size int64
+			_ = filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+				if err == nil && info != nil && info.Mode().IsRegular() {
+					size += info.Size()
+				}
+				return nil
+			})
+			result = append(result, orphanInfo{DirName: name, SizeBytes: size, Human: humanBytes(size)})
+		}
+		if result == nil {
+			result = []orphanInfo{}
+		}
+		respond(w, 200, result)
+
+	case http.MethodDelete:
+		// DELETE /api/backups-orphans/{dirName}
+		dirName := strings.TrimPrefix(r.URL.Path, "/api/backups-orphans/")
+		dirName = strings.Trim(dirName, "/")
+		if dirName == "" {
+			errOut(w, 400, "dir name required")
+			return
+		}
+		// Safety: must be orphaned
+		if registered[dirName] {
+			errOut(w, 409, fmt.Sprintf("'%s' is a registered app — use DELETE /api/apps/{id}?purge=1 instead", dirName))
+			return
+		}
+		// Safety: must not escape backup dir
+		target := filepath.Join(s.cfg.BackupDir(), dirName)
+		if !strings.HasPrefix(target, s.cfg.BackupDir()) {
+			errOut(w, 400, "invalid directory name")
+			return
+		}
+		if err := os.RemoveAll(target); err != nil {
+			errOut(w, 500, err.Error())
+			return
+		}
+		respond(w, 200, map[string]string{"deleted": dirName})
+
 	default:
 		errOut(w, 405, "method not allowed")
 	}
@@ -770,8 +1063,8 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	respond(w, 200, map[string]any{
 		"available":     hasUpdate,
-		"local_digest":  local,  // full digest — UI fmtDigest() handles formatting
-		"remote_digest": remote, // full digest — UI fmtDigest() handles formatting
+		"local_digest":  local,
+		"remote_digest": remote,
 		"image":         s.image,
 		"locally_built": local == "local-build",
 	})
@@ -808,7 +1101,7 @@ func (s *Server) syncSchedule(app config.AppConfig) {
 		s.sched.Remove(app.ID)
 		return
 	}
-	a := app // capture
+	a := app
 	s.sched.Upsert(scheduler.Job{
 		ID:       app.ID,
 		CronExpr: app.Schedule.CronExpr,
@@ -858,18 +1151,15 @@ func (s *Server) runTelegramBot() {
 
 func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.TelegramMessage) {
 	tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
-	// Only respond to the configured chat ID
 	if fmt.Sprintf("%d", msg.Chat.ID) != nc.TelegramChatID {
 		return
 	}
-
 	text := strings.TrimSpace(msg.Text)
 	cmd := strings.SplitN(text, " ", 2)[0]
 	arg := ""
 	if len(strings.SplitN(text, " ", 2)) > 1 {
 		arg = strings.TrimSpace(strings.SplitN(text, " ", 2)[1])
 	}
-
 	switch cmd {
 	case "/status":
 		apps := s.cfg.ListApps()
@@ -883,7 +1173,7 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			if s.engine.IsRunning(a.ID) {
 				running = " ⏳"
 			}
-			reply += fmt.Sprintf("• `%s`%s%s\n  `%s`\n", a.Name, pin, running, a.Path)
+			reply += fmt.Sprintf("• `%s`%s%s — %d volume(s)\n", a.Name, pin, running, len(a.Volumes))
 		}
 		_ = notify.SendTelegram(tgCfg, notify.Event{AppName: "PrestoBack", Detail: reply})
 
@@ -898,7 +1188,7 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			return
 		}
 		if s.engine.IsRunning(app.ID) {
-			_ = notify.SendTelegram(tgCfg, notify.Event{AppName: app.Name, Detail: "A job is already running for this app", IsError: true})
+			_ = notify.SendTelegram(tgCfg, notify.Event{AppName: app.Name, Detail: "A job is already running", IsError: true})
 			return
 		}
 		_ = notify.SendTelegram(tgCfg, notify.Event{AppName: app.Name, Detail: "Backup started ⏳"})
@@ -932,8 +1222,6 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.TelegramCallbackQuery) {
 	tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
 	_ = notify.AnswerCallbackQuery(nc.TelegramToken, cb.ID, "Processing…")
-
-	// callback_data format: "backup:{appID}" or "restore:{appID}:{backupID}"
 	parts := strings.SplitN(cb.Data, ":", 3)
 	if len(parts) < 2 {
 		return
@@ -1016,7 +1304,7 @@ func sanitizeID(name string) string {
 	r := strings.NewReplacer(" ", "_", "/", "_", ".", "_", "-", "_")
 	id := strings.ToLower(r.Replace(strings.TrimSpace(name)))
 	for strings.Contains(id, "__") {
-		id = strings.ReplaceAll(id, "__", "_")
+		id = strings.ReplaceAll(id, "__", "__")
 	}
 	return strings.Trim(id, "_")
 }
@@ -1026,4 +1314,22 @@ func safeSlice(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+// slugFromPath mirrors the config package helper (avoids import cycle).
+func slugFromPath(p string) string {
+	base := filepath.Base(filepath.Clean(p))
+	var b strings.Builder
+	for _, r := range strings.ToLower(base) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	s := strings.Trim(b.String(), "_")
+	if s == "" {
+		return "vol"
+	}
+	return s
 }

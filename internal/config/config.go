@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -29,39 +30,77 @@ type Schedule struct {
 	CronExpr string `json:"cron_expr"` // "0 3 * * *"
 }
 
+// VolumeConfig is a single directory to back up within an app.
+// Apps can have multiple volumes (e.g. mosquitto has config/, data/, log/).
+type VolumeConfig struct {
+	// Slug is a short identifier used in archive filenames: "config", "data", "log".
+	// Auto-derived from the last path component if not set.
+	Slug     string   `json:"slug"`
+	Path     string   `json:"path"`
+	Label    string   `json:"label,omitempty"` // human name shown in UI; defaults to Slug
+	Excludes []string `json:"excludes,omitempty"`
+	Enabled  bool     `json:"enabled"` // false = skip this volume in backups
+}
+
+// AppConfig represents a single application with one or more volumes to back up.
+//
+// Migration: the old single-path schema (Path/Excludes) is still read from disk
+// for existing entries, then promoted to Volumes on first load.
 type AppConfig struct {
-	ID            string   `json:"id"`
-	Name          string   `json:"name"`
-	Path          string   `json:"path"`
-	Retain        int      `json:"retain"`
-	Schedule      Schedule `json:"schedule"`
-	Pinned        bool     `json:"pinned"`                   // if true, skip scheduled backups
-	ContainerName string   `json:"container_name,omitempty"` // real Docker container name from discovery
-	Excludes      []string `json:"excludes,omitempty"`       // glob patterns to skip during backup (e.g. "Cache/", "*.log")
+	ID            string         `json:"id"`
+	Name          string         `json:"name"`
+	Retain        int            `json:"retain"`
+	Schedule      Schedule       `json:"schedule"`
+	Pinned        bool           `json:"pinned"`
+	ContainerName string         `json:"container_name,omitempty"`
+	Volumes       []VolumeConfig `json:"volumes"`
+
+	// ── Legacy fields — read-only, never written ──────────────────────────────
+	// Present in old config.json files. Promoted to Volumes on load.
+	LegacyPath     string   `json:"path,omitempty"`
+	LegacyExcludes []string `json:"excludes,omitempty"`
+}
+
+// PrimaryPath returns the path of the first enabled volume, for display.
+func (a AppConfig) PrimaryPath() string {
+	for _, v := range a.Volumes {
+		if v.Enabled {
+			return v.Path
+		}
+	}
+	if len(a.Volumes) > 0 {
+		return a.Volumes[0].Path
+	}
+	return ""
+}
+
+// EnabledVolumes returns only the volumes that are active for backups.
+func (a AppConfig) EnabledVolumes() []VolumeConfig {
+	var out []VolumeConfig
+	for _, v := range a.Volumes {
+		if v.Enabled {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // NotifyConfig holds all notification channel settings.
-// Each channel is independently enabled and separately configured.
 type NotifyConfig struct {
-	// Telegram
 	TelegramToken   string `json:"telegram_token,omitempty"`
 	TelegramChatID  string `json:"telegram_chat_id,omitempty"`
 	TelegramEnabled bool   `json:"telegram_enabled"`
 
-	// Discord webhook
 	DiscordURL     string `json:"discord_url,omitempty"`
 	DiscordEnabled bool   `json:"discord_enabled"`
 
-	// Ntfy
-	NtfyURL     string `json:"ntfy_url,omitempty"`   // e.g. https://ntfy.sh/my-topic
-	NtfyToken   string `json:"ntfy_token,omitempty"` // optional auth token
+	NtfyURL     string `json:"ntfy_url,omitempty"`
+	NtfyToken   string `json:"ntfy_token,omitempty"`
 	NtfyEnabled bool   `json:"ntfy_enabled"`
 
-	// Generic webhook (POST JSON to any URL — Gotify, Home Assistant, etc.)
 	WebhookURL     string `json:"webhook_url,omitempty"`
 	WebhookEnabled bool   `json:"webhook_enabled"`
 
-	// Which events fire notifications (applies to all channels)
 	OnBackupSuccess  bool `json:"on_backup_success"`
 	OnBackupFail     bool `json:"on_backup_fail"`
 	OnRestoreSuccess bool `json:"on_restore_success"`
@@ -71,8 +110,8 @@ type NotifyConfig struct {
 // User is a PrestoBack login account.
 type User struct {
 	Username string `json:"username"`
-	Hash     string `json:"hash"` // bcrypt hash
-	Role     string `json:"role"` // "admin" (only role for now)
+	Hash     string `json:"hash"`
+	Role     string `json:"role"`
 }
 
 // disk is the on-disk JSON shape.
@@ -96,7 +135,7 @@ type Config struct {
 	remotes       map[string]RemoteTarget
 	notify        NotifyConfig
 	users         map[string]User
-	revokedTokens map[string]struct{} // in-memory revocation set
+	revokedTokens map[string]struct{}
 }
 
 func Load(dataDir string) (*Config, error) {
@@ -113,7 +152,6 @@ func Load(dataDir string) (*Config, error) {
 	path := filepath.Join(dataDir, "config.json")
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		// First run — generate API key
 		c.apiKey = generateKey()
 		return c, nil
 	}
@@ -132,6 +170,34 @@ func Load(dataDir string) (*Config, error) {
 		if a.Retain <= 0 {
 			a.Retain = 5
 		}
+		// ── Migration: promote legacy single-path → Volumes ───────────────────
+		if len(a.Volumes) == 0 && a.LegacyPath != "" {
+			slug := slugFromPath(a.LegacyPath)
+			a.Volumes = []VolumeConfig{{
+				Slug:     slug,
+				Path:     a.LegacyPath,
+				Label:    slug,
+				Excludes: a.LegacyExcludes,
+				Enabled:  true,
+			}}
+		}
+		// Ensure all volumes have enabled=true by default (new field may be zero-value false)
+		for i := range a.Volumes {
+			if a.Volumes[i].Slug == "" {
+				a.Volumes[i].Slug = slugFromPath(a.Volumes[i].Path)
+			}
+			if a.Volumes[i].Label == "" {
+				a.Volumes[i].Label = a.Volumes[i].Slug
+			}
+			// A volume with a path but Enabled==false is almost certainly a
+			// zero-value from JSON (new field). Default to enabled.
+			if !a.Volumes[i].Enabled && a.Volumes[i].Path != "" {
+				a.Volumes[i].Enabled = true
+			}
+		}
+		// Clear legacy fields so they're not re-written
+		a.LegacyPath = ""
+		a.LegacyExcludes = nil
 		c.apps[a.ID] = a
 	}
 	for _, r := range d.Remotes {
@@ -144,11 +210,19 @@ func Load(dataDir string) (*Config, error) {
 	for _, u := range d.Users {
 		c.users[u.Username] = u
 	}
+	// Persist migrated form immediately so next load is clean
+	_ = c.save()
 	return c, nil
 }
 
 func (c *Config) Save() error {
 	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.save()
+}
+
+// save is the internal (lock-free) version, called when the caller already holds a lock.
+func (c *Config) save() error {
 	d := disk{
 		APIKey: c.apiKey,
 		Notify: c.notify,
@@ -162,8 +236,6 @@ func (c *Config) Save() error {
 	for _, u := range c.users {
 		d.Users = append(d.Users, u)
 	}
-	c.mu.RUnlock()
-
 	data, err := json.MarshalIndent(d, "", "  ")
 	if err != nil {
 		return err
@@ -186,7 +258,7 @@ func (c *Config) APIKey() string {
 func (c *Config) RegenerateAPIKey() string {
 	c.mu.Lock()
 	c.apiKey = generateKey()
-	c.revokedTokens = make(map[string]struct{}) // old tokens are all invalid now
+	c.revokedTokens = make(map[string]struct{})
 	c.mu.Unlock()
 	_ = c.Save()
 	return c.apiKey
@@ -220,6 +292,18 @@ func (c *Config) AddApp(a AppConfig) error {
 	if a.Retain <= 0 {
 		a.Retain = 5
 	}
+	// Normalise volumes
+	for i := range a.Volumes {
+		if a.Volumes[i].Slug == "" {
+			a.Volumes[i].Slug = slugFromPath(a.Volumes[i].Path)
+		}
+		if a.Volumes[i].Label == "" {
+			a.Volumes[i].Label = a.Volumes[i].Slug
+		}
+		if !a.Volumes[i].Enabled {
+			a.Volumes[i].Enabled = true
+		}
+	}
 	c.apps[a.ID] = a
 	return nil
 }
@@ -229,6 +313,15 @@ func (c *Config) UpdateApp(a AppConfig) error {
 	defer c.mu.Unlock()
 	if _, exists := c.apps[a.ID]; !exists {
 		return fmt.Errorf("app '%s' not found", a.ID)
+	}
+	// Normalise volumes
+	for i := range a.Volumes {
+		if a.Volumes[i].Slug == "" {
+			a.Volumes[i].Slug = slugFromPath(a.Volumes[i].Path)
+		}
+		if a.Volumes[i].Label == "" {
+			a.Volumes[i].Label = a.Volumes[i].Slug
+		}
 	}
 	c.apps[a.ID] = a
 	return nil
@@ -311,6 +404,27 @@ func generateKey() string {
 	return hex.EncodeToString(b)
 }
 
+// slugFromPath derives a short identifier from the last component of a path.
+// "/volumes/mosquitto/config" → "config"
+// "/volumes/homepage"         → "homepage"
+func slugFromPath(p string) string {
+	base := filepath.Base(filepath.Clean(p))
+	// Replace non-alphanumeric (except dash) with underscore, lowercase
+	var b strings.Builder
+	for _, r := range strings.ToLower(base) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	s := strings.Trim(b.String(), "_")
+	if s == "" {
+		return "vol"
+	}
+	return s
+}
+
 // ── Users ─────────────────────────────────────────────────────────────────────
 
 func (c *Config) HasUsers() bool {
@@ -334,10 +448,10 @@ func (c *Config) AddUser(u User) error {
 	}
 	c.users[u.Username] = u
 	c.mu.Unlock()
-	return c.Save() // persist immediately
+	return c.Save()
 }
 
-// ── Token revocation (in-memory) ─────────────────────────────────────────────
+// ── Token revocation ──────────────────────────────────────────────────────────
 
 func (c *Config) RevokeToken(token string) {
 	c.mu.Lock()
