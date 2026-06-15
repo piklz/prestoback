@@ -770,8 +770,8 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	respond(w, 200, map[string]any{
 		"available":     hasUpdate,
-		"local_digest":  safeSlice(local, 19),
-		"remote_digest": safeSlice(remote, 19),
+		"local_digest":  local,  // full digest — UI fmtDigest() handles formatting
+		"remote_digest": remote, // full digest — UI fmtDigest() handles formatting
 		"image":         s.image,
 		"locally_built": local == "local-build",
 	})
