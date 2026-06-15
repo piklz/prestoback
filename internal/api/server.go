@@ -418,17 +418,17 @@ func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Legacy single-path promotion
-		if len(a.Volumes) == 0 && a.LegacyPath != "" {
-			slug := slugFromPath(a.LegacyPath)
+		if len(a.Volumes) == 0 && a.Path != "" {
+			slug := slugFromPath(a.Path)
 			a.Volumes = []config.VolumeConfig{{
 				Slug:     slug,
-				Path:     a.LegacyPath,
+				Path:     a.Path,
 				Label:    slug,
-				Excludes: a.LegacyExcludes,
+				Excludes: a.Excludes,
 				Enabled:  true,
 			}}
-			a.LegacyPath = ""
-			a.LegacyExcludes = nil
+			a.Path = ""
+			a.Excludes = nil
 		}
 		if len(a.Volumes) == 0 {
 			errOut(w, 400, "at least one volume is required")
@@ -501,17 +501,17 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 		}
 		a.ID = appID
 		// Legacy single-path promotion on PUT too
-		if len(a.Volumes) == 0 && a.LegacyPath != "" {
-			slug := slugFromPath(a.LegacyPath)
+		if len(a.Volumes) == 0 && a.Path != "" {
+			slug := slugFromPath(a.Path)
 			a.Volumes = []config.VolumeConfig{{
 				Slug:     slug,
-				Path:     a.LegacyPath,
+				Path:     a.Path,
 				Label:    slug,
-				Excludes: a.LegacyExcludes,
+				Excludes: a.Excludes,
 				Enabled:  true,
 			}}
-			a.LegacyPath = ""
-			a.LegacyExcludes = nil
+			a.Path = ""
+			a.Excludes = nil
 		}
 		if err := s.cfg.UpdateApp(a); err != nil {
 			errOut(w, 404, err.Error())
