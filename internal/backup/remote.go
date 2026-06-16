@@ -48,6 +48,12 @@ func PullFromRemote(localDir string, remote config.RemoteTarget, appID string) e
 func buildRsyncArgs(remote config.RemoteTarget, src, dest string) []string {
 	args := []string{"-avz", "--progress"}
 
+	// NTFS destinations report 1-second timestamp granularity, which causes rsync
+	// to see every file as "changed". --modify-window=1 suppresses that.
+	if remote.ModifyWindow {
+		args = append(args, "--modify-window=1")
+	}
+
 	sshOpts := fmt.Sprintf("ssh -p %d -o StrictHostKeyChecking=no -o ConnectTimeout=10", remote.Port)
 	if remote.KeyFile != "" {
 		sshOpts += " -i " + remote.KeyFile

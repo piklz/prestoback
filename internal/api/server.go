@@ -1021,12 +1021,36 @@ func (s *Server) handleRemotes(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
 	tail := strings.TrimPrefix(r.URL.Path, "/api/remotes/")
+
+	// POST /api/remotes/test — test connection before saving (wizard step 2).
+	// Body: {host, port, user, key_file} — no ID required.
+	if r.Method == http.MethodPost && tail == "test" {
+		var rem config.RemoteTarget
+		if err := parseJSON(r, &rem); err != nil {
+			errOut(w, 400, err.Error())
+			return
+		}
+		if rem.Host == "" || rem.User == "" {
+			errOut(w, 400, "host and user are required")
+			return
+		}
+		if rem.Port <= 0 {
+			rem.Port = 22
+		}
+		if err := backup.TestRemoteConnection(rem); err != nil {
+			respond(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		} else {
+			respond(w, 200, map[string]any{"ok": true})
+		}
+		return
+	}
+
+	// POST /api/remotes/{id}/test — test an already-saved remote.
 	if r.Method == http.MethodPost && strings.HasSuffix(tail, "/test") {
 		remID := strings.TrimSuffix(tail, "/test")
 		for _, rem := range s.cfg.ListRemotes() {
 			if rem.ID == remID {
-				err := backup.TestRemoteConnection(rem)
-				if err != nil {
+				if err := backup.TestRemoteConnection(rem); err != nil {
 					respond(w, 200, map[string]any{"ok": false, "error": err.Error()})
 				} else {
 					respond(w, 200, map[string]any{"ok": true})
@@ -1037,6 +1061,25 @@ func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
 		errOut(w, 404, "remote not found")
 		return
 	}
+
+	// PUT /api/remotes/{id} — update an existing remote (wizard edit flow).
+	if r.Method == http.MethodPut {
+		var rem config.RemoteTarget
+		if err := parseJSON(r, &rem); err != nil {
+			errOut(w, 400, err.Error())
+			return
+		}
+		rem.ID = tail
+		if err := s.cfg.UpdateRemote(rem); err != nil {
+			errOut(w, 404, err.Error())
+			return
+		}
+		_ = s.cfg.Save()
+		respond(w, 200, rem)
+		return
+	}
+
+	// DELETE /api/remotes/{id}
 	if r.Method == http.MethodDelete {
 		if err := s.cfg.DeleteRemote(tail); err != nil {
 			errOut(w, 404, err.Error())
@@ -1046,6 +1089,7 @@ func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
 		respond(w, 200, map[string]string{"deleted": tail})
 		return
 	}
+
 	errOut(w, 405, "method not allowed")
 }
 

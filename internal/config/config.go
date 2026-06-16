@@ -23,6 +23,9 @@ type RemoteTarget struct {
 	User    string `json:"user"`
 	Path    string `json:"path"`
 	KeyFile string `json:"key_file,omitempty"`
+	// ModifyWindow adds --modify-window=1 to rsync, which prevents false
+	// "file changed" mismatches when the destination uses NTFS (Windows).
+	ModifyWindow bool `json:"modify_window,omitempty"`
 }
 
 type Schedule struct {
@@ -389,6 +392,19 @@ func (c *Config) DeleteRemote(id string) error {
 		return fmt.Errorf("remote '%s' not found", id)
 	}
 	delete(c.remotes, id)
+	return nil
+}
+
+func (c *Config) UpdateRemote(r RemoteTarget) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.remotes[r.ID]; !exists {
+		return fmt.Errorf("remote '%s' not found", r.ID)
+	}
+	if r.Port <= 0 {
+		r.Port = 22
+	}
+	c.remotes[r.ID] = r
 	return nil
 }
 
