@@ -208,6 +208,31 @@ select.fi{cursor:pointer}
 .path-ok{background:var(--green)}
 .path-missing{background:var(--red)}
 .path-unknown{background:var(--txt3)}
+/* ── Remote wizard ── */
+.wiz-bar{display:flex;align-items:center;width:100%;margin-bottom:22px}
+.wiz-step{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.wiz-n{width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;font-weight:700;flex-shrink:0;transition:all .2s}
+.wiz-n.done{background:var(--green);color:#0a1f0d}
+.wiz-n.active{background:var(--accent);color:#fff}
+.wiz-n.todo{background:var(--bg4);border:1px solid var(--line2);color:var(--txt3)}
+.wiz-lbl{font-size:12px;transition:color .2s}
+.wiz-lbl.active{color:var(--txt)}
+.wiz-lbl.done{color:var(--txt2)}
+.wiz-lbl.todo{color:var(--txt3)}
+.wiz-line{flex:1;height:1px;background:var(--line);margin:0 12px}
+/* SSH guide tabs */
+.ssh-tab{background:none;border:none;border-bottom:2px solid transparent;color:var(--txt3);font-size:12px;padding:6px 14px;cursor:pointer;font-family:var(--body);margin-bottom:-1px;transition:color .15s}
+.ssh-tab:hover{color:var(--txt2)}
+.ssh-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+/* Remote destination cards */
+.rem-dest{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);padding:18px 20px;margin-bottom:12px}
+.rem-dest:last-child{margin-bottom:0}
+.rem-dest-name{font-weight:600;font-size:14px;margin-bottom:3px}
+.rem-dest-addr{font-family:var(--mono);font-size:11px;color:var(--txt3)}
+.rem-status{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--txt2)}
+.rem-status-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;background:var(--txt3)}
+.rem-status-dot.ok{background:var(--green)}
+.rem-status-dot.fail{background:var(--red)}
 </style>
 </head>
 <body>
@@ -405,27 +430,41 @@ select.fi{cursor:pointer}
 
 <!-- REMOTES -->
 <div id="view-rem" class="view-hidden">
-  <div class="ph"><div><div class="pt">Remote Targets</div><div class="ps">SSH destinations for off-site backup push</div></div><div class="ha"><button class="btn btn-p btn-sm" onclick="openAddRemote()">+ Add Remote</button></div></div>
+  <div class="ph"><div><div class="pt">Backup destinations</div><div class="ps">Local storage is always on — remotes receive a push after each successful backup</div></div><div class="ha"><button class="btn btn-p btn-sm" onclick="openRemWizard(null)">+ Add remote</button></div></div>
   <div class="sec">
-    <div class="card" style="margin-bottom:18px">
-      <div class="ch"><div class="ct">How remote push works</div></div>
-      <div class="cb" style="color:var(--txt2);font-size:13px;line-height:1.8">
-        <div class="steps">
-          <div class="step"><div class="sn">1</div>Add a remote — another Pi or Linux box you can SSH into</div>
-          <div class="step"><div class="sn">2</div>When starting a backup, pick the remote from the dropdown to auto-push after backup</div>
-          <div class="step"><div class="sn">3</div>Or open <strong>Backups</strong>, find any archive, click <strong>Push</strong> to send it now</div>
+    <!-- Local storage card (always visible) -->
+    <div class="rem-dest" style="margin-bottom:12px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px">
+        <div><div class="rem-dest-name">Local storage</div><div class="rem-dest-addr" id="local-backup-dir">/data/backups</div></div>
+        <span class="pill pg"><span class="pd"></span>Always on</span>
+      </div>
+      <div style="border-top:1px solid var(--line);padding-top:10px">
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--txt3);font-family:var(--mono);margin-bottom:5px">
+          <span>Used</span><span id="local-disk-used">—</span>
         </div>
-        <div style="margin-top:12px;padding:10px 14px;background:var(--bg3);border-radius:var(--rs);font-family:var(--mono);font-size:11px;color:var(--txt3)">
-          ⓘ Uses <strong>rsync over SSH</strong>. Run once on your Pi: <br>
-          <code style="color:var(--accent)">ssh-keygen -t ed25519 && ssh-copy-id pi@&lt;remote-ip&gt;</code><br>
-          Then add to docker-compose: <code style="color:var(--txt2)">- /home/pi/.ssh:/root/.ssh:ro</code>
+        <div style="height:3px;background:var(--bg4);border-radius:2px;overflow:hidden">
+          <div id="local-disk-bar" style="height:100%;background:var(--accent);border-radius:2px;width:0%;transition:width .5s"></div>
         </div>
       </div>
     </div>
-    <div class="card">
-      <div class="empty" id="rem-empty"><div class="ei"><svg width="22" height="22" fill="none" stroke="var(--txt3)" stroke-width="1.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2a10 10 0 100 20A10 10 0 0012 2z"/></svg></div><div class="et">No remotes configured</div><div class="es">Add an SSH remote for off-site backup.</div></div>
-      <div class="cb" id="rem-body"></div>
+    <!-- Remote destination cards -->
+    <div id="rem-body"></div>
+    <div class="card" id="rem-empty" style="display:none">
+      <div class="empty"><div class="ei"><svg width="22" height="22" fill="none" stroke="var(--txt3)" stroke-width="1.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2a10 10 0 100 20A10 10 0 0012 2z"/></svg></div><div class="et">No remote destinations</div><div class="es">Add a remote to push backups off-device after each run.</div></div>
     </div>
+    <!-- Info card -->
+    <div class="card" style="margin-top:18px"><div class="ch"><div class="ct">Setup checklist</div></div><div class="cb" style="color:var(--txt2);font-size:13px;line-height:1.8">
+      <div class="steps">
+        <div class="step"><div class="sn">1</div>Add a remote — click <strong>+ Add remote</strong> above and follow the 3-step wizard</div>
+        <div class="step"><div class="sn">2</div>When starting a backup, pick the remote from the dropdown to push automatically</div>
+        <div class="step"><div class="sn">3</div>Or go to <strong>Backups</strong>, find any archive, and click <strong>⇪ Push</strong> to send it manually</div>
+      </div>
+      <div style="margin-top:12px;padding:10px 14px;background:var(--bg3);border-radius:var(--rs);font-family:var(--mono);font-size:11px;color:var(--txt3)">
+        ⓘ Key-based auth (no password prompts):<br>
+        <code style="color:var(--accent)">ssh-keygen -t ed25519 && ssh-copy-id user@&lt;remote-ip&gt;</code><br>
+        Then mount into the container: <code style="color:var(--txt2)">- /home/pi/.ssh:/root/.ssh:ro</code>
+      </div>
+    </div></div>
   </div>
 </div>
 
@@ -692,17 +731,73 @@ select.fi{cursor:pointer}
   </div>
 </div>
 
-<!-- Add Remote -->
-<div class="overlay hidden" id="m-add-rem">
-  <div class="modal">
-    <div class="mh"><div class="mt">Add Remote Target</div><button class="btn btn-g btn-ic" onclick="CM('m-add-rem')">✕</button></div>
+<!-- Remote wizard (Add + Edit) -->
+<div class="overlay hidden" id="m-rem-wizard">
+  <div class="modal" style="width:580px;max-width:96vw">
+    <div class="mh"><div class="mt" id="rwiz-title">Add Remote Destination</div><button class="btn btn-g btn-ic" onclick="closeRemWizard()">✕</button></div>
     <div class="mb">
-      <div class="fg"><label class="fl">Label</label><input class="fi" id="r-label" placeholder="Backup Pi, Office NAS…"></div>
-      <div class="fr"><div class="fg"><label class="fl">Host / IP</label><input class="fi" id="r-host" placeholder="192.168.1.50"></div><div class="fg"><label class="fl">SSH Port</label><input class="fi" id="r-port" type="number" value="22"></div></div>
-      <div class="fr"><div class="fg"><label class="fl">Username</label><input class="fi" id="r-user" placeholder="pi"></div><div class="fg"><label class="fl">Remote path</label><input class="fi" id="r-path" placeholder="/home/pi/prestoback-store"></div></div>
-      <div class="fg"><label class="fl">SSH key file (optional)</label><input class="fi" id="r-key" placeholder="/home/pi/.ssh/id_rsa"><div class="fh">Leave blank to use default key or agent.</div></div>
+
+      <!-- Step bar -->
+      <div class="wiz-bar" id="rwiz-stepbar"></div>
+
+      <!-- Step 1: Connection details -->
+      <div id="rwiz-s1">
+        <div class="fg"><label class="fl">Label</label><input class="fi" id="rw-label" placeholder="Windows NAS, Backup Pi…"></div>
+        <div class="fr">
+          <div class="fg"><label class="fl">Host / IP</label><input class="fi" id="rw-host" placeholder="192.168.1.50" oninput="rwizUpdateCmd()"></div>
+          <div class="fg" style="flex:0 0 100px"><label class="fl">SSH port</label><input class="fi" id="rw-port" type="number" value="22" oninput="rwizUpdateCmd()"></div>
+        </div>
+        <div class="fg"><label class="fl">SSH user</label><input class="fi" id="rw-user" placeholder="pi" oninput="rwizUpdateCmd()"></div>
+        <div class="fg"><label class="fl">Remote path</label><input class="fi" id="rw-path" placeholder="/mnt/e/backups/volumes" oninput="rwizUpdateCmd()"><div class="fh">Directory on the remote machine where backup archives will be stored.</div></div>
+        <div class="fg"><label class="fl">SSH key file <span style="color:var(--txt3);font-weight:400">(optional)</span></label><input class="fi" id="rw-key" placeholder="/data/keys/id_rsa" oninput="rwizUpdateCmd()"><div class="fh">Leave blank to use password auth or the container's default SSH key.</div></div>
+      </div>
+
+      <!-- Step 2: Test connection -->
+      <div id="rwiz-s2" style="display:none">
+        <div style="font-size:13px;color:var(--txt2);margin-bottom:18px;line-height:1.7">
+          PrestoBack will SSH into <span id="rw-test-target" style="font-family:var(--mono);color:var(--txt)"></span> and verify rsync is reachable.
+        </div>
+        <button class="btn btn-g" id="rw-test-btn" onclick="rwizRunTest()">▶ Test connection</button>
+        <div id="rw-test-result" style="margin-top:14px;display:none"></div>
+        <div id="rw-test-cmd" style="margin-top:14px;display:none">
+          <div class="divlbl">SSH command used</div>
+          <div class="code-b" id="rw-test-cmd-val"></div>
+        </div>
+        <!-- SSH setup guide -->
+        <div style="margin-top:20px;border-top:1px solid var(--line);padding-top:16px">
+          <button class="btn btn-g btn-sm" onclick="toggleSshGuide()" id="ssh-guide-btn">▸ SSH setup guide — Windows, Linux &amp; macOS</button>
+          <div id="ssh-guide-body" style="display:none;margin-top:16px">
+            <div style="display:flex;gap:0;border-bottom:1px solid var(--line);margin-bottom:16px">
+              <button class="ssh-tab active" onclick="setSshTab('windows')">Windows 11</button>
+              <button class="ssh-tab" onclick="setSshTab('linux')">Linux</button>
+              <button class="ssh-tab" onclick="setSshTab('mac')">macOS</button>
+            </div>
+            <div id="ssh-guide-content"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Step 3: Options -->
+      <div id="rwiz-s3" style="display:none">
+        <label style="display:flex;align-items:flex-start;gap:14px;background:var(--bg3);border:1px solid var(--line);border-radius:var(--r);padding:14px 16px;cursor:pointer;margin-bottom:22px" onclick="rwizToggleModifyWindow()">
+          <div class="ftog-sw" id="rw-mw-sw" style="margin-top:2px;flex-shrink:0"><div class="ftog-kn"></div></div>
+          <div>
+            <div style="font-size:13px;font-weight:500;color:var(--txt);margin-bottom:4px">NTFS timestamp tolerance</div>
+            <div class="fh">Adds <code style="font-family:var(--mono);color:var(--accent);font-size:10px">--modify-window=1</code> to rsync. Enable when the destination drive is Windows (NTFS) — prevents false "file changed" mismatches caused by NTFS's 1-second timestamp resolution.</div>
+          </div>
+        </label>
+        <div class="divlbl">rsync command PrestoBack will run per backup push</div>
+        <div class="code-b" id="rw-cmd-preview" style="color:var(--accent);font-size:11.5px;line-height:1.9;white-space:pre-wrap;padding-right:70px"></div>
+        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
+          <div style="font-size:11px;color:var(--txt3)">&lt;app&gt; is replaced with each app's slug at runtime</div>
+          <button class="btn btn-g btn-sm" onclick="rwizCopyCmd()">Copy</button>
+        </div>
+      </div>
     </div>
-    <div class="mf"><button class="btn btn-g" onclick="CM('m-add-rem')">Cancel</button><button class="btn btn-p" onclick="submitAddRemote()">Save Remote</button></div>
+    <div class="mf">
+      <button class="btn btn-g" id="rwiz-back" onclick="rwizBack()">Cancel</button>
+      <button class="btn btn-p" id="rwiz-next" onclick="rwizNext()">Next →</button>
+    </div>
   </div>
 </div>
 
@@ -917,7 +1012,7 @@ async function loadStatus() {
       const builtDate = new Date(d.built_at);
       document.getElementById('upd-built').textContent = isNaN(builtDate) ? d.built_at : builtDate.toLocaleString();
     }
-    // Disk space
+    // Disk space — dashboard stat
     if (d.disk_total_bytes && d.disk_total_bytes > 0) {
       const free = d.disk_free_bytes, total = d.disk_total_bytes;
       const pctUsed = ((total - free) / total) * 100;
@@ -932,11 +1027,16 @@ async function loadStatus() {
           bar.style.width = Math.min(pctUsed, 100) + '%';
           bar.style.background = pctUsed > 90 ? 'var(--red)' : pctUsed > 75 ? 'var(--amber)' : 'var(--green)';
         }
-        const diskSub = document.createElement('div');
         diskEl.title = freeGb + ' GB free of ' + totalGb + ' GB';
         document.getElementById('s-disk-stat').style.display = '';
       }
+      // Local storage card in remotes view
+      const usedEl = document.getElementById('local-disk-used');
+      const barEl  = document.getElementById('local-disk-bar');
+      if (usedEl) usedEl.textContent = freeGb + ' GB free / ' + totalGb + ' GB';
+      if (barEl)  { barEl.style.width = Math.min(pctUsed,100)+'%'; barEl.style.background = pctUsed>90?'var(--red)':pctUsed>75?'var(--amber)':'var(--accent)'; }
     }
+    if (d.backup_dir) { const el=document.getElementById('local-backup-dir'); if(el) el.textContent=d.backup_dir; }
     // Next scheduled run
     if (d.next_runs && d.next_runs.length) {
       const upcoming = d.next_runs
@@ -1577,45 +1677,240 @@ async function loadRemotes() {
     document.getElementById('s-rem').textContent = S.remotes.length;
   } catch(e) { toast(e.message,'error'); }
 }
+
 function renderRemotes() {
-  const body=document.getElementById('rem-body'), empty=document.getElementById('rem-empty');
-  if (!S.remotes.length) { empty.style.display=''; body.innerHTML=''; return; }
-  empty.style.display='none';
-  body.innerHTML = S.remotes.map(r=>`
-    <div class="ri">
-      <div class="ric"><svg width="15" height="15" fill="none" stroke="var(--txt2)" stroke-width="1.6" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2a10 10 0 100 20A10 10 0 0012 2z"/></svg></div>
-      <div style="flex:1"><div style="font-weight:500">${esc(r.label)}</div><div style="font-family:var(--mono);font-size:11px;color:var(--txt3)">${esc(r.user)}@${esc(r.host)}:${r.port} → ${esc(r.path)}</div></div>
-      <div style="display:flex;gap:6px">
+  const body = document.getElementById('rem-body');
+  const empty = document.getElementById('rem-empty');
+  if (!S.remotes.length) {
+    empty.style.display = '';
+    body.innerHTML = '';
+    return;
+  }
+  empty.style.display = 'none';
+  body.innerHTML = S.remotes.map(r => `
+    <div class="rem-dest">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px">
+        <div>
+          <div class="rem-dest-name">${esc(r.label)}</div>
+          <div class="rem-dest-addr">${esc(r.user)}@${esc(r.host)}:${r.port}</div>
+        </div>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-g btn-sm" onclick="openRemWizard('${r.id}')">Edit</button>
+          <button class="btn btn-d btn-sm btn-ic" onclick="delRemote('${r.id}')">🗑</button>
+        </div>
+      </div>
+      <div style="border-top:1px solid var(--line);padding-top:10px;margin-bottom:12px">
+        <div class="divlbl" style="margin-bottom:4px">Remote path</div>
+        <div style="font-family:var(--mono);font-size:11px;color:var(--txt2)">${esc(r.path)}</div>
+        ${r.modify_window ? '<div style="font-family:var(--mono);font-size:10px;color:var(--txt3);margin-top:4px">+ --modify-window=1 (NTFS)</div>' : ''}
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <div class="rem-status">
+          <div class="rem-status-dot" id="rst-${r.id}"></div>
+          <span id="rsm-${r.id}">Not tested</span>
+        </div>
         <button class="btn btn-g btn-sm" onclick="testRemote('${r.id}',this)">Test</button>
-        <button class="btn btn-d btn-sm btn-ic" onclick="delRemote('${r.id}')">🗑</button>
       </div>
     </div>`).join('');
 }
-function openAddRemote() {
-  ['r-label','r-host','r-user','r-path','r-key'].forEach(x=>document.getElementById(x).value='');
-  document.getElementById('r-port').value=22;
-  OM('m-add-rem');
-}
-async function submitAddRemote() {
-  const label=gv('r-label'),host=gv('r-host'),user=gv('r-user'),path=gv('r-path'),port=parseInt(gv('r-port'))||22,key_file=gv('r-key')||undefined;
-  if (!label||!host||!user||!path) { toast('All fields required','error'); return; }
-  try { await api('/api/remotes',{method:'POST',body:JSON.stringify({label,host,user,path,port,key_file})}); toast('Remote added','success'); CM('m-add-rem'); loadRemotes(); }
-  catch(e) { toast(e.message,'error'); }
-}
+
 async function delRemote(id) {
   if (!confirm('Remove this remote?')) return;
   try { await api('/api/remotes/'+id,{method:'DELETE'}); toast('Removed','success'); loadRemotes(); }
   catch(e) { toast(e.message,'error'); }
 }
-async function testRemote(id,btn) {
-  btn.textContent='…'; btn.disabled=true;
+
+async function testRemote(id, btn) {
+  const dot = document.getElementById('rst-'+id);
+  const msg = document.getElementById('rsm-'+id);
+  btn.textContent = '⟳'; btn.disabled = true;
   try {
     const r = await api('/api/remotes/'+id+'/test',{method:'POST'});
-    btn.textContent=r.ok?'✓ OK':'✗ Fail'; btn.style.color=r.ok?'var(--green)':'var(--red)';
-    if (!r.ok) toast('Failed: '+r.error,'error');
-  } catch(e) { btn.textContent='✗ Err'; btn.style.color='var(--red)'; }
-  setTimeout(()=>{ btn.textContent='Test'; btn.disabled=false; btn.style.color=''; }, 3500);
+    if (r.ok) {
+      dot.className = 'rem-status-dot ok';
+      msg.textContent = 'Connected'; msg.style.color = 'var(--green)';
+      btn.textContent = '✓ OK'; btn.style.color = 'var(--green)';
+    } else {
+      dot.className = 'rem-status-dot fail';
+      msg.textContent = 'Failed'; msg.style.color = 'var(--red)';
+      btn.textContent = '✗ Fail'; btn.style.color = 'var(--red)';
+      toast('Failed: '+r.error,'error');
+    }
+  } catch(e) {
+    dot.className = 'rem-status-dot fail';
+    msg.textContent = 'Error'; msg.style.color = 'var(--red)';
+    btn.textContent = '✗ Err'; btn.style.color = 'var(--red)';
+  }
+  setTimeout(() => {
+    btn.textContent = 'Re-test'; btn.disabled = false;
+    btn.style.color = ''; msg.style.color = '';
+  }, 3500);
 }
+
+// ── Remote wizard ─────────────────────────────────────────────────────────────
+const RW = { step:1, editId:null, testStatus:'idle', guideOpen:false, guideTab:'windows', modifyWindow:false };
+
+const SSH_GUIDES = {
+  windows: [
+    { n:1, title:'Install OpenSSH Server', note:'Settings → System → Optional features → Add a feature → search "OpenSSH Server" → Install', cmd:null },
+    { n:2, title:'Start and enable the service', cmd:'Start-Service sshd\nSet-Service -Name sshd -StartupType Automatic' },
+    { n:3, title:'Allow port 22 through Windows Firewall', cmd:"New-NetFirewallRule -Name sshd -DisplayName 'OpenSSH Server' `\n  -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22" },
+    { n:4, title:'Install rsync via Git for Windows', note:'Git for Windows bundles rsync. Install it with winget:', cmd:'winget install --id Git.Git -e --source winget' },
+    { n:5, title:'Confirm rsync is available over SSH', note:'SSH into the Windows machine from your Pi and run:', cmd:'which rsync   # should print /usr/bin/rsync' },
+  ],
+  linux: [
+    { n:1, title:'Install OpenSSH server and rsync', cmd:'# Debian / Ubuntu\nsudo apt install -y openssh-server rsync\n\n# Fedora / RHEL\nsudo dnf install -y openssh-server rsync' },
+    { n:2, title:'Enable and start the service', cmd:'sudo systemctl enable --now ssh' },
+    { n:3, title:'Open the firewall (if enabled)', cmd:'sudo ufw allow 22/tcp && sudo ufw reload' },
+  ],
+  mac: [
+    { n:1, title:'Enable Remote Login', note:'System Settings → General → Sharing → Remote Login → On', cmd:null },
+    { n:2, title:'Install rsync via Homebrew', cmd:'brew install rsync' },
+    { n:3, title:'Confirm the SSH daemon is running', cmd:'sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist' },
+  ],
+};
+
+function openRemWizard(editId) {
+  RW.step = 1; RW.editId = editId || null;
+  RW.testStatus = 'idle'; RW.guideOpen = false; RW.modifyWindow = false;
+  document.getElementById('rwiz-title').textContent = editId ? 'Edit Remote Destination' : 'Add Remote Destination';
+  if (editId) {
+    const r = S.remotes.find(x => x.id === editId);
+    if (r) {
+      document.getElementById('rw-label').value = r.label || '';
+      document.getElementById('rw-host').value  = r.host  || '';
+      document.getElementById('rw-port').value  = r.port  || 22;
+      document.getElementById('rw-user').value  = r.user  || '';
+      document.getElementById('rw-path').value  = r.path  || '';
+      document.getElementById('rw-key').value   = r.key_file || '';
+      RW.modifyWindow = !!r.modify_window;
+    }
+  } else {
+    ['rw-label','rw-host','rw-user','rw-path','rw-key'].forEach(x => document.getElementById(x).value = '');
+    document.getElementById('rw-port').value = 22;
+  }
+  setTog('rw-mw-sw', RW.modifyWindow);
+  rwizShowStep(1);
+  OM('m-rem-wizard');
+}
+function closeRemWizard() { CM('m-rem-wizard'); }
+
+function rwizShowStep(n) {
+  RW.step = n;
+  [1,2,3].forEach(i => { const el = document.getElementById('rwiz-s'+i); if(el) el.style.display = i===n?'':'none'; });
+  // Step bar
+  const labels = ['Connection','Test','Options'];
+  document.getElementById('rwiz-stepbar').innerHTML = labels.map((label,i) => {
+    const sn = i+1, state = sn<n?'done':sn===n?'active':'todo';
+    const line = i<2 ? '<div class="wiz-line"></div>' : '';
+    return `<div class="wiz-step"><div class="wiz-n ${state}">${state==='done'?'✓':sn}</div><span class="wiz-lbl ${state}">${label}</span></div>${line}`;
+  }).join('');
+  // Footer buttons
+  const back = document.getElementById('rwiz-back'), next = document.getElementById('rwiz-next');
+  back.textContent = n===1 ? 'Cancel' : '← Back';
+  if (n===3) { next.textContent = RW.editId ? '✓ Save changes' : '✓ Save destination'; }
+  else { next.textContent = 'Next →'; }
+  // Step 2 prep
+  if (n===2) {
+    document.getElementById('rw-test-target').textContent = (gv('rw-user')||'user')+'@'+(gv('rw-host')||'host');
+    document.getElementById('rw-test-result').style.display = 'none';
+    document.getElementById('rw-test-cmd').style.display = 'none';
+    document.getElementById('ssh-guide-body').style.display = 'none';
+    document.getElementById('ssh-guide-btn').textContent = '▸ SSH setup guide — Windows, Linux & macOS';
+    document.getElementById('rw-test-btn').textContent = '▶ Test connection';
+    document.getElementById('rw-test-btn').disabled = false;
+    RW.guideOpen = false; RW.testStatus = 'idle';
+  }
+  // Step 3 prep
+  if (n===3) { setTog('rw-mw-sw', RW.modifyWindow); rwizUpdateCmd(); }
+}
+
+function rwizNext() {
+  if (RW.step===1) {
+    if (!gv('rw-host')||!gv('rw-user')) { toast('Host and user are required','error'); return; }
+    rwizShowStep(2);
+  } else if (RW.step===2) {
+    rwizShowStep(3);
+  } else {
+    rwizSave();
+  }
+}
+function rwizBack() { if (RW.step>1) rwizShowStep(RW.step-1); else closeRemWizard(); }
+
+async function rwizRunTest() {
+  const btn = document.getElementById('rw-test-btn');
+  const resultEl = document.getElementById('rw-test-result');
+  const cmdEl = document.getElementById('rw-test-cmd');
+  btn.textContent = '⟳ Testing…'; btn.disabled = true;
+  resultEl.style.display = 'none'; cmdEl.style.display = 'none';
+  const port = parseInt(gv('rw-port'))||22, user = gv('rw-user'), host = gv('rw-host'), key = gv('rw-key');
+  try {
+    const r = await api('/api/remotes/test',{method:'POST',body:JSON.stringify({host,port,user,key_file:key||undefined})});
+    RW.testStatus = r.ok ? 'ok' : 'fail';
+    resultEl.style.display = '';
+    if (r.ok) {
+      resultEl.innerHTML = `<div class="info-b"><svg width="14" height="14" fill="none" stroke="var(--green)" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg><div class="info-t" style="color:var(--green)">Connected to ${esc(host)} as ${esc(user)} — prestoback-ok</div></div>`;
+      const sshCmd = ['ssh',`-p ${port}`,'-o StrictHostKeyChecking=no','-o ConnectTimeout=10','-o BatchMode=yes',...(key?[`-i ${key}`]:[]),`${user}@${host}`,'"echo prestoback-ok"'].join(' ');
+      document.getElementById('rw-test-cmd-val').textContent = sshCmd;
+      cmdEl.style.display = '';
+    } else {
+      resultEl.innerHTML = `<div class="danger-b"><svg width="14" height="14" fill="none" stroke="var(--red)" stroke-width="2.5" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg><div class="danger-t">${esc(r.error||'Connection failed')}</div></div>`;
+      if (!RW.guideOpen) { RW.guideOpen=true; renderSshGuide(); document.getElementById('ssh-guide-body').style.display=''; document.getElementById('ssh-guide-btn').textContent='▾ SSH setup guide — Windows, Linux & macOS'; }
+    }
+  } catch(e) {
+    RW.testStatus = 'fail'; resultEl.style.display = '';
+    resultEl.innerHTML = `<div class="danger-b"><div class="danger-t">Request failed: ${esc(e.message)}</div></div>`;
+  }
+  btn.textContent = '↺ Re-test'; btn.disabled = false;
+}
+
+function rwizUpdateCmd() {
+  const host=gv('rw-host')||'host', port=gv('rw-port')||'22', user=gv('rw-user')||'user', path=gv('rw-path')||'/backup', key=gv('rw-key');
+  const sshParts=['ssh -p '+port,'-o StrictHostKeyChecking=no','-o ConnectTimeout=10',...(key?['-i '+key]:[])];
+  const lines=['rsync -avz --progress \\',...(RW.modifyWindow?['  --modify-window=1 \\']:[]),`  -e "${sshParts.join(' ')}" \\`,'  /data/backups/<app>/ \\',`  ${user}@${host}:${path}/`];
+  const el=document.getElementById('rw-cmd-preview'); if(el) el.textContent=lines.join('\n');
+}
+function rwizToggleModifyWindow() { RW.modifyWindow=!RW.modifyWindow; setTog('rw-mw-sw',RW.modifyWindow); rwizUpdateCmd(); }
+function rwizCopyCmd() { navigator.clipboard?.writeText(document.getElementById('rw-cmd-preview')?.textContent||''); toast('Command copied','success'); }
+
+function toggleSshGuide() {
+  RW.guideOpen = !RW.guideOpen;
+  document.getElementById('ssh-guide-body').style.display = RW.guideOpen?'':'none';
+  document.getElementById('ssh-guide-btn').textContent = (RW.guideOpen?'▾':'▸')+' SSH setup guide — Windows, Linux & macOS';
+  if (RW.guideOpen) renderSshGuide();
+}
+function setSshTab(tab) {
+  RW.guideTab=tab;
+  document.querySelectorAll('.ssh-tab').forEach(t=>t.classList.toggle('active',t.textContent.toLowerCase().startsWith(tab==='mac'?'mac':tab)));
+  renderSshGuide();
+}
+function renderSshGuide() {
+  const steps=SSH_GUIDES[RW.guideTab]||SSH_GUIDES.windows;
+  document.getElementById('ssh-guide-content').innerHTML=steps.map(s=>`
+    <div style="display:flex;gap:12px;margin-bottom:14px">
+      <div class="sn" style="flex-shrink:0;margin-top:1px">${s.n}</div>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13px;font-weight:500;color:var(--txt);margin-bottom:${s.note||s.cmd?4:0}px">${esc(s.title)}</div>
+        ${s.note?`<div style="font-size:12px;color:var(--txt2);margin-bottom:${s.cmd?8:0}px">${esc(s.note)}</div>`:''}
+        ${s.cmd?`<div class="code-b" style="font-size:11px;color:var(--txt2)">${esc(s.cmd)}</div>`:''}
+      </div>
+    </div>`).join('');
+}
+
+async function rwizSave() {
+  const label=gv('rw-label'),host=gv('rw-host'),user=gv('rw-user'),path=gv('rw-path');
+  const port=parseInt(gv('rw-port'))||22, key_file=gv('rw-key')||undefined;
+  if (!label||!host||!user||!path) { toast('Label, host, user and path are required','error'); return; }
+  const body=JSON.stringify({label,host,user,path,port,key_file,modify_window:RW.modifyWindow});
+  try {
+    if (RW.editId) { await api('/api/remotes/'+RW.editId,{method:'PUT',body}); toast('Remote updated','success'); }
+    else { await api('/api/remotes',{method:'POST',body}); toast('Remote added','success'); }
+    closeRemWizard(); loadRemotes();
+  } catch(e) { toast(e.message,'error'); }
+}
+
+// legacy shim — openAddRemote referenced from nowhere now but kept for safety
+function openAddRemote() { openRemWizard(null); }
 
 // ════════════════════ Notifications ════════════════════
 async function loadNotify() {
