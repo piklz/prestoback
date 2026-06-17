@@ -58,8 +58,8 @@ func (s *Server) Run(port int) error {
 	key := s.cfg.APIKey()
 	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	log.Printf("  PrestoBack v%s  —  port %d", config.Version, port)
-	log.Printf("  API Key: %s", key)
-	log.Printf("  Add header: X-API-Key: %s", key)
+	masked := key[:8] + "..." + key[len(key)-4:]
+	log.Printf("  API Key: %s (full key in /data/config.json — use for external integrations)", masked)
 	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	return http.ListenAndServe(fmt.Sprintf(":%d", port), s.mux)
 }
@@ -90,11 +90,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/apps/", s.authJWT(s.handleApp))
 	s.mux.HandleFunc("/api/backups/", s.authJWT(s.handleBackups))
 	s.mux.HandleFunc("/api/backups-orphans", s.authJWT(s.handleOrphans))
-	s.mux.HandleFunc("/api/remotes", s.authJWT(s.handleRemotes))
-	s.mux.HandleFunc("/api/remotes/", s.authJWT(s.handleRemote))
 	s.mux.HandleFunc("/api/history", s.authJWT(s.handleHistory))
 	s.mux.HandleFunc("/api/notify", s.authJWT(s.handleNotify))
 	s.mux.HandleFunc("/api/notify/test", s.authJWT(s.handleNotifyTest))
+	s.mux.HandleFunc("/api/apikey", s.authJWT(s.handleAPIKey))
 	s.mux.HandleFunc("/api/apikey/regenerate", s.authJWT(s.handleRegenKey))
 	s.mux.HandleFunc("/api/update/check", s.authJWT(s.handleUpdateCheck))
 	s.mux.HandleFunc("/api/update/apply", s.authJWT(s.handleUpdateApply))
@@ -196,7 +195,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]any{
 		"version":          config.Version,
 		"app_count":        s.cfg.AppCount(),
-		"remote_count":     len(s.cfg.ListRemotes()),
 		"volumes_dir":      s.cfg.VolumesDir,
 		"backup_dir":       s.cfg.BackupDir(),
 		"image":            s.image,
@@ -271,13 +269,19 @@ func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request) {
 
 // ── API key regen ─────────────────────────────────────────────────────────────
 
+// POST /api/apikey/regenerate — generates a new key and returns it ONCE in full.
+// The UI must prompt the user to copy it immediately; subsequent GET /api/apikey
+// will only show the masked version.
 func (s *Server) handleRegenKey(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errOut(w, 405, "method not allowed")
 		return
 	}
 	newKey := s.cfg.RegenerateAPIKey()
-	respond(w, 200, map[string]string{"api_key": newKey})
+	respond(w, 200, map[string]any{
+		"api_key": newKey,
+		"warning": "Copy this key now — it will not be shown again. Use it as the X-API-Key header for external integrations.",
+	})
 }
 
 // ── Volumes ───────────────────────────────────────────────────────────────────
@@ -625,12 +629,11 @@ func (s *Server) handleTriggerBackup(w http.ResponseWriter, r *http.Request, app
 		errOut(w, 409, "a job is already running for this app")
 		return
 	}
-	remoteID := r.URL.Query().Get("remote")
 	respond(w, 202, map[string]string{"status": "accepted", "app_id": appID})
-	go s.runBackup(app, remoteID, false)
+	go s.runBackup(app, false)
 }
 
-func (s *Server) runBackup(app config.AppConfig, remoteID string, scheduled bool) {
+func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 	start := time.Now()
 	emit := func(msg string) { s.engine.EmitLog(app.ID, msg) }
 
@@ -700,27 +703,6 @@ func (s *Server) runBackup(app config.AppConfig, remoteID string, scheduled bool
 		})
 		s.dispatchNotify(notify.Event{Kind: "backup_success", AppName: app.Name, Detail: detail})
 		_ = s.engine.PruneBackups(app.ID, app.Retain)
-	}
-
-	if remoteID != "" && len(metas) > 0 {
-		for _, rem := range s.cfg.ListRemotes() {
-			if rem.ID == remoteID {
-				for _, m := range metas {
-					if m.Status != backup.StatusSuccess {
-						continue
-					}
-					emit("Pushing " + m.VolumeSlug + " to remote: " + rem.Label)
-					if pushErr := backup.PushToRemote(m.FilePath, rem); pushErr != nil {
-						emit("✗ Push failed (" + m.VolumeSlug + "): " + pushErr.Error())
-						s.dispatchNotify(notify.Event{Kind: "push_fail", AppName: app.Name, Detail: pushErr.Error(), IsError: true})
-					} else {
-						emit("✓ Remote push complete (" + m.VolumeSlug + "): " + rem.Label)
-						s.dispatchNotify(notify.Event{Kind: "push_success", AppName: app.Name, Detail: rem.Label})
-					}
-				}
-				break
-			}
-		}
 	}
 	emit("━━━ Backup complete ━━━")
 }
@@ -842,54 +824,12 @@ func volumeSlugFromBackupID(appID, backupID string) string {
 //
 // GET    /api/backups/{appID}                    → list archives (all volumes)
 // DELETE /api/backups/{appID}/{backupID}         → delete one archive
-// POST   /api/backups/{appID}/{backupID}/push    → push one archive to remote
 
 func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
 	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/api/backups/"), "/", 3)
 	appID := parts[0]
 	if appID == "" {
 		errOut(w, 400, "app ID required")
-		return
-	}
-
-	// POST /api/backups/{appID}/{backupID}/push?remote=
-	if r.Method == http.MethodPost && len(parts) == 3 && parts[2] == "push" {
-		backupID := parts[1]
-		remoteID := r.URL.Query().Get("remote")
-		if remoteID == "" {
-			errOut(w, 400, "remote query param required")
-			return
-		}
-		archivePath := filepath.Join(s.cfg.BackupDir(), appID, backupID+".tar.gz")
-		if _, err := os.Stat(archivePath); os.IsNotExist(err) {
-			errOut(w, 404, "backup not found")
-			return
-		}
-		var found *config.RemoteTarget
-		for _, rem := range s.cfg.ListRemotes() {
-			if rem.ID == remoteID {
-				cp := rem
-				found = &cp
-				break
-			}
-		}
-		if found == nil {
-			errOut(w, 404, "remote not found")
-			return
-		}
-		app, _ := s.cfg.GetApp(appID)
-		respond(w, 202, map[string]string{"status": "accepted"})
-		go func() {
-			emit := func(msg string) { s.engine.EmitLog(appID, msg) }
-			emit("Pushing " + backupID + " → " + found.Label + "…")
-			if err := backup.PushToRemote(archivePath, *found); err != nil {
-				emit("✗ Push failed: " + err.Error())
-				s.dispatchNotify(notify.Event{Kind: "push_fail", AppName: app.Name, Detail: err.Error(), IsError: true})
-			} else {
-				emit("✓ Push complete: " + found.Label)
-				s.dispatchNotify(notify.Event{Kind: "push_success", AppName: app.Name, Detail: found.Label})
-			}
-		}()
 		return
 	}
 
@@ -991,106 +931,33 @@ func (s *Server) handleOrphans(w http.ResponseWriter, r *http.Request) {
 
 // ── Remotes ───────────────────────────────────────────────────────────────────
 
-func (s *Server) handleRemotes(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		respond(w, 200, s.cfg.ListRemotes())
-	case http.MethodPost:
-		var rem config.RemoteTarget
-		if err := parseJSON(r, &rem); err != nil {
-			errOut(w, 400, err.Error())
-			return
-		}
-		if rem.Label == "" || rem.Host == "" {
-			errOut(w, 400, "label and host are required")
-			return
-		}
-		if rem.ID == "" {
-			rem.ID = sanitizeID(rem.Label)
-		}
-		if err := s.cfg.AddRemote(rem); err != nil {
-			errOut(w, 409, err.Error())
-			return
-		}
-		_ = s.cfg.Save()
-		respond(w, 201, rem)
-	default:
+// ── API Key ───────────────────────────────────────────────────────────────────
+//
+// GET /api/apikey  → returns masked key + usage instructions for external integrations
+// The full key is never sent to the browser. Callers that need it (scripts, Home Assistant,
+// Homepage, Tautulli, etc.) must read it from /data/config.json on the host or copy it
+// from the Settings → API Access page after a fresh regeneration.
+
+func (s *Server) handleAPIKey(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
 		errOut(w, 405, "method not allowed")
-	}
-}
-
-func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
-	tail := strings.TrimPrefix(r.URL.Path, "/api/remotes/")
-
-	// POST /api/remotes/test — test connection before saving (wizard step 2).
-	// Body: {host, port, user, key_file} — no ID required.
-	if r.Method == http.MethodPost && tail == "test" {
-		var rem config.RemoteTarget
-		if err := parseJSON(r, &rem); err != nil {
-			errOut(w, 400, err.Error())
-			return
-		}
-		if rem.Host == "" || rem.User == "" {
-			errOut(w, 400, "host and user are required")
-			return
-		}
-		if rem.Port <= 0 {
-			rem.Port = 22
-		}
-		if err := backup.TestRemoteConnection(rem); err != nil {
-			respond(w, 200, map[string]any{"ok": false, "error": err.Error()})
-		} else {
-			respond(w, 200, map[string]any{"ok": true})
-		}
 		return
 	}
-
-	// POST /api/remotes/{id}/test — test an already-saved remote.
-	if r.Method == http.MethodPost && strings.HasSuffix(tail, "/test") {
-		remID := strings.TrimSuffix(tail, "/test")
-		for _, rem := range s.cfg.ListRemotes() {
-			if rem.ID == remID {
-				if err := backup.TestRemoteConnection(rem); err != nil {
-					respond(w, 200, map[string]any{"ok": false, "error": err.Error()})
-				} else {
-					respond(w, 200, map[string]any{"ok": true})
-				}
-				return
-			}
-		}
-		errOut(w, 404, "remote not found")
-		return
+	key := s.cfg.APIKey()
+	// Return a masked version so the UI can show it's set without leaking it.
+	// Format: first 8 chars + "..." + last 4 chars, e.g. "a1b2c3d4...ef90"
+	masked := key
+	if len(key) > 12 {
+		masked = key[:8] + "..." + key[len(key)-4:]
 	}
-
-	// PUT /api/remotes/{id} — update an existing remote (wizard edit flow).
-	if r.Method == http.MethodPut {
-		var rem config.RemoteTarget
-		if err := parseJSON(r, &rem); err != nil {
-			errOut(w, 400, err.Error())
-			return
-		}
-		rem.ID = tail
-		if err := s.cfg.UpdateRemote(rem); err != nil {
-			errOut(w, 404, err.Error())
-			return
-		}
-		_ = s.cfg.Save()
-		respond(w, 200, rem)
-		return
-	}
-
-	// DELETE /api/remotes/{id}
-	if r.Method == http.MethodDelete {
-		if err := s.cfg.DeleteRemote(tail); err != nil {
-			errOut(w, 404, err.Error())
-			return
-		}
-		_ = s.cfg.Save()
-		respond(w, 200, map[string]string{"deleted": tail})
-		return
-	}
-
-	errOut(w, 405, "method not allowed")
+	respond(w, 200, map[string]any{
+		"masked":       masked,
+		"length":       len(key),
+		"usage_header": "X-API-Key",
+		"usage_param":  "api_key",
+		"example":      "curl -H 'X-API-Key: <your-key>' http://<pi-ip>:8765/api/apps",
+		"hint":         "Copy the full key once after regenerating — it will not be shown again in the UI.",
+	})
 }
 
 // ── Self-update ───────────────────────────────────────────────────────────────
@@ -1158,7 +1025,7 @@ func (s *Server) syncSchedule(app config.AppConfig) {
 				log.Printf("[scheduler] skipping %s — job already running", current.ID)
 				return
 			}
-			s.runBackup(current, "", true)
+			s.runBackup(current, true)
 		},
 	})
 }
@@ -1236,7 +1103,7 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			return
 		}
 		_ = notify.SendTelegram(tgCfg, notify.Event{AppName: app.Name, Detail: "Backup started ⏳"})
-		go s.runBackup(*app, "", false)
+		go s.runBackup(*app, false)
 
 	case "/history":
 		entries := s.hist.List(10)
@@ -1281,7 +1148,7 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 			return
 		}
 		_ = notify.SendTelegram(tgCfg, notify.Event{AppName: app.Name, Detail: "Backup started ⏳"})
-		go s.runBackup(app, "", false)
+		go s.runBackup(app, false)
 	}
 }
 
@@ -1351,13 +1218,6 @@ func sanitizeID(name string) string {
 		id = strings.ReplaceAll(id, "__", "__")
 	}
 	return strings.Trim(id, "_")
-}
-
-func safeSlice(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
 }
 
 // slugFromPath mirrors the config package helper (avoids import cycle).
