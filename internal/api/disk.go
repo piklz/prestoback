@@ -1,4 +1,5 @@
-//go:build linux || darwin
+//go:build linux
+// +build linux
 
 package api
 
