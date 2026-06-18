@@ -331,9 +331,16 @@ select.fi{cursor:pointer}
         </div>
       </div>
       <div class="stat" id="s-next-stat" style="display:none">
-        <div class="sl">Next scheduled backup</div>
-        <div class="sv" id="s-next" style="font-size:13px;font-family:var(--mono)">—</div>
-        <div style="font-size:11px;color:var(--txt3);margin-top:3px" id="s-next-app"></div>
+        <div class="sl" style="display:flex;align-items:center;justify-content:space-between">
+          <span>Upcoming backups</span>
+          <span id="s-next-dots" style="display:flex;gap:4px;align-items:center"></span>
+        </div>
+        <div id="s-next-ticker" style="position:relative;overflow:hidden;min-height:38px;margin-top:2px">
+          <div id="s-next-frame" style="transition:opacity .35s,transform .35s;opacity:1;transform:translateY(0)">
+            <div class="sv" id="s-next" style="font-size:13px;font-family:var(--mono)">—</div>
+            <div style="font-size:11px;color:var(--txt3);margin-top:1px" id="s-next-app"></div>
+          </div>
+        </div>
       </div>
     </div>
     <div class="card">
@@ -939,29 +946,19 @@ async function loadStatus() {
         .filter(r => r.next_run)
         .sort((a,b) => new Date(a.next_run) - new Date(b.next_run));
       if (upcoming.length) {
-        const next = upcoming[0];
-        const app = S.apps.find(a => a.id === next.app_id);
-        const nextDate = new Date(next.next_run);
-        const mins = Math.round((nextDate - Date.now()) / 60000);
-        const timeStr = mins < 60
-          ? `in ${mins}m`
-          : mins < 1440
-          ? `in ${Math.round(mins/60)}h`
-          : nextDate.toLocaleDateString();
-        document.getElementById('s-next').textContent = timeStr;
-        document.getElementById('s-next-app').textContent = app ? app.name : next.app_id;
         document.getElementById('s-next-stat').style.display = '';
+        initSchedTicker(upcoming);
       }
     }
-    // Fetch full key from server
+    // Fetch masked key from server — full key never exposed after JWT login
     try {
       const keyInfo = await api('/api/apikey');
-      const key = keyInfo.key || '(could not load)';
-      S.apiKey = key;
+      const masked = keyInfo.masked || '(key set — regenerate to reveal)';
       const el = document.getElementById('api-key-display');
-      el.childNodes[0].textContent = key;
+      el.childNodes[0].textContent = masked;
+      el.dataset.masked = 'true';
       document.getElementById('curl-example').textContent =
-        `curl -H "X-API-Key: ${key}" http://localhost:8765/api/status`;
+        'curl -H "X-API-Key: <your-key>" http://your-pi:8765/api/status\n# Regenerate the key to get a one-time copy of the full value.';
     } catch {
       const el = document.getElementById('api-key-display');
       el.childNodes[0].textContent = '(could not load)';
@@ -1227,10 +1224,10 @@ async function _doPreviewCron(inputId, previewId) {
       const date = d.toLocaleDateString(undefined, {month:'short', day:'numeric'});
       const time = d.toLocaleTimeString(undefined, {hour:'2-digit', minute:'2-digit'});
 
-      return \`<div style="display:flex;align-items:baseline;gap:8px;padding:3px 0;border-bottom:1px solid var(--line);\${i===4?'border-bottom:none':''}">
-        <span style="font-family:var(--mono);font-size:11px;color:var(--accent);min-width:48px">\${rel}</span>
-        <span style="font-size:12px;color:var(--txt2);\${i===0?'font-weight:500':''}">\${day} \${date} at \${time}</span>
-      </div>\`;
+      return `<div style="display:flex;align-items:baseline;gap:8px;padding:3px 0;border-bottom:1px solid var(--line);${i===4?'border-bottom:none':''}">
+        <span style="font-family:var(--mono);font-size:11px;color:var(--accent);min-width:48px">${rel}</span>
+        <span style="font-size:12px;color:var(--txt2);${i===0?'font-weight:500':''}">${day} ${date} at ${time}</span>
+      </div>`;
     }).join('');
 
     preview.style.display = '';
@@ -1656,11 +1653,14 @@ async function testNotify() {
 
 // ════════════════════ Security ════════════════════
 function copyKey() {
-  if (S.apiKey) {
-    navigator.clipboard.writeText(S.apiKey);
+  // After JWT login the full key is never in memory — only the masked version.
+  // If the user just regenerated, S.apiKey holds the one-time full value.
+  const full = S.apiKey;
+  if (full && full.length > 12) {
+    navigator.clipboard.writeText(full);
     toast('API key copied','success');
   } else {
-    toast('Key not loaded yet — try refreshing','warn');
+    toast('Full key not available — use Regenerate to get a one-time copy','warn');
   }
 }
 async function regenKey() {
@@ -1677,7 +1677,7 @@ async function regenKey() {
     overlay.innerHTML = `
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:28px 32px;max-width:540px;width:90%">
         <div style="font-size:15px;font-weight:500;margin-bottom:6px">New API Key — copy it now</div>
-        <div style="font-size:12px;color:var(--txt3);margin-bottom:16px">Copy the new key to update any external integrations (Home Assistant, Homepage, etc.).</div>
+        <div style="font-size:12px;color:var(--txt3);margin-bottom:16px">This is the only time the full key will be shown. After dismissing, only a masked version will be displayed.</div>
         <div style="font-family:var(--mono,monospace);font-size:13px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:12px 14px;word-break:break-all;margin-bottom:16px;user-select:all">${newKey}</div>
         <div style="display:flex;gap:10px">
           <button onclick="navigator.clipboard.writeText('${newKey}');this.textContent='Copied ✓'" style="flex:1">Copy key</button>
@@ -1799,6 +1799,88 @@ function addLog(appID,msg,cls='') {
   log.scrollTop=log.scrollHeight;
 }
 
+
+// ════════════════════ Schedule ticker ════════════════════
+let _schedTimer = null;
+let _schedIdx = 0;
+let _schedItems = [];
+
+function fmtRelTime(dateStr) {
+  const mins = Math.round((new Date(dateStr) - Date.now()) / 60000);
+  if (mins < 1)    return 'now';
+  if (mins < 60)   return `in ${mins}m`;
+  if (mins < 1440) return `in ${Math.round(mins/60)}h`;
+  if (mins < 10080) return `in ${Math.round(mins/1440)}d`;
+  return new Date(dateStr).toLocaleDateString();
+}
+
+function initSchedTicker(upcoming) {
+  clearInterval(_schedTimer);
+  _schedIdx = 0;
+
+  // cap display at 5; if more, last slot becomes overflow indicator
+  const MAX_SHOW = 5;
+  _schedItems = upcoming.slice(0, MAX_SHOW);
+  const overflow = upcoming.length - MAX_SHOW;
+
+  // build dot indicators
+  const dotsEl = document.getElementById('s-next-dots');
+  dotsEl.innerHTML = '';
+  _schedItems.forEach((_, i) => {
+    const d = document.createElement('span');
+    d.style.cssText = `width:5px;height:5px;border-radius:50%;background:var(--${i===0?'accent':'bg4'});border:1px solid var(--${i===0?'accent':'txt3'});transition:background .3s,border-color .3s;cursor:pointer`;
+    d.onclick = () => tickerGoto(i);
+    dotsEl.appendChild(d);
+  });
+  if (overflow > 0) {
+    const more = document.createElement('span');
+    more.style.cssText = 'font-size:9px;color:var(--txt3);font-family:var(--mono);margin-left:2px';
+    more.textContent = `+${overflow}`;
+    dotsEl.appendChild(more);
+  }
+
+  renderSchedFrame(0);
+  if (_schedItems.length > 1) {
+    _schedTimer = setInterval(() => tickerGoto((_schedIdx + 1) % _schedItems.length), 4000);
+  }
+}
+
+function tickerGoto(idx) {
+  if (idx === _schedIdx) return;
+  const frame = document.getElementById('s-next-frame');
+  // slide out up
+  frame.style.opacity = '0';
+  frame.style.transform = 'translateY(-8px)';
+  setTimeout(() => {
+    _schedIdx = idx;
+    renderSchedFrame(idx);
+    // slide in from below
+    frame.style.transition = 'none';
+    frame.style.transform = 'translateY(8px)';
+    frame.style.opacity = '0';
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        frame.style.transition = 'opacity .3s,transform .3s';
+        frame.style.opacity = '1';
+        frame.style.transform = 'translateY(0)';
+      });
+    });
+    // update dots
+    document.getElementById('s-next-dots').querySelectorAll('span[style*="border-radius:50%"]').forEach((d,i) => {
+      const active = i === idx;
+      d.style.background = active ? 'var(--accent)' : 'var(--bg4)';
+      d.style.borderColor = active ? 'var(--accent)' : 'var(--txt3)';
+    });
+  }, 300);
+}
+
+function renderSchedFrame(idx) {
+  const item = _schedItems[idx];
+  if (!item) return;
+  const app = S.apps.find(a => a.id === item.app_id);
+  document.getElementById('s-next').textContent = fmtRelTime(item.next_run);
+  document.getElementById('s-next-app').textContent = app ? app.name : item.app_id;
+}
 // ════════════════════ Toggle helpers ════════════════════
 function setTog(id,on) { const el=document.getElementById(id); if(!el)return; el.classList.toggle('on',!!on); }
 
