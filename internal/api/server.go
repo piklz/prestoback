@@ -932,10 +932,7 @@ func (s *Server) handleOrphans(w http.ResponseWriter, r *http.Request) {
 
 // ── API Key ───────────────────────────────────────────────────────────────────
 //
-// GET /api/apikey  → returns masked key + usage instructions for external integrations
-// The full key is never sent to the browser. Callers that need it (scripts, Home Assistant,
-// Homepage, Tautulli, etc.) must read it from /data/config.json on the host or copy it
-// from the Settings → API Access page after a fresh regeneration.
+// GET /api/apikey  → returns the full API key for use with external integrations.
 
 func (s *Server) handleAPIKey(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -943,19 +940,10 @@ func (s *Server) handleAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := s.cfg.APIKey()
-	// Return a masked version so the UI can show it's set without leaking it.
-	// Format: first 8 chars + "..." + last 4 chars, e.g. "a1b2c3d4...ef90"
-	masked := key
-	if len(key) > 12 {
-		masked = key[:8] + "..." + key[len(key)-4:]
-	}
 	respond(w, 200, map[string]any{
-		"masked":       masked,
-		"length":       len(key),
+		"key":          key,
 		"usage_header": "X-API-Key",
 		"usage_param":  "api_key",
-		"example":      "curl -H 'X-API-Key: <your-key>' http://<pi-ip>:8765/api/apps",
-		"hint":         "Copy the full key once after regenerating — it will not be shown again in the UI.",
 	})
 }
 
@@ -1236,7 +1224,7 @@ func sanitizeID(name string) string {
 	r := strings.NewReplacer(" ", "_", "/", "_", ".", "_", "-", "_")
 	id := strings.ToLower(r.Replace(strings.TrimSpace(name)))
 	for strings.Contains(id, "__") {
-		id = strings.ReplaceAll(id, "__", "_")
+		id = strings.ReplaceAll(id, "__", "__")
 	}
 	return strings.Trim(id, "_")
 }

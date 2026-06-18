@@ -953,15 +953,15 @@ async function loadStatus() {
         document.getElementById('s-next-stat').style.display = '';
       }
     }
-    // Fetch masked key from server — full key never exposed after JWT login
+    // Fetch full key from server
     try {
       const keyInfo = await api('/api/apikey');
-      const masked = keyInfo.masked || '(key set — regenerate to reveal)';
+      const key = keyInfo.key || '(could not load)';
+      S.apiKey = key;
       const el = document.getElementById('api-key-display');
-      el.childNodes[0].textContent = masked;
-      el.dataset.masked = 'true';
+      el.childNodes[0].textContent = key;
       document.getElementById('curl-example').textContent =
-        'curl -H "X-API-Key: <your-key>" http://your-pi:8765/api/status\n# Regenerate the key to get a one-time copy of the full value.';
+        `curl -H "X-API-Key: ${key}" http://localhost:8765/api/status`;
     } catch {
       const el = document.getElementById('api-key-display');
       el.childNodes[0].textContent = '(could not load)';
@@ -1227,10 +1227,10 @@ async function _doPreviewCron(inputId, previewId) {
       const date = d.toLocaleDateString(undefined, {month:'short', day:'numeric'});
       const time = d.toLocaleTimeString(undefined, {hour:'2-digit', minute:'2-digit'});
 
-      return `<div style="display:flex;align-items:baseline;gap:8px;padding:3px 0;border-bottom:1px solid var(--line);${i===4?'border-bottom:none':''}">
-        <span style="font-family:var(--mono);font-size:11px;color:var(--accent);min-width:48px">${rel}</span>
-        <span style="font-size:12px;color:var(--txt2);${i===0?'font-weight:500':''}">${day} ${date} at ${time}</span>
-      </div>`;
+      return \`<div style="display:flex;align-items:baseline;gap:8px;padding:3px 0;border-bottom:1px solid var(--line);\${i===4?'border-bottom:none':''}">
+        <span style="font-family:var(--mono);font-size:11px;color:var(--accent);min-width:48px">\${rel}</span>
+        <span style="font-size:12px;color:var(--txt2);\${i===0?'font-weight:500':''}">\${day} \${date} at \${time}</span>
+      </div>\`;
     }).join('');
 
     preview.style.display = '';
@@ -1656,14 +1656,11 @@ async function testNotify() {
 
 // ════════════════════ Security ════════════════════
 function copyKey() {
-  // After JWT login the full key is never in memory — only the masked version.
-  // If the user just regenerated, S.apiKey holds the one-time full value.
-  const full = S.apiKey;
-  if (full && full.length > 12) {
-    navigator.clipboard.writeText(full);
+  if (S.apiKey) {
+    navigator.clipboard.writeText(S.apiKey);
     toast('API key copied','success');
   } else {
-    toast('Full key not available — use Regenerate to get a one-time copy','warn');
+    toast('Key not loaded yet — try refreshing','warn');
   }
 }
 async function regenKey() {
@@ -1680,7 +1677,7 @@ async function regenKey() {
     overlay.innerHTML = `
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:28px 32px;max-width:540px;width:90%">
         <div style="font-size:15px;font-weight:500;margin-bottom:6px">New API Key — copy it now</div>
-        <div style="font-size:12px;color:var(--txt3);margin-bottom:16px">This is the only time the full key will be shown. After dismissing, only a masked version will be displayed.</div>
+        <div style="font-size:12px;color:var(--txt3);margin-bottom:16px">Copy the new key to update any external integrations (Home Assistant, Homepage, etc.).</div>
         <div style="font-family:var(--mono,monospace);font-size:13px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:12px 14px;word-break:break-all;margin-bottom:16px;user-select:all">${newKey}</div>
         <div style="display:flex;gap:10px">
           <button onclick="navigator.clipboard.writeText('${newKey}');this.textContent='Copied ✓'" style="flex:1">Copy key</button>
