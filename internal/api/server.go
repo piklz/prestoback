@@ -97,6 +97,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/apikey/regenerate", s.authJWT(s.handleRegenKey))
 	s.mux.HandleFunc("/api/update/check", s.authJWT(s.handleUpdateCheck))
 	s.mux.HandleFunc("/api/update/apply", s.authJWT(s.handleUpdateApply))
+	s.mux.HandleFunc("/api/cron/preview", s.authJWT(s.handleCronPreview))
 }
 
 // ── SSE ───────────────────────────────────────────────────────────────────────
@@ -997,6 +998,28 @@ func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 			s.engine.EmitUpdate(backup.UpdateResult{Stage: "error", Message: "Update failed", Error: err.Error()})
 		}
 	}()
+}
+
+// ── Cron preview ──────────────────────────────────────────────────────────────
+
+func (s *Server) handleCronPreview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	expr := r.URL.Query().Get("expr")
+	if expr == "" {
+		errOut(w, 400, "missing cron expression")
+		return
+	}
+
+	description := scheduler.DescribeCron(expr)
+	nextRuns := scheduler.NextRunsForExpr(expr, 5, time.Now())
+
+	respond(w, 200, map[string]interface{}{
+		"description": description,
+		"next_runs":   nextRuns,
+	})
 }
 
 // ── Scheduler ─────────────────────────────────────────────────────────────────

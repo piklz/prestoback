@@ -631,7 +631,7 @@ select.fi{cursor:pointer}
         <div class="divlbl">Scheduled backup (optional)</div>
         <div class="ftog" onclick="togAddSched()"><div class="ftog-sw" id="add-sched-tog"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable scheduled backup</div></div>
         <div id="add-sched-fields" style="display:none">
-          <div class="fg"><label class="fl">Cron expression</label><input class="fi" id="a-cron" placeholder="0 3 * * *  (3:00 AM daily)"><div class="fh">Standard 5-field cron: minute hour day month weekday</div></div>
+          <div class="fg"><label class="fl">Cron expression</label><input class="fi" id="a-cron" placeholder="0 3 * * *  (3:00 AM daily)" oninput="previewCron('a-cron','a-cron-preview')"><div class="fh">Standard 5-field cron: minute hour day month weekday</div><div id="a-cron-preview" style="margin-top:8px;padding:8px;background:var(--bg3);border-radius:var(--rs);font-size:12px;display:none"><div style="color:var(--txt2);margin-bottom:6px" id="a-cron-desc"></div><div style="color:var(--txt3);font-family:var(--mono);font-size:11px" id="a-cron-runs"></div></div></div>
         </div>
       </div>
     </div>
@@ -659,7 +659,7 @@ select.fi{cursor:pointer}
         <div class="divlbl">Scheduled backup</div>
         <div class="ftog" onclick="togEditSched()"><div class="ftog-sw" id="edit-sched-tog"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable scheduled backup</div></div>
         <div id="edit-sched-fields" style="display:none">
-          <div class="fg"><label class="fl">Cron expression</label><input class="fi" id="ea-cron" placeholder="0 3 * * *"></div>
+          <div class="fg"><label class="fl">Cron expression</label><input class="fi" id="ea-cron" placeholder="0 3 * * *" oninput="previewCron('ea-cron','ea-cron-preview')"><div id="ea-cron-preview" style="margin-top:8px;padding:8px;background:var(--bg3);border-radius:var(--rs);font-size:12px;display:none"><div style="color:var(--txt2);margin-bottom:6px" id="ea-cron-desc"></div><div style="color:var(--txt3);font-family:var(--mono);font-size:11px" id="ea-cron-runs"></div></div></div>
         </div>
         <div class="ftog" onclick="togEditPin()"><div class="ftog-sw" id="edit-pin-tog"><div class="ftog-kn"></div></div><div class="ftog-lbl">Pin / freeze (skip scheduled backups)</div></div>
       </div>
@@ -1283,6 +1283,41 @@ async function submitEditApp() {
   };
   try { await api('/api/apps/'+a.id,{method:'PUT',body:JSON.stringify(a)}); toast('Saved','success'); CM('m-edit-app'); loadApps(); }
   catch(e) { toast(e.message,'error'); }
+}
+
+// Cron preview — show description and next 5 runs
+async function previewCron(inputId, previewId) {
+  const expr = document.getElementById(inputId).value.trim();
+  const preview = document.getElementById(previewId);
+  
+  if (!expr) {
+    preview.style.display = 'none';
+    return;
+  }
+
+  try {
+    const data = await api('/api/cron/preview?expr=' + encodeURIComponent(expr));
+    const descEl = document.getElementById(inputId.replace(/cron/, 'cron-desc'));
+    const runsEl = document.getElementById(inputId.replace(/cron/, 'cron-runs'));
+    
+    descEl.textContent = data.description;
+    
+    let runsHtml = 'Next runs:<br>';
+    for (const run of data.next_runs) {
+      const d = new Date(run);
+      runsHtml += d.toLocaleString() + '<br>';
+    }
+    runsEl.innerHTML = runsHtml;
+    
+    preview.style.display = 'block';
+  } catch(e) {
+    const preview = document.getElementById(previewId);
+    const descEl = document.getElementById(inputId.replace(/cron/, 'cron-desc'));
+    const runsEl = document.getElementById(inputId.replace(/cron/, 'cron-runs'));
+    descEl.textContent = '❌ Invalid cron expression';
+    runsEl.innerHTML = '';
+    preview.style.display = 'block';
+  }
 }
 
 // Discover

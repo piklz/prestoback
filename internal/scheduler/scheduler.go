@@ -5,7 +5,9 @@ package scheduler
 // Jobs are upserted (add-or-replace) so syncing app schedules is idempotent.
 
 import (
+	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -274,4 +276,99 @@ func indexByte(s string, b byte) int {
 		}
 	}
 	return -1
+}
+
+// DescribeCron returns a human-readable description of a cron expression.
+// Example: "0 3 * * *" → "Every day at 3:00 AM"
+func DescribeCron(expr string) string {
+	fields := parseCron(expr)
+	if fields == nil {
+		return "Invalid cron expression"
+	}
+
+	minute := formatCronField(fields.minute, 0, 59)
+	hour := formatCronField(fields.hour, 0, 23)
+	day := formatCronField(fields.day, 1, 31)
+	month := formatCronField(fields.month, 1, 12)
+	weekday := formatCronField(fields.weekday, 0, 6)
+
+	// Simple heuristics for common patterns
+	isDaily := len(fields.day.values) == 31 && len(fields.month.values) == 12 && len(fields.weekday.values) == 7
+	isWeekly := len(fields.weekday.values) < 7
+	isMonthly := len(fields.day.values) == 1 && len(fields.month.values) == 12
+
+	if isDaily && len(fields.hour.values) == 1 {
+		return fmt.Sprintf("Every day at %s", formatTime(fields.hour.values[0], fields.minute.values[0]))
+	}
+	if isMonthly && len(fields.hour.values) == 1 {
+		return fmt.Sprintf("On day %d every month at %s", fields.day.values[0], formatTime(fields.hour.values[0], fields.minute.values[0]))
+	}
+	if isWeekly && len(fields.hour.values) == 1 {
+		days := formatWeekdays(fields.weekday.values)
+		return fmt.Sprintf("%s at %s", days, formatTime(fields.hour.values[0], fields.minute.values[0]))
+	}
+
+	// Fallback: show all fields
+	return fmt.Sprintf("minute=%s hour=%s day=%s month=%s weekday=%s", minute, hour, day, month, weekday)
+}
+
+func formatWeekdays(values []int) string {
+	var names []string
+	dayNames := []string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
+	for _, v := range values {
+		if v >= 0 && v < 7 {
+			names = append(names, dayNames[v])
+		}
+	}
+	if len(names) == 7 {
+		return "Every day"
+	}
+	if len(names) == 5 {
+		hasWeekend := false
+		for _, v := range values {
+			if v == 0 || v == 6 {
+				hasWeekend = true
+				break
+			}
+		}
+		if !hasWeekend {
+			return "Every weekday"
+		}
+	}
+	if len(names) <= 2 {
+		return "On " + strings.Join(names, " and ")
+	}
+	return "On " + strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
+}
+
+func formatTime(hour, minute int) string {
+	return fmt.Sprintf("%02d:%02d", hour, minute)
+}
+
+func formatCronField(f cronField, min, max int) string {
+	if len(f.values) == (max - min + 1) {
+		return "*"
+	}
+	if len(f.values) == 1 {
+		return fmt.Sprintf("%d", f.values[0])
+	}
+	return fmt.Sprintf("%d values", len(f.values))
+}
+
+// NextRunsForExpr returns the next N run times for a cron expression.
+func NextRunsForExpr(expr string, count int, from time.Time) []time.Time {
+	if count <= 0 {
+		count = 5
+	}
+	if count > 100 {
+		count = 100 // safety limit
+	}
+
+	var runs []time.Time
+	next := from
+	for i := 0; i < count; i++ {
+		next = nextAfter(expr, next)
+		runs = append(runs, next)
+	}
+	return runs
 }
