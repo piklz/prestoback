@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -159,6 +160,17 @@ func (e *Engine) backupVolumes(appID, appName string, volumes []VolumeTarget, pr
 				label, vol.Slug, vol.Path, strings.Join(vol.Excludes, ", ")))
 		} else {
 			e.emit(&meta, fmt.Sprintf("Starting %s: %s [%s]", label, vol.Slug, vol.Path))
+		}
+
+		// Pre-flight: ensure destination has enough free space before stopping containers.
+		if err := checkDiskSpace(vol.Path, destDir, e, &meta); err != nil {
+			meta.Status = StatusFailed
+			meta.Error = err.Error()
+			if firstErr == nil {
+				firstErr = err
+			}
+			results = append(results, meta)
+			continue
 		}
 
 		size, err := tarGz(vol.Path, destFile, vol.Excludes)
@@ -526,6 +538,48 @@ func matchesExclude(relPath string, excludes []string) bool {
 		}
 	}
 	return false
+}
+
+// checkDiskSpace walks srcDir to measure its raw size, then checks that the
+// backup destination has at least 1.2× that available. The 1.2× margin covers:
+//   - tar metadata overhead
+//   - already-compressed content (Plex, media) that won't shrink under gzip
+//   - other writes happening concurrently on the same volume
+//
+// Returns a descriptive error (emitted as a log line) if space is insufficient.
+func checkDiskSpace(srcDir, destDir string, e *Engine, meta *BackupMeta) error {
+	// Measure raw source size
+	var srcBytes int64
+	_ = filepath.Walk(srcDir, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && info != nil && info.Mode().IsRegular() {
+			srcBytes += info.Size()
+		}
+		return nil
+	})
+
+	// Get free bytes on the backup destination filesystem
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(destDir, &stat); err != nil {
+		// Can't check — warn but don't block the backup
+		e.emit(meta, fmt.Sprintf("⚠  disk space check skipped (statfs %s: %v)", destDir, err))
+		return nil
+	}
+	freeBytes := stat.Bavail * uint64(stat.Bsize)
+
+	// Require 1.2× source size free (worst-case: no compression)
+	required := uint64(float64(srcBytes) * 1.2)
+	if required > freeBytes {
+		return fmt.Errorf(
+			"insufficient disk space: source is %.1f GB, need %.1f GB free on backup volume, only %.1f GB available — backup aborted",
+			float64(srcBytes)/1e9,
+			float64(required)/1e9,
+			float64(freeBytes)/1e9,
+		)
+	}
+
+	e.emit(meta, fmt.Sprintf("✓ disk space OK (source %.1f GB, free %.1f GB)",
+		float64(srcBytes)/1e9, float64(freeBytes)/1e9))
+	return nil
 }
 
 func tarGz(srcDir, destFile string, excludes []string) (int64, error) {
