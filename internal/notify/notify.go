@@ -285,21 +285,26 @@ type TelegramUpdate struct {
 }
 
 type TelegramMessage struct {
-	MessageID int            `json:"message_id"`
-	From      TelegramUser   `json:"from"`
-	Chat      TelegramChat   `json:"chat"`
-	Text      string         `json:"text"`
+	MessageID int          `json:"message_id"`
+	From      TelegramUser `json:"from"`
+	Chat      TelegramChat `json:"chat"`
+	Text      string       `json:"text"`
 }
 
 type TelegramCallbackQuery struct {
-	ID      string         `json:"id"`
-	From    TelegramUser   `json:"from"`
+	ID      string          `json:"id"`
+	From    TelegramUser    `json:"from"`
 	Message TelegramMessage `json:"message"`
-	Data    string         `json:"data"`
+	Data    string          `json:"data"`
 }
 
-type TelegramUser struct { ID int64 `json:"id"`; Username string `json:"username"` }
-type TelegramChat struct { ID int64 `json:"id"` }
+type TelegramUser struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+}
+type TelegramChat struct {
+	ID int64 `json:"id"`
+}
 
 type BotUpdates struct {
 	OK     bool             `json:"ok"`
@@ -308,7 +313,8 @@ type BotUpdates struct {
 
 func GetUpdates(token string, offset int) ([]TelegramUpdate, error) {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=10", token, offset)
-	resp, err := http.Get(url)
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(url)
 	if err != nil {
 		return nil, err
 	}

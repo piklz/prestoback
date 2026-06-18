@@ -1236,7 +1236,7 @@ func sanitizeID(name string) string {
 	r := strings.NewReplacer(" ", "_", "/", "_", ".", "_", "-", "_")
 	id := strings.ToLower(r.Replace(strings.TrimSpace(name)))
 	for strings.Contains(id, "__") {
-		id = strings.ReplaceAll(id, "__", "__")
+		id = strings.ReplaceAll(id, "__", "_")
 	}
 	return strings.Trim(id, "_")
 }
