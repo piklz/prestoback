@@ -1227,10 +1227,10 @@ async function _doPreviewCron(inputId, previewId) {
       const date = d.toLocaleDateString(undefined, {month:'short', day:'numeric'});
       const time = d.toLocaleTimeString(undefined, {hour:'2-digit', minute:'2-digit'});
 
-      return \`<div style="display:flex;align-items:baseline;gap:8px;padding:3px 0;border-bottom:1px solid var(--line);\${i===4?'border-bottom:none':''}">
-        <span style="font-family:var(--mono);font-size:11px;color:var(--accent);min-width:48px">\${rel}</span>
-        <span style="font-size:12px;color:var(--txt2);\${i===0?'font-weight:500':''}">\${day} \${date} at \${time}</span>
-      </div>\`;
+      return `<div style="display:flex;align-items:baseline;gap:8px;padding:3px 0;border-bottom:1px solid var(--line);${i===4?'border-bottom:none':''}">
+        <span style="font-family:var(--mono);font-size:11px;color:var(--accent);min-width:48px">${rel}</span>
+        <span style="font-size:12px;color:var(--txt2);${i===0?'font-weight:500':''}">${day} ${date} at ${time}</span>
+      </div>`;
     }).join('');
 
     preview.style.display = '';
