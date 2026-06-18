@@ -15,19 +15,6 @@ var Version = "dev"
 
 // ── Sub-types ─────────────────────────────────────────────────────────────────
 
-type RemoteTarget struct {
-	ID      string `json:"id"`
-	Label   string `json:"label"`
-	Host    string `json:"host"`
-	Port    int    `json:"port"`
-	User    string `json:"user"`
-	Path    string `json:"path"`
-	KeyFile string `json:"key_file,omitempty"`
-	// ModifyWindow adds --modify-window=1 to rsync, which prevents false
-	// "file changed" mismatches when the destination uses NTFS (Windows).
-	ModifyWindow bool `json:"modify_window,omitempty"`
-}
-
 type Schedule struct {
 	Enabled  bool   `json:"enabled"`
 	CronExpr string `json:"cron_expr"` // "0 3 * * *"
@@ -127,7 +114,6 @@ type User struct {
 type disk struct {
 	APIKey  string         `json:"api_key"`
 	Apps    []AppConfig    `json:"apps"`
-	Remotes []RemoteTarget `json:"remotes"`
 	Notify  NotifyConfig   `json:"notify"`
 	Users   []User         `json:"users,omitempty"`
 }
@@ -141,7 +127,6 @@ type Config struct {
 	mu            sync.RWMutex
 	apiKey        string
 	apps          map[string]AppConfig
-	remotes       map[string]RemoteTarget
 	notify        NotifyConfig
 	users         map[string]User
 	revokedTokens map[string]struct{}
@@ -154,8 +139,7 @@ func Load(dataDir string) (*Config, error) {
 	c := &Config{
 		DataDir:       dataDir,
 		apps:          make(map[string]AppConfig),
-		remotes:       make(map[string]RemoteTarget),
-		users:         make(map[string]User),
+			users:         make(map[string]User),
 		revokedTokens: make(map[string]struct{}),
 	}
 	path := filepath.Join(dataDir, "config.json")
@@ -215,12 +199,6 @@ func Load(dataDir string) (*Config, error) {
 		a.Excludes = nil // legacy field; now lives inside each VolumeConfig
 		c.apps[a.ID] = a
 	}
-	for _, r := range d.Remotes {
-		if r.Port <= 0 {
-			r.Port = 22
-		}
-		c.remotes[r.ID] = r
-	}
 	c.notify = d.Notify
 	for _, u := range d.Users {
 		c.users[u.Username] = u
@@ -244,9 +222,6 @@ func (c *Config) save() error {
 	}
 	for _, a := range c.apps {
 		d.Apps = append(d.Apps, a)
-	}
-	for _, r := range c.remotes {
-		d.Remotes = append(d.Remotes, r)
 	}
 	for _, u := range c.users {
 		d.Users = append(d.Users, u)
@@ -358,54 +333,6 @@ func (c *Config) AppCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.apps)
-}
-
-// ── Remotes ───────────────────────────────────────────────────────────────────
-
-func (c *Config) ListRemotes() []RemoteTarget {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	out := make([]RemoteTarget, 0, len(c.remotes))
-	for _, r := range c.remotes {
-		out = append(out, r)
-	}
-	return out
-}
-
-func (c *Config) AddRemote(r RemoteTarget) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, exists := c.remotes[r.ID]; exists {
-		return fmt.Errorf("remote '%s' already exists", r.ID)
-	}
-	if r.Port <= 0 {
-		r.Port = 22
-	}
-	c.remotes[r.ID] = r
-	return nil
-}
-
-func (c *Config) DeleteRemote(id string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, exists := c.remotes[id]; !exists {
-		return fmt.Errorf("remote '%s' not found", id)
-	}
-	delete(c.remotes, id)
-	return nil
-}
-
-func (c *Config) UpdateRemote(r RemoteTarget) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, exists := c.remotes[r.ID]; !exists {
-		return fmt.Errorf("remote '%s' not found", r.ID)
-	}
-	if r.Port <= 0 {
-		r.Port = 22
-	}
-	c.remotes[r.ID] = r
-	return nil
 }
 
 // ── Notifications ─────────────────────────────────────────────────────────────

@@ -930,8 +930,6 @@ func (s *Server) handleOrphans(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ── Remotes ───────────────────────────────────────────────────────────────────
-
 // ── API Key ───────────────────────────────────────────────────────────────────
 //
 // GET /api/apikey  → returns masked key + usage instructions for external integrations
