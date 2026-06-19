@@ -25,20 +25,22 @@ type SubDirInfo struct {
 
 // DiscoveredApp is a candidate app found via Docker socket or volumes dir.
 type DiscoveredApp struct {
-	Name          string       `json:"name"`
-	Path          string       `json:"path"` // path INSIDE prestoback container
-	ContainerName string       `json:"container_name"`
-	Image         string       `json:"image"`
-	Running       bool         `json:"running"`
-	LabelHinted   bool         `json:"label_hinted"`
-	Source        string       `json:"source"`     // "docker" | "volumes_dir"
-	Accessible    bool         `json:"accessible"` // can prestoback actually reach this path?
-	SubDirs       []SubDirInfo `json:"sub_dirs,omitempty"`
-	RootFiles     bool         `json:"root_files"`      // true if path has files directly inside (not just subdirs)
-	RootSizeBytes int64        `json:"root_size_bytes"` // size of files directly in the root (not recursive)
+	Name          string        `json:"name"`
+	Path          string        `json:"path"` // path INSIDE prestoback container
+	ContainerName string        `json:"container_name"`
+	Image         string        `json:"image"`
+	Running       bool          `json:"running"`
+	LabelHinted   bool          `json:"label_hinted"`
+	Source        string        `json:"source"`     // "docker" | "volumes_dir"
+	Accessible    bool          `json:"accessible"` // can prestoback actually reach this path?
+	SubDirs       []SubDirInfo  `json:"sub_dirs,omitempty"`
+	RootFiles     bool          `json:"root_files"`             // true if path has files directly inside (not just subdirs)
+	RootSizeBytes int64         `json:"root_size_bytes"`        // size of files directly in the root (not recursive)
+	ComposeDeps   []ComposeLink `json:"compose_deps,omitempty"` // this container's own depends_on, resolved
 }
 
 type dockerContainer struct {
+	ID    string `json:"Id"`
 	Name  string `json:"Name"`
 	State struct {
 		Running bool `json:"Running"`
@@ -233,6 +235,7 @@ func discoverFromDocker(selfName string, hostToContainer map[string]string, alre
 		if friendlyName == "" {
 			friendlyName = cleanContainerName(name)
 		}
+		deps := ComposeDependencies(c.ID)
 
 		if explicitPath := labels["com.prestoback.path"]; explicitPath != "" {
 			containerPath, accessible := translateHostPath(explicitPath, hostToContainer)
@@ -248,6 +251,7 @@ func discoverFromDocker(selfName string, hostToContainer map[string]string, alre
 					ContainerName: name, Image: c.Config.Image,
 					Running: c.State.Running, LabelHinted: true,
 					Source: "docker", Accessible: accessible,
+					ComposeDeps: deps,
 				})
 			}
 			continue
@@ -283,6 +287,7 @@ func discoverFromDocker(selfName string, hostToContainer map[string]string, alre
 				LabelHinted:   labelBacked,
 				Source:        "docker",
 				Accessible:    true,
+				ComposeDeps:   deps,
 			})
 		}
 	}

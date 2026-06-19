@@ -488,6 +488,11 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 		s.handleRemoveVolume(w, r, appID, parts[2])
 		return
 	}
+	// GET /api/apps/{id}/linked-containers — detect compose depends_on for this app
+	if len(parts) == 2 && parts[1] == "linked-containers" && r.Method == http.MethodGet {
+		s.handleLinkedContainers(w, r, appID)
+		return
+	}
 
 	switch r.Method {
 	case http.MethodGet:
@@ -545,6 +550,57 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 	default:
 		errOut(w, 405, "method not allowed")
 	}
+}
+
+// LinkedContainerCandidate is one compose-detected dependency surfaced to the
+// Edit App UI, for the user to confirm (or not) as part of the pause/stop pipeline.
+type LinkedContainerCandidate struct {
+	ServiceName   string `json:"service_name"`             // as declared in depends_on, e.g. "database"
+	ContainerName string `json:"container_name,omitempty"` // resolved sibling container name, if found
+	Status        string `json:"status,omitempty"`
+	Found         bool   `json:"found"`          // false if the service name didn't resolve to a live container
+	AlreadyLinked bool   `json:"already_linked"` // true if this app's config already includes it
+}
+
+// GET /api/apps/{id}/linked-containers — detects compose depends_on for the
+// app's currently matched container(s), so the Edit App UI can show "this
+// app depends on: X, Y" and let the user opt these into the pause/stop
+// pipeline. We only ever read the matched container's OWN depends_on label —
+// never a reverse proxy's or anything else's — see ComposeDependencies.
+func (s *Server) handleLinkedContainers(w http.ResponseWriter, r *http.Request, appID string) {
+	app, ok := s.cfg.GetApp(appID)
+	if !ok {
+		errOut(w, 404, "app not found")
+		return
+	}
+	alreadyLinked := map[string]bool{}
+	for _, n := range app.LinkedContainers {
+		alreadyLinked[n] = true
+	}
+
+	containers := backup.FindContainers(appID)
+	seen := map[string]bool{} // dedupe by service name, in case of multiple replicas
+	var candidates []LinkedContainerCandidate
+	for _, c := range containers {
+		for _, link := range backup.ComposeDependencies(c.ID) {
+			if seen[link.ServiceName] {
+				continue
+			}
+			seen[link.ServiceName] = true
+			cand := LinkedContainerCandidate{ServiceName: link.ServiceName}
+			if link.Container != nil {
+				cand.Found = true
+				cand.ContainerName = link.Container.Name
+				cand.Status = link.Container.Status
+				cand.AlreadyLinked = alreadyLinked[link.Container.Name]
+			}
+			candidates = append(candidates, cand)
+		}
+	}
+	if candidates == nil {
+		candidates = []LinkedContainerCandidate{}
+	}
+	respond(w, 200, map[string]any{"detected": candidates})
 }
 
 // handleAddVolume adds a new VolumeConfig to an existing app.
@@ -691,13 +747,30 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 	}
 
 	containers := backup.FindContainers(app.ID)
+	containers = append(containers, backup.ContainersByName(app.LinkedContainers)...)
+	containers = backup.DedupeContainers(containers)
 	if len(containers) == 0 {
 		emit("⚠  No running containers found — backing up live files")
 	}
 	toResume, _ := backup.QuiesceContainers(containers, app.ContainerStrategy, emit)
 
-	metas, err := s.engine.BackupVolumes(app.ID, app.Name, targets)
-	backup.ResumeContainers(toResume, app.ContainerStrategy, emit)
+	// Isolated in a closure so resume is guaranteed (via defer) the instant
+	// BackupVolumes returns OR panics — same timing as before on the happy
+	// path (no added downtime), but a panic here no longer (a) strands the
+	// containers stopped/paused, or (b) crashes the entire PrestoBack process.
+	var metas []backup.BackupMeta
+	var err error
+	func() {
+		defer backup.ResumeContainers(toResume, app.ContainerStrategy, emit)
+		defer func() {
+			if rec := recover(); rec != nil {
+				err = fmt.Errorf("internal error during backup: %v", rec)
+				emit(fmt.Sprintf("✗ Internal error during backup: %v", rec))
+				log.Printf("[backup] panic recovered for app %s: %v", app.ID, rec)
+			}
+		}()
+		metas, err = s.engine.BackupVolumes(app.ID, app.Name, targets)
+	}()
 
 	dur := time.Since(start).Milliseconds()
 
@@ -811,12 +884,25 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, ba
 		emit(fmt.Sprintf("━━━ Restore started: %s [%s → %s] ━━━", app.Name, backupID, destPath))
 
 		containers := backup.FindContainers(app.ID)
+		containers = append(containers, backup.ContainersByName(app.LinkedContainers)...)
+		containers = backup.DedupeContainers(containers)
 		if len(containers) == 0 {
 			emit("⚠  No running containers found")
 		}
 		toResume, _ := backup.QuiesceContainers(containers, app.ContainerStrategy, emit)
-		err := s.engine.RestoreVolume(app.ID, app.Name, volumeSlug, archivePath, destPath)
-		backup.ResumeContainers(toResume, app.ContainerStrategy, emit)
+
+		var err error
+		func() {
+			defer backup.ResumeContainers(toResume, app.ContainerStrategy, emit)
+			defer func() {
+				if rec := recover(); rec != nil {
+					err = fmt.Errorf("internal error during restore: %v", rec)
+					emit(fmt.Sprintf("✗ Internal error during restore: %v", rec))
+					log.Printf("[restore] panic recovered for app %s: %v", app.ID, rec)
+				}
+			}()
+			err = s.engine.RestoreVolume(app.ID, app.Name, volumeSlug, archivePath, destPath)
+		}()
 
 		dur := time.Since(start).Milliseconds()
 		if err != nil {

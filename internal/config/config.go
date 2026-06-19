@@ -51,6 +51,15 @@ type AppConfig struct {
 	// do not abort the backup (the command may be best-effort, e.g. a cache warm).
 	PreBackupCmd string `json:"pre_backup_cmd,omitempty"`
 
+	// LinkedContainers names additional containers (by exact Docker name,
+	// not service name) to quiesce alongside this app's own matched
+	// containers — typically a compose-declared dependency like a database
+	// or cache, detected via ComposeDependencies() and confirmed by the
+	// user in the Edit App UI. Empty by default: most apps either have no
+	// separate DB container, or back up that DB via PreBackupCmd instead
+	// (the zero-downtime option), so nothing is auto-included.
+	LinkedContainers []string `json:"linked_containers,omitempty"`
+
 	// ContainerStrategy controls how running containers are quiesced during
 	// backup/restore:
 	//   "stop"  (default, safest) — graceful SIGTERM, archive, then restart.

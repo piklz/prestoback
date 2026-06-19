@@ -11,9 +11,158 @@ import (
 
 // ContainerInfo holds what we need about a matched container.
 type ContainerInfo struct {
-	ID     string
-	Name   string
-	Status string // "running", "exited", etc.
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"` // "running", "exited", etc.
+}
+
+// ── Compose dependency discovery ──────────────────────────────────────────────
+//
+// Docker Compose stamps every container it creates with labels recording
+// which compose project/service it belongs to, and — crucially — what its
+// own `depends_on:` entry in the compose file listed. We read that straight
+// off the container; no compose file parsing needed.
+//
+// IMPORTANT — direction matters: we only ever read a container's OWN
+// depends_on label, never anyone else's. A reverse proxy that depends_on
+// your app (e.g. Caddy → Vaultwarden) is irrelevant to backing up the app —
+// we only care what the app ITSELF depends on (e.g. immich-server →
+// postgres, redis), since that's where its actual data dependencies live.
+
+const (
+	composeProjectLabel   = "com.docker.compose.project"
+	composeServiceLabel   = "com.docker.compose.service"
+	composeDependsOnLabel = "com.docker.compose.depends_on"
+)
+
+// ComposeLink describes one compose-declared dependency, resolved to an
+// actual sibling container where possible.
+type ComposeLink struct {
+	ServiceName string         `json:"service_name"`        // as named in depends_on, e.g. "database"
+	Container   *ContainerInfo `json:"container,omitempty"` // resolved sibling, nil if not found
+}
+
+// ComposeDependencies reads a container's own com.docker.compose.depends_on
+// label and resolves each entry to its actual sibling container within the
+// same compose project. Returns nil if the container isn't compose-managed
+// or has no declared dependencies (e.g. it's the thing other things depend
+// on, not the other way around).
+func ComposeDependencies(containerID string) []ComposeLink {
+	labels := inspectLabels(containerID)
+	if labels == nil {
+		return nil
+	}
+	project := labels[composeProjectLabel]
+	depsRaw := labels[composeDependsOnLabel]
+	if project == "" || depsRaw == "" {
+		return nil
+	}
+
+	var links []ComposeLink
+	for _, entry := range strings.Split(depsRaw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		// Format is "service:condition:required" — we only need the service name,
+		// and we parse defensively in case the exact format varies by Compose version.
+		serviceName := strings.SplitN(entry, ":", 2)[0]
+		if serviceName == "" {
+			continue
+		}
+		link := ComposeLink{ServiceName: serviceName}
+		if ci := findComposeService(project, serviceName); ci != nil {
+			link.Container = ci
+		}
+		links = append(links, link)
+	}
+	return links
+}
+
+// inspectLabels returns a container's labels, or nil on any failure.
+func inspectLabels(containerID string) map[string]string {
+	out, err := exec.Command("docker", "inspect", "--format={{json .Config.Labels}}", containerID).Output()
+	if err != nil {
+		return nil
+	}
+	var labels map[string]string
+	if err := json.Unmarshal(out, &labels); err != nil {
+		return nil
+	}
+	return labels
+}
+
+// findComposeService locates the container for a given compose project +
+// service name pair, regardless of running state. If a service has multiple
+// replicas, the first match is returned.
+func findComposeService(project, service string) *ContainerInfo {
+	out, err := exec.Command("docker", "ps", "-a",
+		"--filter", "label="+composeProjectLabel+"="+project,
+		"--filter", "label="+composeServiceLabel+"="+service,
+		"--format", `{"id":"{{.ID}}","name":"{{.Names}}","status":"{{.Status}}"}`,
+	).Output()
+	if err != nil {
+		return nil
+	}
+	line := strings.TrimSpace(string(out))
+	if line == "" {
+		return nil
+	}
+	first := strings.SplitN(line, "\n", 2)[0]
+	var ci ContainerInfo
+	if err := json.Unmarshal([]byte(first), &ci); err != nil {
+		return nil
+	}
+	ci.Status = containerState(ci.ID)
+	return &ci
+}
+
+// ContainersByName resolves explicit, user-configured container names (e.g.
+// AppConfig.LinkedContainers) to their current ContainerInfo. Unlike
+// FindContainers, this does an exact-name lookup — no fuzzy matching — since
+// the user (or auto-detection) already pinned down the precise name.
+func ContainersByName(names []string) []ContainerInfo {
+	var out []ContainerInfo
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		raw, err := exec.Command("docker", "ps", "-a",
+			"--filter", "name=^/"+name+"$",
+			"--format", `{"id":"{{.ID}}","name":"{{.Names}}","status":"{{.Status}}"}`,
+		).Output()
+		if err != nil {
+			continue
+		}
+		line := strings.TrimSpace(string(raw))
+		if line == "" {
+			log.Printf("[docker] linked container %q not found", name)
+			continue
+		}
+		var ci ContainerInfo
+		if err := json.Unmarshal([]byte(strings.SplitN(line, "\n", 2)[0]), &ci); err != nil {
+			continue
+		}
+		ci.Status = containerState(ci.ID)
+		out = append(out, ci)
+	}
+	return out
+}
+
+// DedupeContainers removes duplicate entries by ID — relevant when a linked
+// container happens to also be matched by FindContainers' name heuristics.
+func DedupeContainers(cs []ContainerInfo) []ContainerInfo {
+	seen := map[string]bool{}
+	var out []ContainerInfo
+	for _, c := range cs {
+		if seen[c.ID] {
+			continue
+		}
+		seen[c.ID] = true
+		out = append(out, c)
+	}
+	return out
 }
 
 // FindContainers returns ALL containers (running or stopped) that look like

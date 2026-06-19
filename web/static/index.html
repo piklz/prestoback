@@ -640,6 +640,11 @@ select.fi{cursor:pointer}
         </select>
         <div class="fh">Pause freezes the container instead of restarting it — much faster, fine for apps with a journaling DB (SQLite/Postgres/MySQL).</div>
       </div>
+      <div class="fg" id="ea-linked-wrap" style="display:none">
+        <label class="fl">Detected dependencies</label>
+        <div id="ea-linked-list" style="display:flex;flex-direction:column;gap:6px"></div>
+        <div class="fh">Detected via Docker Compose's <code>depends_on</code> — checked containers are paused/stopped alongside this app. We only read what this app itself depends on, never the reverse (e.g. a reverse proxy in front of it is never included).</div>
+      </div>
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
         <div class="divlbl">Exclude patterns <span style="color:var(--txt3);font-weight:400;font-size:11px">(one per line — dirs: Cache/, globs: *.log)</span></div>
         <textarea class="fi" id="ea-excludes" rows="3" placeholder="Cache/&#10;Transcodes/&#10;*.log" style="font-family:var(--mono);font-size:12px;resize:vertical"></textarea>
@@ -1173,6 +1178,7 @@ function openEditApp(id) {
   document.getElementById('edit-sched-fields').style.display=S.editSchedOn?'':'none';
   S.editPinOn=a.pinned||false; setTog('edit-pin-tog',S.editPinOn);
   document.getElementById('ea-excludes').value=(a.excludes||[]).join('\n');
+  loadLinkedContainers(a);
   // Fetch suggested excludes for this app's image (best-effort)
   const hint = document.getElementById('ea-suggest-hint');
   hint.textContent = '';
@@ -1192,17 +1198,43 @@ function togEditPin() { S.editPinOn=!S.editPinOn; setTog('edit-pin-tog',S.editPi
 async function submitEditApp() {
   const excludesRaw = (document.getElementById('ea-excludes').value||'')
     .split('\n').map(s=>s.trim()).filter(Boolean);
+  const linkedContainers = [...document.querySelectorAll('.ea-linked-chk:checked')].map(el => el.value);
   const a = {
     ...S.editApp,
     name:gv('ea-name'), path:gv('ea-path'),
     retain:parseInt(gv('ea-retain'))||5,
     pinned:S.editPinOn,
     container_strategy:gv('ea-strategy'),
+    linked_containers: linkedContainers,
     schedule:{enabled:S.editSchedOn, cron_expr:gv('ea-cron')},
     excludes: excludesRaw,
   };
   try { await api('/api/apps/'+a.id,{method:'PUT',body:JSON.stringify(a)}); toast('Saved','success'); CM('m-edit-app'); loadApps(); }
   catch(e) { toast(e.message,'error'); }
+}
+
+// Fetches compose-detected dependencies for this app and renders a checklist.
+// First-time detections (nothing saved yet) default to checked — "mutual
+// inclusion" — but anything the user has explicitly saved (checked or not)
+// is respected on subsequent opens rather than re-suggested every time.
+function loadLinkedContainers(a) {
+  const wrap = document.getElementById('ea-linked-wrap');
+  const list = document.getElementById('ea-linked-list');
+  wrap.style.display = 'none';
+  list.innerHTML = '';
+  api('/api/apps/'+a.id+'/linked-containers').then(r => {
+    const detected = (r.detected||[]).filter(c => c.found);
+    if (!detected.length) return;
+    const isFirstTime = !(a.linked_containers||[]).length;
+    wrap.style.display = '';
+    list.innerHTML = detected.map(c => {
+      const checked = c.already_linked || isFirstTime;
+      return `<label style="display:flex;align-items:center;gap:8px;background:var(--bg3);border:1px solid var(--line2);border-radius:var(--rs);padding:8px 11px;font-size:13px;cursor:pointer">
+        <input type="checkbox" class="ea-linked-chk" value="${esc(c.container_name)}" ${checked?'checked':''}>
+        <span><b>${esc(c.container_name)}</b> <span style="color:var(--txt3)">— depends_on: ${esc(c.service_name)}${c.status?' · '+esc(c.status):''}</span></span>
+      </label>`;
+    }).join('');
+  }).catch(()=>{}); // best-effort — no Docker socket access, or nothing detected
 }
 
 // Cron preset buttons
@@ -1315,6 +1347,9 @@ async function openDiscover() {
       const srcMeta = app.source === 'docker'
         ? `<span style="color:var(--txt3);font-size:10px;font-family:var(--mono)">${esc(app.container_name||'')} · ${esc(app.image||'')}</span>`
         : `<span style="color:var(--txt3);font-size:10px;font-family:var(--mono)">volumes dir</span>`;
+      const depsNote = (app.compose_deps && app.compose_deps.length)
+        ? `<div style="font-size:11px;color:var(--txt3);margin-top:3px">🔗 depends on: ${app.compose_deps.map(d=>esc(d.container?d.container.name:d.service_name)).join(', ')} — link these after import in Edit App</div>`
+        : '';
 
       // Whole-folder total = sum of everything we found inside it (sub_dirs + root files).
       let wholeTotal = app.root_size_bytes || 0;
@@ -1331,6 +1366,7 @@ async function openDiscover() {
             </div>
             <div style="font-family:var(--mono);font-size:11px;color:var(--accent);margin-top:2px">${esc(app.path)}</div>
             <div style="margin-top:2px">${srcMeta}</div>
+            ${depsNote}
           </div>
           ${hasSubdirs ? `<div style="display:flex;border:1px solid var(--line2);border-radius:7px;overflow:hidden;flex-shrink:0">
             <button type="button" class="disc-mode-btn disc-mode-whole active" data-gid="${gid}"
