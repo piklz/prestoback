@@ -662,14 +662,20 @@ select.fi{cursor:pointer}
 
 <!-- Discover -->
 <div class="overlay hidden" id="m-discover">
-  <div class="modal" style="max-width:560px">
+  <div class="modal" style="max-width:600px">
     <div class="mh"><div class="mt">Discover Apps</div><button class="btn btn-g btn-ic" onclick="CM('m-discover')">✕</button></div>
     <div class="mb">
       <div style="font-size:13px;color:var(--txt2);margin-bottom:6px">Running containers and their data directories, discovered via Docker socket.</div>
       <div style="font-size:11px;color:var(--txt3);margin-bottom:14px;font-family:var(--mono)">Tip: add label <span style="color:var(--accent)">com.prestoback.backup=true</span> to your compose services to highlight them here.</div>
       <div id="disc-list"></div>
     </div>
-    <div class="mf"><button class="btn btn-g" onclick="CM('m-discover')">Cancel</button><button class="btn btn-p" onclick="importDisc()">Import Selected</button></div>
+    <div class="mf" style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+      <div id="disc-caption" style="font-size:11px;font-family:var(--mono);color:var(--txt3);flex:1;min-width:0">Nothing selected yet</div>
+      <div style="display:flex;gap:8px;flex-shrink:0">
+        <button class="btn btn-g" onclick="CM('m-discover')">Cancel</button>
+        <button class="btn btn-p" onclick="importDisc()">Import Selected</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1239,168 +1245,217 @@ async function _doPreviewCron(inputId, previewId) {
   }
 }
 
-// Discover
+// ════════════════════ Discover (Smart Import) ════════════════════
+//
+// Each discovered app group gets an import-mode toggle:
+//   • "Whole folder" (default) — imports the entire path as a single volume.
+//   • "Choose items"  — granular checklist of sub-directories (and root files,
+//     if present) from the enriched /api/discover payload. Each ticked item
+//     becomes its own VolumeConfig on the same app.
+//
+// A live caption tracks what's selected and sums sub_dirs[].size_bytes /
+// root_size_bytes (already computed server-side) into a running total —
+// no extra /api/dir-size round-trips needed for the common case.
+
+let discGroups = []; // [{ gid, app, mode: 'whole'|'granular' }]
+
+function discFmtBytes(n) {
+  if (!n || n <= 0) return '0 B';
+  const u = ['B','KB','MB','GB','TB'];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(1)) + ' ' + u[i];
+}
+
 async function openDiscover() {
   const list = document.getElementById('disc-list');
   list.innerHTML = '<div style="color:var(--txt3);font-size:13px">Scanning Docker containers…</div>';
   OM('m-discover');
+  discGroups = [];
   try {
     const candidates = await api('/api/discover');
     if (!candidates.length) {
       list.innerHTML = '<div style="color:var(--txt2);font-size:13px">No new apps found. All running containers are already configured, or no bind mounts were detected.</div>';
+      updateDiscCaption();
       return;
     }
     candidates.sort((a,b) => (b.label_hinted - a.label_hinted) || a.name.localeCompare(b.name));
 
-    // Group by container_name (docker) or treat each as its own group (volumes_dir)
-    const groupMap = new Map();
-    for (const v of candidates) {
-      const key = (v.source === 'docker' && v.container_name) ? v.container_name : '\x00' + v.path;
-      if (!groupMap.has(key)) groupMap.set(key, []);
-      groupMap.get(key).push(v);
-    }
-
-    // Longest common ancestor that all paths are direct children of
-    function commonParent(paths) {
-      if (paths.length < 2) return null;
-      const segs = p => p.split('/').filter(Boolean);
-      const base = segs(paths[0]);
-      let depth = base.length;
-      for (const p of paths.slice(1)) {
-        const ps = segs(p);
-        let d = 0;
-        while (d < depth && d < ps.length && ps[d] === base[d]) d++;
-        depth = d;
-      }
-      if (depth === 0) return null;
-      const parent = '/' + base.slice(0, depth).join('/');
-      return paths.every(p => p.startsWith(parent + '/')) ? parent : null;
-    }
-
     let html = '';
     let gIdx = 0;
-    const pendingGroups = []; // groups to wire up after innerHTML set
 
-    for (const [, items] of groupMap) {
-      const first = items[0];
-      const isGroup = items.length > 1;
-      const parentPath = isGroup ? commonParent(items.map(v => v.path)) : null;
+    for (const app of candidates) {
       const gid = 'dg' + (gIdx++);
-
-      const hint = first.label_hinted
+      const hasSubdirs = Array.isArray(app.sub_dirs) && app.sub_dirs.length > 0;
+      const hint = app.label_hinted
         ? `<span style="color:var(--green);font-size:10px;margin-left:6px">● label</span>` : '';
-      const stopped = (first.source === 'docker' && first.running === false)
+      const stopped = (app.source === 'docker' && app.running === false)
         ? `<span style="color:var(--amber);font-size:10px;margin-left:6px">stopped</span>` : '';
-      const srcMeta = first.source === 'docker'
-        ? `<span style="color:var(--txt3);font-size:10px;font-family:var(--mono)">${esc(first.container_name||'')} · ${esc(first.image||'')}</span>`
+      const srcMeta = app.source === 'docker'
+        ? `<span style="color:var(--txt3);font-size:10px;font-family:var(--mono)">${esc(app.container_name||'')} · ${esc(app.image||'')}</span>`
         : `<span style="color:var(--txt3);font-size:10px;font-family:var(--mono)">volumes dir</span>`;
 
-      if (!isGroup) {
-        // ── Single-mount app — flat row ───────────────────────────────────
-        html += `<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 0;border-bottom:1px solid var(--line);cursor:pointer">
-          <input type="checkbox" class="disc-flat" data-name="${esc(first.name)}" data-path="${esc(first.path)}"
-            ${first.label_hinted ? 'checked' : ''} style="accent-color:var(--accent);width:15px;height:15px;margin-top:2px;flex-shrink:0">
-          <div>
-            <div style="font-weight:500;display:flex;align-items:center">${esc(first.name)}${hint}${stopped}</div>
-            <div style="font-family:var(--mono);font-size:11px;color:var(--accent);margin-top:2px">${esc(first.path)}</div>
+      // Whole-folder total = sum of everything we found inside it (sub_dirs + root files).
+      let wholeTotal = app.root_size_bytes || 0;
+      if (hasSubdirs) for (const sd of app.sub_dirs) wholeTotal += (sd.size_bytes || 0);
+      const wholeTotalStr = wholeTotal > 0 ? discFmtBytes(wholeTotal) : '';
+
+      discGroups.push({ gid, app, mode: 'whole' });
+
+      html += `<div class="disc-group" data-gid="${gid}" style="border-bottom:1px solid var(--line);padding:10px 0">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px">
+          <div style="min-width:0">
+            <div style="font-weight:600;display:flex;align-items:center;flex-wrap:wrap;gap:4px">
+              ${esc(app.name)}${hint}${stopped}
+            </div>
+            <div style="font-family:var(--mono);font-size:11px;color:var(--accent);margin-top:2px">${esc(app.path)}</div>
             <div style="margin-top:2px">${srcMeta}</div>
           </div>
-        </label>`;
-      } else {
-        // ── Multi-mount app — tree group ──────────────────────────────────
-        pendingGroups.push({ gid, items });
-        const anyHinted = items.some(v => v.label_hinted);
+          ${hasSubdirs ? `<div style="display:flex;border:1px solid var(--line2);border-radius:7px;overflow:hidden;flex-shrink:0">
+            <button type="button" class="disc-mode-btn disc-mode-whole active" data-gid="${gid}"
+              onclick="discSetMode('${gid}','whole')"
+              style="padding:5px 10px;font-size:11px;font-family:var(--body);border:none;cursor:pointer;background:var(--accent);color:#fff">Whole folder</button>
+            <button type="button" class="disc-mode-btn disc-mode-granular" data-gid="${gid}"
+              onclick="discSetMode('${gid}','granular')"
+              style="padding:5px 10px;font-size:11px;font-family:var(--body);border:none;cursor:pointer;background:transparent;color:var(--txt2)">Choose items</button>
+          </div>` : ''}
+        </div>
 
-        // Parent path badge + import hint
-        const parentBadge = parentPath
-          ? `<span style="font-family:var(--mono);font-size:10px;color:var(--txt3);margin-left:6px">${esc(parentPath)}</span>` : '';
-        const importHint = parentPath
-          ? `<div style="font-size:10px;color:var(--txt3);margin-top:2px">
-               Select all → imports <span style="font-family:var(--mono);color:var(--accent)">${esc(parentPath)}</span> as one app &nbsp;·&nbsp; select individually for separate backups
-             </div>` : '';
+        <div class="disc-whole-row" data-gid="${gid}" style="margin-top:8px">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input type="checkbox" class="disc-whole-chk" data-gid="${gid}"
+              ${app.label_hinted ? 'checked' : ''} onchange="updateDiscCaption()"
+              style="accent-color:var(--accent);width:15px;height:15px;flex-shrink:0">
+            <span style="font-size:12px;color:var(--txt2)">Import entire folder as one app</span>
+            ${wholeTotalStr ? `<span style="font-family:var(--mono);font-size:11px;color:var(--txt3);margin-left:auto">~${wholeTotalStr}</span>` : ''}
+          </label>
+        </div>
 
-        html += `<div style="border-bottom:1px solid var(--line);padding:8px 0 4px">
-          <div style="display:flex;align-items:flex-start;gap:10px;padding:4px 0 2px">
-            <input type="checkbox" id="${gid}_p" class="disc-parent"
-              data-gid="${gid}" data-parent-path="${esc(parentPath||'')}" data-parent-name="${esc(first.name)}"
-              ${anyHinted ? 'checked' : ''}
-              style="accent-color:var(--accent);width:15px;height:15px;margin-top:3px;flex-shrink:0">
-            <div style="min-width:0">
-              <div style="font-weight:600;display:flex;align-items:center;flex-wrap:wrap;gap:4px">
-                ${esc(first.name)}${parentBadge}${hint}${stopped}
-              </div>
-              <div style="margin-top:2px">${srcMeta}</div>
-              ${importHint}
-            </div>
-          </div>
-          <div style="padding-left:25px">
-            ${items.map(v => {
-              // Show just the subfolder name as the label, full path as secondary
-              const sub = parentPath ? v.path.slice(parentPath.length + 1) : v.path.split('/').pop();
-              return `<label style="display:flex;align-items:center;gap:8px;padding:5px 0;border-top:1px solid var(--line);cursor:pointer">
-                <input type="checkbox" class="disc-child" data-gid="${gid}"
-                  data-name="${esc(first.name + ' (' + sub + ')')}" data-path="${esc(v.path)}"
-                  ${v.label_hinted ? 'checked' : ''}
-                  style="accent-color:var(--accent);width:13px;height:13px;flex-shrink:0">
-                <div style="display:flex;align-items:baseline;gap:8px;min-width:0;overflow:hidden">
-                  <span style="font-size:12px;font-weight:500;color:var(--txt2);white-space:nowrap">— ${esc(sub)}</span>
-                  <span style="font-family:var(--mono);font-size:10px;color:var(--accent);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(v.path)}</span>
-                </div>
-              </label>`;
-            }).join('')}
-          </div>
-        </div>`;
-      }
+        ${hasSubdirs ? `<div class="disc-granular-box hidden" data-gid="${gid}" style="margin-top:8px;padding-left:23px">
+          ${app.root_files ? `<label style="display:flex;align-items:center;gap:8px;padding:5px 0;border-top:1px solid var(--line);cursor:pointer">
+            <input type="checkbox" class="disc-item-chk" data-gid="${gid}" data-kind="root"
+              data-name="${esc(app.name + ' (root)')}" data-path="${esc(app.path)}"
+              onchange="updateDiscCaption()"
+              style="accent-color:var(--accent);width:13px;height:13px;flex-shrink:0">
+            <span style="font-size:12px;font-weight:500;color:var(--txt2)">— Root files only</span>
+            <span style="font-family:var(--mono);font-size:10px;color:var(--txt3);margin-left:auto">${esc(app.root_size_bytes ? discFmtBytes(app.root_size_bytes) : '')}</span>
+          </label>` : ''}
+          ${app.sub_dirs.map(sd => `<label style="display:flex;align-items:center;gap:8px;padding:5px 0;border-top:1px solid var(--line);cursor:pointer">
+            <input type="checkbox" class="disc-item-chk" data-gid="${gid}" data-kind="subdir"
+              data-name="${esc(app.name + ' (' + sd.name + ')')}" data-path="${esc(sd.path)}"
+              onchange="updateDiscCaption()"
+              style="accent-color:var(--accent);width:13px;height:13px;flex-shrink:0">
+            <span style="font-size:12px;font-weight:500;color:var(--txt2)">— ${esc(sd.name)}</span>
+            <span style="font-family:var(--mono);font-size:10px;color:var(--txt3);margin-left:auto">${esc(sd.human || discFmtBytes(sd.size_bytes))}</span>
+          </label>`).join('')}
+        </div>` : ''}
+      </div>`;
     }
 
     list.innerHTML = html;
-
-    // Wire up parent ↔ child checkboxes for each group
-    const syncParent = (pChk, cChks) => {
-      const n = cChks.filter(c => c.checked).length;
-      pChk.indeterminate = n > 0 && n < cChks.length;
-      pChk.checked = n > 0;
-    };
-    for (const { gid, items } of pendingGroups) {
-      const pChk = document.getElementById(gid + '_p');
-      const cChks = [...document.querySelectorAll(`.disc-child[data-gid="${gid}"]`)];
-      pChk.addEventListener('change', () => {
-        cChks.forEach(c => c.checked = pChk.checked);
-        pChk.indeterminate = false;
-      });
-      cChks.forEach(c => c.addEventListener('change', () => syncParent(pChk, cChks)));
-      syncParent(pChk, cChks); // set initial indeterminate state
-    }
+    updateDiscCaption();
 
   } catch(e) { toast(e.message,'error'); list.innerHTML=''; }
 }
-async function importDisc() {
-  const toImport = [];
-  const handledGroups = new Set();
 
-  // Fully-checked parent → import whole parent dir as one app
-  for (const pChk of document.querySelectorAll('#disc-list .disc-parent')) {
-    if (pChk.checked && !pChk.indeterminate && pChk.dataset.parentPath) {
-      toImport.push({ name: pChk.dataset.parentName, path: pChk.dataset.parentPath });
-      handledGroups.add(pChk.dataset.gid);
+// discSetMode toggles a group between "whole folder" and "choose items" modes.
+function discSetMode(gid, mode) {
+  const g = discGroups.find(x => x.gid === gid);
+  if (g) g.mode = mode;
+
+  document.querySelectorAll(`.disc-mode-btn[data-gid="${gid}"]`).forEach(btn => {
+    const isActive = (mode === 'whole' && btn.classList.contains('disc-mode-whole')) ||
+                      (mode === 'granular' && btn.classList.contains('disc-mode-granular'));
+    btn.classList.toggle('active', isActive);
+    btn.style.background = isActive ? 'var(--accent)' : 'transparent';
+    btn.style.color = isActive ? '#fff' : 'var(--txt2)';
+  });
+
+  const wholeRow = document.querySelector(`.disc-whole-row[data-gid="${gid}"]`);
+  const granularBox = document.querySelector(`.disc-granular-box[data-gid="${gid}"]`);
+  if (wholeRow) wholeRow.classList.toggle('hidden', mode !== 'whole');
+  if (granularBox) granularBox.classList.toggle('hidden', mode !== 'granular');
+
+  updateDiscCaption();
+}
+
+// updateDiscCaption recomputes the live "N items selected · ~size" status line
+// from already-fetched discovery metadata (no network calls).
+function updateDiscCaption() {
+  const caption = document.getElementById('disc-caption');
+  if (!caption) return;
+
+  let appCount = 0, itemCount = 0, totalBytes = 0;
+
+  for (const g of discGroups) {
+    if (g.mode === 'whole') {
+      const chk = document.querySelector(`.disc-whole-chk[data-gid="${g.gid}"]`);
+      if (chk && chk.checked) {
+        appCount++; itemCount++;
+        totalBytes += (g.app.root_size_bytes || 0) + (g.app.sub_dirs||[]).reduce((s,sd)=>s+(sd.size_bytes||0), 0);
+      }
+    } else {
+      const chks = [...document.querySelectorAll(`.disc-item-chk[data-gid="${g.gid}"]:checked`)];
+      if (chks.length) {
+        appCount++;
+        itemCount += chks.length;
+        for (const c of chks) {
+          if (c.dataset.kind === 'root') totalBytes += (g.app.root_size_bytes || 0);
+          else {
+            const sd = (g.app.sub_dirs||[]).find(s => s.path === c.dataset.path);
+            if (sd) totalBytes += (sd.size_bytes || 0);
+          }
+        }
+      }
     }
   }
-  // Partial / individual children (groups not fully selected above)
-  for (const cChk of document.querySelectorAll('#disc-list .disc-child:checked')) {
-    if (!handledGroups.has(cChk.dataset.gid))
-      toImport.push({ name: cChk.dataset.name, path: cChk.dataset.path });
+
+  if (itemCount === 0) {
+    caption.textContent = 'Nothing selected yet';
+    caption.style.color = 'var(--txt3)';
+  } else {
+    caption.textContent = `${appCount} app(s), ${itemCount} item(s) selected · ~${discFmtBytes(totalBytes)} estimated`;
+    caption.style.color = 'var(--txt2)';
   }
-  // Flat single-mount items
-  for (const fChk of document.querySelectorAll('#disc-list .disc-flat:checked'))
-    toImport.push({ name: fChk.dataset.name, path: fChk.dataset.path });
+}
+
+async function importDisc() {
+  // Each entry: { name, volumes: [{path, label}] } — single-volume entries use
+  // the legacy `path` field for backward compat with the existing POST /api/apps handler.
+  const toImport = [];
+
+  for (const g of discGroups) {
+    if (g.mode === 'whole') {
+      const chk = document.querySelector(`.disc-whole-chk[data-gid="${g.gid}"]`);
+      if (chk && chk.checked) {
+        toImport.push({ name: g.app.name, path: g.app.path });
+      }
+    } else {
+      const chks = [...document.querySelectorAll(`.disc-item-chk[data-gid="${g.gid}"]:checked`)];
+      if (!chks.length) continue;
+      if (chks.length === 1) {
+        // Single item selected — keep it as a simple single-volume app.
+        toImport.push({ name: chks[0].dataset.name, path: chks[0].dataset.path });
+      } else {
+        // Multiple items selected — one app, multiple volumes.
+        toImport.push({
+          name: g.app.name,
+          volumes: chks.map(c => ({ path: c.dataset.path, label: c.dataset.kind === 'root' ? 'root' : c.dataset.path.split('/').pop() }))
+        });
+      }
+    }
+  }
 
   if (!toImport.length) { toast('Nothing selected', 'error'); return; }
   let n = 0, failed = 0;
-  for (const { name, path } of toImport) {
+  for (const entry of toImport) {
     try {
-      await api('/api/apps', { method:'POST', body: JSON.stringify({ name, path, retain: 5 }) });
+      const body = entry.volumes
+        ? { name: entry.name, retain: 5, volumes: entry.volumes.map(v => ({ path: v.path, label: v.label, enabled: true })) }
+        : { name: entry.name, path: entry.path, retain: 5 };
+      await api('/api/apps', { method:'POST', body: JSON.stringify(body) });
       n++;
-    } catch(e) { failed++; console.error('import failed', name, e); }
+    } catch(e) { failed++; console.error('import failed', entry.name, e); }
   }
   if (failed) toast(`${n} imported, ${failed} failed (path may not be accessible inside container)`, 'warn');
   else toast(n + ' app(s) imported', 'success');

@@ -3,10 +3,14 @@ package backup
 import (
 	"archive/tar"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -104,6 +108,114 @@ type VolumeTarget struct {
 
 // ── Backup ────────────────────────────────────────────────────────────────────
 
+// CheckAllDiskSpace measures every volume's source size and confirms the
+// backup destination has enough free space for ALL of them combined, before
+// any container is stopped. This is the pre-flight gate that runBackup calls
+// up-front — if it fails, the backup is aborted before any downtime occurs.
+//
+// This is intentionally separate from the per-volume checkDiskSpace done
+// later inside backupVolumes (which remains as a defense-in-depth check in
+// case free space changes between the pre-flight and the actual write).
+func (e *Engine) CheckAllDiskSpace(appID string, volumes []VolumeTarget, emit func(string)) error {
+	destDir := filepath.Join(e.backupDir, appID)
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return fmt.Errorf("cannot prepare backup directory: %w", err)
+	}
+
+	var totalSrcBytes int64
+	for _, vol := range volumes {
+		var srcBytes int64
+		_ = filepath.Walk(vol.Path, func(_ string, info os.FileInfo, err error) error {
+			if err == nil && info != nil && info.Mode().IsRegular() {
+				srcBytes += info.Size()
+			}
+			return nil
+		})
+		totalSrcBytes += srcBytes
+	}
+
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(destDir, &stat); err != nil {
+		emit(fmt.Sprintf("⚠  disk space check skipped (statfs %s: %v)", destDir, err))
+		return nil
+	}
+	freeBytes := stat.Bavail * uint64(stat.Bsize)
+
+	// Require 1.2× combined source size free (worst case: no compression).
+	required := uint64(float64(totalSrcBytes) * 1.2)
+	if required > freeBytes {
+		return fmt.Errorf(
+			"source totals %.1f GB across %d volume(s), need %.1f GB free, only %.1f GB available on backup volume",
+			float64(totalSrcBytes)/1e9, len(volumes),
+			float64(required)/1e9, float64(freeBytes)/1e9,
+		)
+	}
+
+	emit(fmt.Sprintf("✓ disk space OK (source %.1f GB total, free %.1f GB)",
+		float64(totalSrcBytes)/1e9, float64(freeBytes)/1e9))
+	return nil
+}
+
+// RunPreBackupCmd executes a shell command (e.g. `pg_dump ... > /data/dump.sql`)
+// before containers are stopped, streaming combined stdout/stderr to emit as
+// it runs. A 5-minute timeout prevents a hung hook from blocking the backup
+// indefinitely.
+func (e *Engine) RunPreBackupCmd(appID, cmdStr string, emit func(string)) error {
+	cmdStr = strings.TrimSpace(cmdStr)
+	if cmdStr == "" {
+		return nil
+	}
+
+	cmd := exec.Command("sh", "-c", cmdStr)
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("create output pipe: %w", err)
+	}
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	if err := cmd.Start(); err != nil {
+		pr.Close()
+		pw.Close()
+		return fmt.Errorf("start command: %w", err)
+	}
+	// Close our copy of the write end so the reader sees EOF once the child exits.
+	pw.Close()
+
+	done := make(chan struct{})
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, rerr := pr.Read(buf)
+			if n > 0 {
+				for _, line := range strings.Split(strings.TrimRight(string(buf[:n]), "\n"), "\n") {
+					if line != "" {
+						emit("  [pre-backup] " + line)
+					}
+				}
+			}
+			if rerr != nil {
+				break
+			}
+		}
+		close(done)
+	}()
+
+	timer := time.AfterFunc(5*time.Minute, func() {
+		emit("⚠  pre-backup command exceeded 5m timeout — killing")
+		_ = cmd.Process.Kill()
+	})
+	defer timer.Stop()
+
+	<-done
+	pr.Close()
+	if werr := cmd.Wait(); werr != nil {
+		return fmt.Errorf("command exited with error: %w", werr)
+	}
+	return nil
+}
+
 // BackupVolumes archives each supplied volume into the app's backup directory.
 // Returns one BackupMeta per volume (in the same order), plus the first error encountered.
 // On error the remaining volumes are still attempted; caller gets all results.
@@ -162,7 +274,10 @@ func (e *Engine) backupVolumes(appID, appName string, volumes []VolumeTarget, pr
 			e.emit(&meta, fmt.Sprintf("Starting %s: %s [%s]", label, vol.Slug, vol.Path))
 		}
 
-		// Pre-flight: ensure destination has enough free space before stopping containers.
+		// Secondary safety net: re-check this volume's space immediately before
+		// writing. The primary gate is Engine.CheckAllDiskSpace, called by the
+		// server BEFORE any container is stopped — this catches the rarer case
+		// where free space dropped between that check and now.
 		if err := checkDiskSpace(vol.Path, destDir, e, &meta); err != nil {
 			meta.Status = StatusFailed
 			meta.Error = err.Error()
@@ -185,12 +300,33 @@ func (e *Engine) backupVolumes(appID, appName string, volumes []VolumeTarget, pr
 			if firstErr == nil {
 				firstErr = err
 			}
-		} else {
-			meta.SizeBytes = size
-			meta.Status = StatusSuccess
-			e.emit(&meta, fmt.Sprintf("%s complete (%s, %.1f MB): %s",
-				label, vol.Slug, float64(size)/1e6, id))
+			results = append(results, meta)
+			continue
 		}
+
+		// ── Post-backup integrity verification ───────────────────────────────
+		// Open the freshly written archive and walk every header via the tar
+		// reader. This catches truncated writes, bad gzip footers, or corrupt
+		// archives BEFORE containers are restarted — so a failed verification
+		// still leaves us able to immediately retry against live (not yet
+		// restarted) containers if the caller chooses to.
+		e.emit(&meta, fmt.Sprintf("Verifying archive integrity: %s", id))
+		if verr := verifyArchive(destFile); verr != nil {
+			_ = os.Remove(destFile)
+			meta.Status = StatusFailed
+			meta.Error = fmt.Sprintf("archive verification failed: %v", verr)
+			e.emit(&meta, fmt.Sprintf("%s FAILED verification (%s): %v — archive discarded", label, vol.Slug, verr))
+			if firstErr == nil {
+				firstErr = fmt.Errorf("archive verification failed for %s: %w", vol.Slug, verr)
+			}
+			results = append(results, meta)
+			continue
+		}
+
+		meta.SizeBytes = size
+		meta.Status = StatusSuccess
+		e.emit(&meta, fmt.Sprintf("%s complete (%s, %.1f MB, verified ✓): %s",
+			label, vol.Slug, float64(size)/1e6, id))
 		results = append(results, meta)
 	}
 	return results, firstErr
@@ -404,6 +540,99 @@ func (e *Engine) PruneBackups(appID string, retain int) error {
 		}
 	}
 	return nil
+}
+
+// ── Manifest ──────────────────────────────────────────────────────────────────
+//
+// After every backup run, PrestoBack writes a {appID}_{timestamp}_manifest.json
+// alongside the archives. It lists every produced file with its size and a
+// SHA-256 hash, plus the overall run duration — a tamper-evident record of
+// exactly what was on disk after this run, independent of the archives
+// themselves. Useful for audit trails, scripted verification, or detecting
+// silent corruption of an archive after the fact (re-hash and compare).
+
+// ManifestEntry describes one archive produced by a backup run.
+type ManifestEntry struct {
+	VolumeSlug string `json:"volume_slug"`
+	FileName   string `json:"file_name"`
+	SizeBytes  int64  `json:"size_bytes"`
+	SHA256     string `json:"sha256"`
+	Status     Status `json:"status"`
+	Error      string `json:"error,omitempty"`
+}
+
+// Manifest is the full record for a single backup run (all volumes).
+type Manifest struct {
+	AppID      string          `json:"app_id"`
+	AppName    string          `json:"app_name"`
+	RunAt      time.Time       `json:"run_at"`
+	DurationMs int64           `json:"duration_ms"`
+	Entries    []ManifestEntry `json:"entries"`
+}
+
+// WriteManifest hashes every successfully produced archive from this run and
+// writes a manifest JSON file into the app's backup directory. Returns the
+// path to the written manifest.
+func (e *Engine) WriteManifest(appID, appName string, metas []BackupMeta, durationMs int64) (string, error) {
+	destDir := filepath.Join(e.backupDir, appID)
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return "", err
+	}
+
+	m := Manifest{
+		AppID:      appID,
+		AppName:    appName,
+		RunAt:      time.Now().UTC(),
+		DurationMs: durationMs,
+	}
+
+	for _, meta := range metas {
+		entry := ManifestEntry{
+			VolumeSlug: meta.VolumeSlug,
+			FileName:   filepath.Base(meta.FilePath),
+			SizeBytes:  meta.SizeBytes,
+			Status:     meta.Status,
+			Error:      meta.Error,
+		}
+		if meta.Status == StatusSuccess {
+			sum, err := sha256File(meta.FilePath)
+			if err != nil {
+				entry.Error = fmt.Sprintf("manifest hash failed: %v", err)
+			} else {
+				entry.SHA256 = sum
+			}
+		}
+		m.Entries = append(m.Entries, entry)
+	}
+
+	timestamp := m.RunAt.Format("20060102_150405")
+	manifestPath := filepath.Join(destDir, fmt.Sprintf("%s_%s_manifest.json", appID, timestamp))
+
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(manifestPath, data, 0644); err != nil {
+		return "", err
+	}
+	return manifestPath, nil
+}
+
+// sha256File computes the hex-encoded SHA-256 digest of a file's contents
+// by streaming it through the hasher — no full-file buffering, safe for
+// multi-GB archives.
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // OrphanedBackupDirs returns backup directories that have no registered app.
@@ -672,6 +901,52 @@ func tarGz(srcDir, destFile string, excludes []string) (int64, error) {
 		return 0, fmt.Errorf("archive is empty — check that %s contains files and is readable", srcDir)
 	}
 	return fi.Size(), nil
+}
+
+// verifyArchive performs a quick integrity pass over a freshly written
+// .tar.gz: open it, initialize a gzip reader, and walk every tar header via
+// tr.Next() until EOF. This is much cheaper than re-reading file contents,
+// but still catches the failure modes that actually matter for backups —
+// truncated writes (process killed mid-write, disk full), corrupt gzip
+// footers, and malformed tar structure — without re-hashing every byte.
+//
+// Modeled on the same philosophy as Duplicati's post-backup verification
+// pass: never trust a freshly written archive until you've proven you can
+// read it back.
+func verifyArchive(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open for verification: %w", err)
+	}
+	defer f.Close()
+
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("gzip header invalid: %w", err)
+	}
+	defer gr.Close()
+
+	tr := tar.NewReader(gr)
+	entryCount := 0
+	for {
+		_, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("truncated or corrupt archive after %d entries: %w", entryCount, err)
+		}
+		entryCount++
+	}
+	if entryCount == 0 {
+		return fmt.Errorf("archive contains zero entries")
+	}
+	// Confirm the gzip stream itself closes cleanly (catches a truncated
+	// trailer that tr.Next() alone might not surface on some payloads).
+	if _, err := io.Copy(io.Discard, gr); err != nil {
+		return fmt.Errorf("gzip stream did not close cleanly: %w", err)
+	}
+	return nil
 }
 
 func extractTarGz(archivePath, destPath string) error {

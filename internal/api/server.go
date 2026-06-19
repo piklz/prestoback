@@ -651,13 +651,7 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 	}
 	emit(fmt.Sprintf("Backing up %d volume(s): %s", len(vols), volumeNames(vols)))
 
-	containers := backup.FindContainers(app.ID)
-	if len(containers) == 0 {
-		emit("⚠  No running containers found — backing up live files")
-	}
-	toRestart, _ := backup.StopContainers(containers, emit)
-
-	// Build VolumeTarget list
+	// Build VolumeTarget list early — needed for pre-flight checks before stopping containers.
 	targets := make([]backup.VolumeTarget, len(vols))
 	for i, v := range vols {
 		targets[i] = backup.VolumeTarget{
@@ -666,6 +660,41 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 			Excludes: v.Excludes,
 		}
 	}
+
+	// ── Pre-flight: disk space check BEFORE stopping any containers ───────────
+	// Stopping containers then discovering we're out of space causes unnecessary
+	// downtime. We check all volumes up-front.
+	if spaceErr := s.engine.CheckAllDiskSpace(app.ID, targets, emit); spaceErr != nil {
+		emit("✗ Backup aborted (disk space): " + spaceErr.Error())
+		s.hist.Append(history.Entry{
+			Event:      history.EventBackupFail,
+			AppID:      app.ID,
+			AppName:    app.Name,
+			Detail:     "disk space check failed: " + spaceErr.Error(),
+			DurationMs: time.Since(start).Milliseconds(),
+		})
+		s.dispatchNotify(notify.Event{Kind: "backup_fail", AppName: app.Name,
+			Detail: "Insufficient disk space: " + spaceErr.Error(), IsError: true})
+		return
+	}
+
+	// ── Pre-backup hook ───────────────────────────────────────────────────────
+	// Run any pre-backup command (e.g. pg_dump, sqlite3 .backup) while containers
+	// are still running so databases are accessible.
+	if app.PreBackupCmd != "" {
+		emit(fmt.Sprintf("→ Running pre-backup hook: %s", app.PreBackupCmd))
+		if err := s.engine.RunPreBackupCmd(app.ID, app.PreBackupCmd, emit); err != nil {
+			emit(fmt.Sprintf("⚠  Pre-backup hook failed: %v — continuing anyway", err))
+		} else {
+			emit("✓ Pre-backup hook completed")
+		}
+	}
+
+	containers := backup.FindContainers(app.ID)
+	if len(containers) == 0 {
+		emit("⚠  No running containers found — backing up live files")
+	}
+	toRestart, _ := backup.StopContainers(containers, emit)
 
 	metas, err := s.engine.BackupVolumes(app.ID, app.Name, targets)
 	backup.StartContainers(toRestart, emit)
@@ -705,6 +734,16 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 		s.dispatchNotify(notify.Event{Kind: "backup_success", AppName: app.Name, Detail: detail})
 		_ = s.engine.PruneBackups(app.ID, app.Retain)
 	}
+
+	// ── Manifest ────────────────────────────────────────────────────────────
+	// Written regardless of partial/full success — records exactly what we
+	// have on disk for this run (files, sizes, hashes, duration).
+	if manifestPath, mErr := s.engine.WriteManifest(app.ID, app.Name, metas, dur); mErr != nil {
+		emit("⚠  Could not write backup manifest: " + mErr.Error())
+	} else {
+		emit("✓ Manifest written: " + filepath.Base(manifestPath))
+	}
+
 	emit("━━━ Backup complete ━━━")
 }
 

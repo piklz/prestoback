@@ -45,6 +45,12 @@ type AppConfig struct {
 	ContainerName string         `json:"container_name,omitempty"`
 	Volumes       []VolumeConfig `json:"volumes"`
 
+	// PreBackupCmd is an optional shell command run BEFORE container stop and
+	// archiving begins — e.g. `docker exec postgres pg_dump -U app app > /volumes/app/dump.sql`.
+	// Runs via `sh -c`, output streamed to SSE logs. Failures are logged but
+	// do not abort the backup (the command may be best-effort, e.g. a cache warm).
+	PreBackupCmd string `json:"pre_backup_cmd,omitempty"`
+
 	// Path is a computed convenience field (first enabled volume path).
 	// It is written to JSON so the existing frontend keeps working unchanged.
 	// On disk it is also used as the legacy single-path for old entries —
@@ -112,10 +118,10 @@ type User struct {
 
 // disk is the on-disk JSON shape.
 type disk struct {
-	APIKey  string         `json:"api_key"`
-	Apps    []AppConfig    `json:"apps"`
-	Notify  NotifyConfig   `json:"notify"`
-	Users   []User         `json:"users,omitempty"`
+	APIKey string       `json:"api_key"`
+	Apps   []AppConfig  `json:"apps"`
+	Notify NotifyConfig `json:"notify"`
+	Users  []User       `json:"users,omitempty"`
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -139,7 +145,7 @@ func Load(dataDir string) (*Config, error) {
 	c := &Config{
 		DataDir:       dataDir,
 		apps:          make(map[string]AppConfig),
-			users:         make(map[string]User),
+		users:         make(map[string]User),
 		revokedTokens: make(map[string]struct{}),
 	}
 	path := filepath.Join(dataDir, "config.json")

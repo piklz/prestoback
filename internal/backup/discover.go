@@ -6,6 +6,7 @@ package backup
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -13,21 +14,33 @@ import (
 	"strings"
 )
 
+// SubDirInfo describes one immediate subdirectory of a discovered path,
+// including a shallow size estimate (sum of direct file sizes, not recursive).
+type SubDirInfo struct {
+	Name      string `json:"name"`
+	Path      string `json:"path"`
+	SizeBytes int64  `json:"size_bytes"`
+	Human     string `json:"human"`
+}
+
 // DiscoveredApp is a candidate app found via Docker socket or volumes dir.
 type DiscoveredApp struct {
-	Name          string `json:"name"`
-	Path          string `json:"path"`           // path INSIDE prestoback container
-	ContainerName string `json:"container_name"`
-	Image         string `json:"image"`
-	Running       bool   `json:"running"`
-	LabelHinted   bool   `json:"label_hinted"`
-	Source        string `json:"source"` // "docker" | "volumes_dir"
-	Accessible    bool   `json:"accessible"` // can prestoback actually reach this path?
+	Name          string       `json:"name"`
+	Path          string       `json:"path"` // path INSIDE prestoback container
+	ContainerName string       `json:"container_name"`
+	Image         string       `json:"image"`
+	Running       bool         `json:"running"`
+	LabelHinted   bool         `json:"label_hinted"`
+	Source        string       `json:"source"`     // "docker" | "volumes_dir"
+	Accessible    bool         `json:"accessible"` // can prestoback actually reach this path?
+	SubDirs       []SubDirInfo `json:"sub_dirs,omitempty"`
+	RootFiles     bool         `json:"root_files"`      // true if path has files directly inside (not just subdirs)
+	RootSizeBytes int64        `json:"root_size_bytes"` // size of files directly in the root (not recursive)
 }
 
 type dockerContainer struct {
-	Name   string `json:"Name"`
-	State  struct {
+	Name  string `json:"Name"`
+	State struct {
 		Running bool `json:"Running"`
 	} `json:"State"`
 	Config struct {
@@ -48,8 +61,6 @@ type dockerContainer struct {
 // alreadyRegistered is a set of paths already in config (filtered out).
 func DiscoverApps(selfName, volumesDir string, alreadyRegistered map[string]bool) []DiscoveredApp {
 	// ── Step 1: learn prestoback's own host→container path mappings ──────────
-	// e.g. /home/pi/presto/volumes → /volumes
-	//      /data → /data
 	hostToContainer := inspectSelfMounts(selfName)
 	log.Printf("[discover] own mounts: %v", hostToContainer)
 
@@ -66,7 +77,70 @@ func DiscoverApps(selfName, volumesDir string, alreadyRegistered map[string]bool
 		results = append(results, dirResults...)
 	}
 
+	// ── Step 4: Enrich each result with shallow sub-directory info ────────────
+	for i := range results {
+		if results[i].Accessible && results[i].Path != "" {
+			enrichWithSubDirs(&results[i])
+		}
+	}
+
 	return results
+}
+
+// enrichWithSubDirs performs a single-level shallow scan of the discovered
+// path and populates SubDirs, RootFiles, and RootSizeBytes.
+func enrichWithSubDirs(app *DiscoveredApp) {
+	entries, err := os.ReadDir(app.Path)
+	if err != nil {
+		return
+	}
+
+	for _, e := range entries {
+		fullPath := filepath.Join(app.Path, e.Name())
+		if e.IsDir() {
+			size := shallowDirSize(fullPath)
+			app.SubDirs = append(app.SubDirs, SubDirInfo{
+				Name:      e.Name(),
+				Path:      fullPath,
+				SizeBytes: size,
+				Human:     humanBytes(size),
+			})
+		} else if e.Type().IsRegular() {
+			info, err := e.Info()
+			if err == nil {
+				app.RootSizeBytes += info.Size()
+				app.RootFiles = true
+			}
+		}
+	}
+}
+
+// shallowDirSize returns the recursive size of all regular files in dir.
+// We use filepath.Walk here (not just shallow) so the size shown is the real
+// total size of that subdirectory — makes the UI numbers meaningful.
+func shallowDirSize(dir string) int64 {
+	var total int64
+	_ = filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && info != nil && info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+// humanBytes formats a byte count as a compact human-readable string (e.g. "1.4 MB").
+func humanBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 // inspectSelfMounts returns a map of hostPath→containerPath for the prestoback
@@ -96,18 +170,13 @@ func inspectSelfMounts(selfName string) map[string]string {
 
 // translateHostPath converts a host path to a path accessible inside the
 // prestoback container using its known mount mappings.
-// Returns ("", false) if the path is not accessible.
 func translateHostPath(hostPath string, hostToContainer map[string]string) (string, bool) {
 	hostPath = filepath.Clean(hostPath)
 
-	// Direct match
 	if cp, ok := hostToContainer[hostPath]; ok {
 		return cp, true
 	}
 
-	// Check if hostPath is under any of our mounted host dirs
-	// e.g. hostPath=/home/pi/presto/volumes/plex, mount=/home/pi/presto/volumes→/volumes
-	// result = /volumes/plex
 	for hostMount, containerMount := range hostToContainer {
 		if strings.HasPrefix(hostPath, hostMount+"/") {
 			rel := strings.TrimPrefix(hostPath, hostMount)
@@ -151,7 +220,6 @@ func discoverFromDocker(selfName string, hostToContainer map[string]string, alre
 	for _, c := range containers {
 		name := strings.TrimPrefix(c.Name, "/")
 
-		// Skip prestoback itself and its helper
 		if name == selfName || name == "prestoback" || name == "prestoback-updater" {
 			continue
 		}
@@ -166,11 +234,9 @@ func discoverFromDocker(selfName string, hostToContainer map[string]string, alre
 			friendlyName = cleanContainerName(name)
 		}
 
-		// Explicit path label — translate from host path if needed
 		if explicitPath := labels["com.prestoback.path"]; explicitPath != "" {
 			containerPath, accessible := translateHostPath(explicitPath, hostToContainer)
 			if !accessible {
-				// Try using it directly (might already be a container-internal path)
 				containerPath = explicitPath
 				accessible = pathAccessible(explicitPath)
 			}
@@ -187,7 +253,6 @@ func discoverFromDocker(selfName string, hostToContainer map[string]string, alre
 			continue
 		}
 
-		// Scan bind mounts
 		for _, bind := range c.HostConfig.Binds {
 			hostPath, _, _ := parseBindMount(bind)
 			if hostPath == "" {
@@ -197,10 +262,8 @@ func discoverFromDocker(selfName string, hostToContainer map[string]string, alre
 				continue
 			}
 
-			// Translate host path → container-internal path
 			containerPath, accessible := translateHostPath(hostPath, hostToContainer)
 			if !accessible {
-				// Not mounted into prestoback — skip, can't back it up
 				log.Printf("[discover] skipping %s bind %s — not accessible inside prestoback", name, hostPath)
 				continue
 			}
@@ -226,7 +289,6 @@ func discoverFromDocker(selfName string, hostToContainer map[string]string, alre
 	return results
 }
 
-// skipDirNames are volume directory names that are never valid backup targets.
 var skipDirNames = map[string]bool{
 	"lost+found": true,
 }
@@ -252,9 +314,6 @@ func discoverFromDir(dir string, alreadyRegistered map[string]bool, seen map[str
 		if alreadyRegistered[path] || seen[path] {
 			continue
 		}
-		// Skip if Docker socket already found children inside this dir —
-		// e.g. Docker found /volumes/mosquitto/config and /volumes/mosquitto/data,
-		// so we don't also offer /volumes/mosquitto as a separate entry.
 		childFound := false
 		for seenPath := range seen {
 			if strings.HasPrefix(seenPath, path+"/") {
@@ -266,8 +325,6 @@ func discoverFromDir(dir string, alreadyRegistered map[string]bool, seen map[str
 			continue
 		}
 		seen[path] = true
-		// Running is always true for volumes_dir — we have no container state,
-		// so we never show the "stopped" badge for these entries.
 		results = append(results, DiscoveredApp{
 			Name:       e.Name(),
 			Path:       path,
@@ -293,7 +350,6 @@ func parseBindMount(bind string) (hostPath, containerPath, options string) {
 }
 
 func isSystemPath(path string) bool {
-	// Exact matches for things that should never be backed up
 	systemExact := []string{
 		"/", "/proc", "/sys", "/dev", "/run", "/tmp",
 		"/var/run/docker.sock", "/etc/localtime", "/etc/timezone",
@@ -303,7 +359,6 @@ func isSystemPath(path string) bool {
 			return true
 		}
 	}
-	// Prefix matches
 	systemPrefixes := []string{
 		"/proc/", "/sys/", "/dev/", "/run/",
 		"/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/",
@@ -324,7 +379,6 @@ func pathAccessible(path string) bool {
 func cleanContainerName(name string) string {
 	name = strings.ReplaceAll(name, "_", "-")
 	parts := strings.Split(name, "-")
-	// Drop trailing replica number
 	if len(parts) > 1 {
 		last := parts[len(parts)-1]
 		allDigits := true
@@ -338,7 +392,6 @@ func cleanContainerName(name string) string {
 			parts = parts[:len(parts)-1]
 		}
 	}
-	// Drop leading project name if 3+ parts
 	if len(parts) > 2 {
 		parts = parts[1:]
 	}
