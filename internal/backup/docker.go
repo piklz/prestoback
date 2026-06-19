@@ -107,6 +107,73 @@ func FindContainers(appID string) []ContainerInfo {
 	return results
 }
 
+// PauseContainers freezes all running containers via SIGSTOP (docker pause),
+// returning the set that was actually paused so the caller knows what to
+// resume afterward. Unlike StopContainers, nothing exits and nothing is
+// asked to flush — the container's filesystem state is simply frozen exactly
+// where it stood. This is crash-consistent (the same guarantee LVM/ZFS
+// snapshots give), not clean-shutdown-consistent — fine for apps with proper
+// WAL/journaling (SQLite, Postgres, MySQL), but skip it for anything that
+// writes raw/unjournaled state across multiple files.
+func PauseContainers(containers []ContainerInfo, emitFn func(string)) ([]ContainerInfo, error) {
+	var toUnpause []ContainerInfo
+	for _, c := range containers {
+		if c.Status != "running" {
+			log.Printf("[docker] container %s is already %s — skipping pause", c.Name, c.Status)
+			continue
+		}
+		emitFn(fmt.Sprintf("Pausing container %s…", c.Name))
+		out, err := exec.Command("docker", "pause", c.ID).CombinedOutput()
+		if err != nil {
+			return toUnpause, fmt.Errorf("docker pause %s: %w\n%s", c.Name, err, out)
+		}
+		log.Printf("[docker] paused %s", c.Name)
+		toUnpause = append(toUnpause, c)
+	}
+	return toUnpause, nil
+}
+
+// UnpauseContainers resumes containers previously frozen by PauseContainers.
+// Resuming is near-instant (no health-check wait needed — the process never
+// stopped running, it just picks back up where it left off).
+func UnpauseContainers(containers []ContainerInfo, emitFn func(string)) {
+	for _, c := range containers {
+		emitFn(fmt.Sprintf("Resuming container %s…", c.Name))
+		out, err := exec.Command("docker", "unpause", c.ID).CombinedOutput()
+		if err != nil {
+			emitFn(fmt.Sprintf("ERROR: could not unpause %s — %s", c.Name, strings.TrimSpace(string(out))))
+			log.Printf("[docker] unpause error for %s: %v", c.Name, err)
+			continue
+		}
+		emitFn(fmt.Sprintf("Container %s resumed ✓", c.Name))
+	}
+}
+
+// QuiesceContainers stops, pauses, or leaves containers alone depending on
+// strategy, returning whatever must be passed to ResumeContainers afterward.
+// Empty/unrecognized strategy defaults to "stop" (the safest option) so
+// existing configs with no container_strategy set behave exactly as before.
+func QuiesceContainers(containers []ContainerInfo, strategy string, emitFn func(string)) ([]ContainerInfo, error) {
+	switch strategy {
+	case "none":
+		return nil, nil
+	case "pause":
+		return PauseContainers(containers, emitFn)
+	default:
+		return StopContainers(containers, emitFn)
+	}
+}
+
+// ResumeContainers is the inverse of QuiesceContainers — call with the same
+// strategy and the containers it returned.
+func ResumeContainers(containers []ContainerInfo, strategy string, emitFn func(string)) {
+	if strategy == "pause" {
+		UnpauseContainers(containers, emitFn)
+		return
+	}
+	StartContainers(containers, emitFn)
+}
+
 // StopContainers stops all given containers, returning a map of id→wasRunning
 // so the caller knows which ones to restart.
 func StopContainers(containers []ContainerInfo, emitFn func(string)) ([]ContainerInfo, error) {

@@ -51,6 +51,19 @@ type AppConfig struct {
 	// do not abort the backup (the command may be best-effort, e.g. a cache warm).
 	PreBackupCmd string `json:"pre_backup_cmd,omitempty"`
 
+	// ContainerStrategy controls how running containers are quiesced during
+	// backup/restore:
+	//   "stop"  (default, safest) — graceful SIGTERM, archive, then restart.
+	//   "pause" — freeze via SIGSTOP instead of stopping. Much faster (no
+	//             restart/health-check wait), and crash-consistent — the same
+	//             guarantee LVM/ZFS snapshots give, which SQLite/Postgres/MySQL
+	//             WAL journaling is designed to recover from cleanly. Only a
+	//             real downgrade for apps that don't journal their writes.
+	//   "none"  — don't touch the container at all (stateless apps, or apps
+	//             whose PreBackupCmd already produces a consistent dump).
+	// Empty string is treated as "stop" for backward compatibility.
+	ContainerStrategy string `json:"container_strategy,omitempty"`
+
 	// Path is a computed convenience field (first enabled volume path).
 	// It is written to JSON so the existing frontend keeps working unchanged.
 	// On disk it is also used as the legacy single-path for old entries —

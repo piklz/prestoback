@@ -694,10 +694,10 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 	if len(containers) == 0 {
 		emit("⚠  No running containers found — backing up live files")
 	}
-	toRestart, _ := backup.StopContainers(containers, emit)
+	toResume, _ := backup.QuiesceContainers(containers, app.ContainerStrategy, emit)
 
 	metas, err := s.engine.BackupVolumes(app.ID, app.Name, targets)
-	backup.StartContainers(toRestart, emit)
+	backup.ResumeContainers(toResume, app.ContainerStrategy, emit)
 
 	dur := time.Since(start).Milliseconds()
 
@@ -814,9 +814,9 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, ba
 		if len(containers) == 0 {
 			emit("⚠  No running containers found")
 		}
-		toRestart, _ := backup.StopContainers(containers, emit)
+		toResume, _ := backup.QuiesceContainers(containers, app.ContainerStrategy, emit)
 		err := s.engine.RestoreVolume(app.ID, app.Name, volumeSlug, archivePath, destPath)
-		backup.StartContainers(toRestart, emit)
+		backup.ResumeContainers(toResume, app.ContainerStrategy, emit)
 
 		dur := time.Since(start).Milliseconds()
 		if err != nil {

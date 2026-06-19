@@ -579,6 +579,15 @@ select.fi{cursor:pointer}
         <div class="fg"><label class="fl">Keep last N backups</label><input class="fi" id="a-retain" type="number" value="5" min="1" max="99"></div>
         <div class="fg"><label class="fl">ID (auto)</label><input class="fi" id="a-id" placeholder="auto-generated"></div>
       </div>
+      <div class="fg">
+        <label class="fl">Container handling during backup</label>
+        <select class="fi" id="a-strategy">
+          <option value="stop" selected>Stop &amp; restart (safest)</option>
+          <option value="pause">Pause &amp; resume (faster, crash-consistent)</option>
+          <option value="none">Don't touch container</option>
+        </select>
+        <div class="fh">Pause freezes the container instead of restarting it — much faster, fine for apps with a journaling DB (SQLite/Postgres/MySQL).</div>
+      </div>
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
         <div class="divlbl">Scheduled backup (optional)</div>
         <div class="ftog" onclick="togAddSched()"><div class="ftog-sw" id="add-sched-tog"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable scheduled backup</div></div>
@@ -621,6 +630,15 @@ select.fi{cursor:pointer}
       <div class="fr">
         <div class="fg"><label class="fl">Keep last N backups</label><input class="fi" id="ea-retain" type="number" min="1" max="99"></div>
         <div class="fg"><label class="fl">App ID (read-only)</label><input class="fi" id="ea-id" disabled style="opacity:.5"></div>
+      </div>
+      <div class="fg">
+        <label class="fl">Container handling during backup</label>
+        <select class="fi" id="ea-strategy">
+          <option value="stop">Stop &amp; restart (safest)</option>
+          <option value="pause">Pause &amp; resume (faster, crash-consistent)</option>
+          <option value="none">Don't touch container</option>
+        </select>
+        <div class="fh">Pause freezes the container instead of restarting it — much faster, fine for apps with a journaling DB (SQLite/Postgres/MySQL).</div>
       </div>
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
         <div class="divlbl">Exclude patterns <span style="color:var(--txt3);font-weight:400;font-size:11px">(one per line — dirs: Cache/, globs: *.log)</span></div>
@@ -1121,6 +1139,7 @@ async function delApp(id) {
 function openAddApp() {
   ['a-name','a-path','a-id','a-cron'].forEach(x=>document.getElementById(x).value='');
   document.getElementById('a-retain').value=5;
+  document.getElementById('a-strategy').value='stop';
   S.addSchedOn=false; setTog('add-sched-tog',false);
   document.getElementById('add-sched-fields').style.display='none';
   document.getElementById('path-status').textContent='';
@@ -1133,7 +1152,7 @@ function togAddSched() {
 async function submitAddApp() {
   const name=gv('a-name'), path=gv('a-path'), retain=parseInt(gv('a-retain'))||5, id=gv('a-id')||undefined;
   if (!name||!path) { toast('Name and path required','error'); return; }
-  const app = {name,path,retain,id,
+  const app = {name,path,retain,id,container_strategy:gv('a-strategy'),
     schedule:{enabled:S.addSchedOn, cron_expr: S.addSchedOn?gv('a-cron'):''}};
   try { await api('/api/apps',{method:'POST',body:JSON.stringify(app)}); toast('App added','success'); CM('m-add-app'); loadApps(); }
   catch(e) { toast(e.message,'error'); }
@@ -1148,6 +1167,7 @@ function openEditApp(id) {
   document.getElementById('ea-path').value=a.path;
   document.getElementById('ea-retain').value=a.retain||5;
   document.getElementById('ea-id').value=a.id;
+  document.getElementById('ea-strategy').value=a.container_strategy||'stop';
   document.getElementById('ea-cron').value=a.schedule?.cron_expr||'';
   S.editSchedOn=a.schedule?.enabled||false; setTog('edit-sched-tog',S.editSchedOn);
   document.getElementById('edit-sched-fields').style.display=S.editSchedOn?'':'none';
@@ -1177,6 +1197,7 @@ async function submitEditApp() {
     name:gv('ea-name'), path:gv('ea-path'),
     retain:parseInt(gv('ea-retain'))||5,
     pinned:S.editPinOn,
+    container_strategy:gv('ea-strategy'),
     schedule:{enabled:S.editSchedOn, cron_expr:gv('ea-cron')},
     excludes: excludesRaw,
   };
