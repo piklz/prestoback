@@ -120,7 +120,7 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .hic{width:30px;height:30px;border-radius:6px;background:var(--bg4);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:14px}
 /* modal */
 .overlay{position:fixed;inset:0;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(5px)}
-.overlay.hidden{display:none}
+.hidden{display:none}
 .modal{background:var(--bg2);border:1px solid var(--line2);border-radius:14px;width:520px;max-width:95vw;max-height:90vh;overflow-y:auto}
 .mh{padding:18px 22px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between}
 .mt{font-family:var(--head);font-size:15px;font-weight:700}
@@ -1257,7 +1257,7 @@ async function _doPreviewCron(inputId, previewId) {
 // root_size_bytes (already computed server-side) into a running total —
 // no extra /api/dir-size round-trips needed for the common case.
 
-let discGroups = []; // [{ gid, app, mode: 'whole'|'granular' }]
+let discGroups = []; // [{ gid, app }] — mode is read from the DOM (see discIsGranular), not tracked separately
 
 function discFmtBytes(n) {
   if (!n || n <= 0) return '0 B';
@@ -1300,7 +1300,7 @@ async function openDiscover() {
       if (hasSubdirs) for (const sd of app.sub_dirs) wholeTotal += (sd.size_bytes || 0);
       const wholeTotalStr = wholeTotal > 0 ? discFmtBytes(wholeTotal) : '';
 
-      discGroups.push({ gid, app, mode: 'whole' });
+      discGroups.push({ gid, app });
 
       html += `<div class="disc-group" data-gid="${gid}" style="border-bottom:1px solid var(--line);padding:10px 0">
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px">
@@ -1358,11 +1358,15 @@ async function openDiscover() {
   } catch(e) { toast(e.message,'error'); list.innerHTML=''; }
 }
 
+// discIsGranular reads the DOM directly to find out which mode a group is in —
+// there's no separate JS-side mode flag to keep in sync with the visible UI.
+function discIsGranular(gid) {
+  const box = document.querySelector(`.disc-granular-box[data-gid="${gid}"]`);
+  return !!box && !box.classList.contains('hidden');
+}
+
 // discSetMode toggles a group between "whole folder" and "choose items" modes.
 function discSetMode(gid, mode) {
-  const g = discGroups.find(x => x.gid === gid);
-  if (g) g.mode = mode;
-
   document.querySelectorAll(`.disc-mode-btn[data-gid="${gid}"]`).forEach(btn => {
     const isActive = (mode === 'whole' && btn.classList.contains('disc-mode-whole')) ||
                       (mode === 'granular' && btn.classList.contains('disc-mode-granular'));
@@ -1388,13 +1392,7 @@ function updateDiscCaption() {
   let appCount = 0, itemCount = 0, totalBytes = 0;
 
   for (const g of discGroups) {
-    if (g.mode === 'whole') {
-      const chk = document.querySelector(`.disc-whole-chk[data-gid="${g.gid}"]`);
-      if (chk && chk.checked) {
-        appCount++; itemCount++;
-        totalBytes += (g.app.root_size_bytes || 0) + (g.app.sub_dirs||[]).reduce((s,sd)=>s+(sd.size_bytes||0), 0);
-      }
-    } else {
+    if (discIsGranular(g.gid)) {
       const chks = [...document.querySelectorAll(`.disc-item-chk[data-gid="${g.gid}"]:checked`)];
       if (chks.length) {
         appCount++;
@@ -1406,6 +1404,12 @@ function updateDiscCaption() {
             if (sd) totalBytes += (sd.size_bytes || 0);
           }
         }
+      }
+    } else {
+      const chk = document.querySelector(`.disc-whole-chk[data-gid="${g.gid}"]`);
+      if (chk && chk.checked) {
+        appCount++; itemCount++;
+        totalBytes += (g.app.root_size_bytes || 0) + (g.app.sub_dirs||[]).reduce((s,sd)=>s+(sd.size_bytes||0), 0);
       }
     }
   }
@@ -1425,12 +1429,7 @@ async function importDisc() {
   const toImport = [];
 
   for (const g of discGroups) {
-    if (g.mode === 'whole') {
-      const chk = document.querySelector(`.disc-whole-chk[data-gid="${g.gid}"]`);
-      if (chk && chk.checked) {
-        toImport.push({ name: g.app.name, path: g.app.path });
-      }
-    } else {
+    if (discIsGranular(g.gid)) {
       const chks = [...document.querySelectorAll(`.disc-item-chk[data-gid="${g.gid}"]:checked`)];
       if (!chks.length) continue;
       if (chks.length === 1) {
@@ -1442,6 +1441,11 @@ async function importDisc() {
           name: g.app.name,
           volumes: chks.map(c => ({ path: c.dataset.path, label: c.dataset.kind === 'root' ? 'root' : c.dataset.path.split('/').pop() }))
         });
+      }
+    } else {
+      const chk = document.querySelector(`.disc-whole-chk[data-gid="${g.gid}"]`);
+      if (chk && chk.checked) {
+        toImport.push({ name: g.app.name, path: g.app.path });
       }
     }
   }
