@@ -51,7 +51,9 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .cb{padding:20px}
 /* stats */
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:22px}
-.stat{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);padding:14px 18px}
+.stat{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);padding:14px 18px;cursor:pointer;transition:border-color .15s,transform .1s}
+.stat:hover{border-color:var(--accent)}
+.stat:active{transform:scale(.98)}
 .sl{font-family:var(--mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--txt3);margin-bottom:6px}
 .sv{font-family:var(--head);font-size:24px;font-weight:700}
 .sv.a{color:var(--accent)}.sv.g{color:var(--green)}.sv.am{color:var(--amber)}
@@ -223,7 +225,7 @@ select.fi{cursor:pointer}
 .ssh-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
 
 /* ══════════════════════ MOBILE ══════════════════════ */
-.mobile-menu-btn{display:none;position:fixed;top:12px;left:12px;z-index:60;width:38px;height:38px;border-radius:8px;background:var(--bg3);border:1px solid var(--line2);color:var(--txt);align-items:center;justify-content:center;font-size:17px;cursor:pointer}
+.mobile-menu-btn{display:none;position:fixed;top:12px;left:12px;z-index:50;width:38px;height:38px;border-radius:8px;background:var(--bg3);border:1px solid var(--line2);color:var(--txt);align-items:center;justify-content:center;font-size:17px;cursor:pointer}
 .sidebar-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:55}
 .sidebar-backdrop.show{display:block}
 
@@ -381,17 +383,17 @@ select.fi{cursor:pointer}
   </div>
   <div class="sec">
     <div class="stats">
-      <div class="stat"><div class="sl">Applications</div><div class="sv a" id="s-apps">0</div></div>
-      <div class="stat"><div class="sl">Total Backups</div><div class="sv g" id="s-total">—</div></div>
-      <div class="stat"><div class="sl">Scheduled Jobs</div><div class="sv am" id="s-sched">0</div></div>
-      <div class="stat" id="s-disk-stat" style="display:none">
+      <div class="stat" onclick="V('apps')" title="Go to Applications"><div class="sl">Applications</div><div class="sv a" id="s-apps">0</div></div>
+      <div class="stat" onclick="V('bk')" title="Go to Backups"><div class="sl">Total Backups</div><div class="sv g" id="s-total">—</div></div>
+      <div class="stat" onclick="V('apps')" title="Go to Applications"><div class="sl">Scheduled Jobs</div><div class="sv am" id="s-sched">0</div></div>
+      <div class="stat" id="s-disk-stat" onclick="V('bk')" title="Go to Backups" style="display:none">
         <div class="sl">Backup disk free</div>
         <div class="sv" id="s-disk" style="font-size:16px">—</div>
         <div style="height:4px;background:var(--bg3);border-radius:2px;margin-top:6px;overflow:hidden">
           <div id="s-disk-bar" style="height:100%;background:var(--green);border-radius:2px;transition:width .5s"></div>
         </div>
       </div>
-      <div class="stat" id="s-next-stat" style="display:none">
+      <div class="stat" id="s-next-stat" onclick="V('apps')" title="Go to Applications" style="display:none">
         <div class="sl" style="display:flex;align-items:center;justify-content:space-between">
           <span>Upcoming backups</span>
           <span id="s-next-dots" style="display:flex;gap:4px;align-items:center"></span>
