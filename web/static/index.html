@@ -222,6 +222,65 @@ select.fi{cursor:pointer}
 .ssh-tab:hover{color:var(--txt2)}
 .ssh-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
 
+/* ══════════════════════ MOBILE ══════════════════════ */
+.mobile-menu-btn{display:none;position:fixed;top:12px;left:12px;z-index:60;width:38px;height:38px;border-radius:8px;background:var(--bg3);border:1px solid var(--line2);color:var(--txt);align-items:center;justify-content:center;font-size:17px;cursor:pointer}
+.sidebar-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:55}
+.sidebar-backdrop.show{display:block}
+
+@media (max-width:860px){
+  /* Defensive backstop: clip anything that still overflows rather than
+     letting it widen the whole page (the classic "zoomed out" mobile bug). */
+  html,body{overflow-x:hidden}
+
+  /* Sidebar becomes an off-canvas drawer */
+  .mobile-menu-btn{display:flex}
+  .shell{position:relative}
+  .sidebar{position:fixed;top:0;left:0;bottom:0;z-index:56;width:248px;max-width:80vw;
+    transform:translateX(-100%);transition:transform .22s ease;box-shadow:0 0 40px rgba(0,0,0,.4)}
+  .sidebar.open{transform:translateX(0)}
+  .main{width:100%}
+
+  /* Page header / section padding — leave room for the hamburger button */
+  .ph{padding:64px 16px 0;flex-wrap:wrap;gap:10px}
+  .ph .ha{flex-wrap:wrap}
+  .sec{padding:16px}
+
+  /* Two-column form rows collapse to one */
+  .fr{grid-template-columns:1fr}
+
+  /* Modal: tighter padding, near-full-width */
+  .modal{width:100%;border-radius:12px}
+  .mh{padding:14px 16px 12px}
+  .mb{padding:16px}
+  .mf{padding:12px 16px 16px;flex-wrap:wrap}
+
+  /* Apps table → stacked cards (no horizontal scrolling/squished columns) */
+  .tbl thead{display:none}
+  .tbl, .tbl tbody{display:block;width:100%}
+  .tbl tr{display:block;border:1px solid var(--line);border-radius:var(--r);padding:4px 14px;margin-bottom:10px;background:var(--bg2)}
+  .tbl tr:hover td{background:transparent}
+  .tbl td{display:block;padding:8px 0;border-bottom:1px solid var(--line)}
+  .tbl tr td:last-child{border-bottom:none}
+  .tbl td[data-label]::before{content:attr(data-label);display:block;font-family:var(--mono);font-size:9px;letter-spacing:1px;text-transform:uppercase;color:var(--txt3);margin-bottom:4px}
+  .tbl td[data-label="Actions"] .ra{justify-content:flex-start;flex-wrap:wrap}
+
+  /* Flex rows that could otherwise force horizontal scroll */
+  .chips-legend,.wiz-bar{flex-wrap:wrap;row-gap:8px}
+  .apps-toolbar{flex-wrap:wrap}
+  .apps-search{max-width:none}
+
+  /* Discover Apps modal: stack the name/path block above the mode toggle */
+  #m-discover .modal{max-width:100%}
+  .disc-group-head{flex-wrap:wrap}
+
+  /* Toasts: avoid overflow on very narrow phones (e.g. 320px wide) */
+  #toasts{left:12px;right:12px;bottom:12px}
+  .toast{max-width:none}
+
+  /* Login screen */
+  .auth-card{padding:28px 22px}
+}
+
 </style>
 </head>
 <body>
@@ -269,6 +328,8 @@ select.fi{cursor:pointer}
 </div>
 <!-- APP SHELL -->
 <div class="shell">
+<button class="mobile-menu-btn" onclick="toggleSidebar()" aria-label="Menu">☰</button>
+<div class="sidebar-backdrop" id="sidebar-backdrop" onclick="closeSidebar()"></div>
 <!-- SIDEBAR -->
 <aside class="sidebar">
   <div class="logo">
@@ -521,12 +582,12 @@ select.fi{cursor:pointer}
           <tbody>
             <tr style="border-top:1px solid var(--line)">
               <td style="padding:10px 0;color:var(--txt3)">local</td>
-              <td style="padding:10px 8px 10px 0"><span id="upd-local-full" style="color:var(--txt2)">—</span></td>
+              <td style="padding:10px 8px 10px 0;word-break:break-all"><span id="upd-local-full" style="color:var(--txt2)">—</span></td>
               <td style="padding:10px 0;color:var(--txt3)" id="upd-local-time">—</td>
             </tr>
             <tr style="border-top:1px solid var(--line)">
               <td style="padding:10px 0;color:var(--txt3)">remote</td>
-              <td style="padding:10px 8px 10px 0"><span id="upd-remote-full" style="color:var(--txt2)">—</span></td>
+              <td style="padding:10px 8px 10px 0;word-break:break-all"><span id="upd-remote-full" style="color:var(--txt2)">—</span></td>
               <td style="padding:10px 0;color:var(--txt3)" id="upd-remote-time">—</td>
             </tr>
           </tbody>
@@ -1056,6 +1117,17 @@ function V(name) {
   if (name==='bk') { renderChips(); refreshBkView(); }
   if (name==='hist') loadHistory();
   if (name==='sec') loadStatus();
+  closeSidebar();
+}
+
+// Mobile off-canvas sidebar
+function toggleSidebar() {
+  document.querySelector('.sidebar').classList.toggle('open');
+  document.getElementById('sidebar-backdrop').classList.toggle('show');
+}
+function closeSidebar() {
+  document.querySelector('.sidebar').classList.remove('open');
+  document.getElementById('sidebar-backdrop').classList.remove('show');
 }
 
 // ════════════════════ API helper ════════════════════
@@ -1121,11 +1193,11 @@ function renderApps() {
       : `<span class="pill" style="background:var(--bg4);color:var(--txt3)">manual</span>`;
     const pinPill = a.pinned ? `<span class="pill pa" style="margin-left:4px">📌 pinned</span>` : '';
     return `<tr class="${rowCls}">
-      <td><div class="an">${esc(a.name)}${cntHtml}</div></td>
-      <td><div style="display:flex;align-items:center;gap:4px"><span class="path-status-dot ${dotCls}" title="${dotTitle}"></span><span class="ap" style="margin-top:0">${esc(a.path)}</span></div></td>
-      <td><span class="pill pb">${a.retain||5}</span></td>
-      <td>${schedPill}${pinPill}</td>
-      <td><div class="ra">
+      <td data-label="Application"><div class="an">${esc(a.name)}${cntHtml}</div></td>
+      <td data-label="Path"><div style="display:flex;align-items:center;gap:4px"><span class="path-status-dot ${dotCls}" title="${dotTitle}"></span><span class="ap" style="margin-top:0">${esc(a.path)}</span></div></td>
+      <td data-label="Retain"><span class="pill pb">${a.retain||5}</span></td>
+      <td data-label="Schedule">${schedPill}${pinPill}</td>
+      <td data-label="Actions"><div class="ra">
         <button class="btn btn-g btn-sm" onclick="openBkModal('${a.id}','${esc(a.name)}')"${pathSt==='missing'?' title="Config path missing — backup may fail"':''}>▶ Backup</button>
         <button class="btn btn-g btn-sm btn-ic" title="Edit" onclick="openEditApp('${a.id}')">✎</button>
         <button class="btn btn-d btn-sm btn-ic" title="Delete" onclick="delApp('${a.id}')">🗑</button>
@@ -1359,7 +1431,7 @@ async function openDiscover() {
       discGroups.push({ gid, app });
 
       html += `<div class="disc-group" data-gid="${gid}" style="border-bottom:1px solid var(--line);padding:10px 0">
-        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px">
+        <div class="disc-group-head" style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px">
           <div style="min-width:0">
             <div style="font-weight:600;display:flex;align-items:center;flex-wrap:wrap;gap:4px">
               ${esc(app.name)}${hint}${stopped}
