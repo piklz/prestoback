@@ -689,7 +689,9 @@ select.fi{cursor:pointer}
     <div class="mh"><div class="mt">Edit Application</div><button class="btn btn-g btn-ic" onclick="CM('m-edit-app')">✕</button></div>
     <div class="mb">
       <div class="fg"><label class="fl">App name</label><input class="fi" id="ea-name"></div>
-      <div class="fg"><label class="fl">Config directory path</label><input class="fi" id="ea-path"></div>
+      <div class="fg"><label class="fl">Config directory path</label><input class="fi" id="ea-path">
+        <div class="fh" id="ea-path-hint" style="color:var(--amber)"></div>
+      </div>
       <div class="fr">
         <div class="fg"><label class="fl">Keep last N backups</label><input class="fi" id="ea-retain" type="number" min="1" max="99"></div>
         <div class="fg"><label class="fl">App ID (read-only)</label><input class="fi" id="ea-id" disabled style="opacity:.5"></div>
@@ -1243,7 +1245,14 @@ function openEditApp(id) {
   if (!a) return;
   S.editApp=a;
   document.getElementById('ea-name').value=a.name;
-  document.getElementById('ea-path').value=a.path;
+  const isMultiVol = (a.volumes||[]).length > 1;
+  const pathEl = document.getElementById('ea-path');
+  pathEl.value = a.path;
+  pathEl.disabled = isMultiVol;
+  pathEl.style.opacity = isMultiVol ? '.5' : '';
+  document.getElementById('ea-path-hint').textContent = isMultiVol
+    ? `This app has ${a.volumes.length} volumes (${a.volumes.map(v=>v.slug).join(', ')}) — editing a single path here isn't supported yet.`
+    : '';
   document.getElementById('ea-retain').value=a.retain||5;
   document.getElementById('ea-id').value=a.id;
   document.getElementById('ea-strategy').value=a.container_strategy||'stop';
@@ -1582,7 +1591,7 @@ async function importDisc() {
   }
 
   if (!toImport.length) { toast('Nothing selected', 'error'); return; }
-  let n = 0, failed = 0;
+  let n = 0, failed = 0, errs = [];
   for (const entry of toImport) {
     try {
       const body = entry.volumes
@@ -1590,9 +1599,9 @@ async function importDisc() {
         : { name: entry.name, path: entry.path, retain: 5 };
       await api('/api/apps', { method:'POST', body: JSON.stringify(body) });
       n++;
-    } catch(e) { failed++; console.error('import failed', entry.name, e); }
+    } catch(e) { failed++; errs.push(`${entry.name}: ${e.message}`); console.error('import failed', entry.name, e); }
   }
-  if (failed) toast(`${n} imported, ${failed} failed (path may not be accessible inside container)`, 'warn');
+  if (failed) toast(`${n} imported, ${failed} failed — ${errs.join('; ')}`, 'warn');
   else toast(n + ' app(s) imported', 'success');
   CM('m-discover'); loadApps();
 }

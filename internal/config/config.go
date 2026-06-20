@@ -301,6 +301,28 @@ func (c *Config) GetApp(id string) (AppConfig, bool) {
 	return a, ok
 }
 
+// PathInUse reports whether path is already registered as a volume on a
+// different app, returning that app's ID and Name for a clear error message.
+// Used to stop the same directory silently ending up backed up under two
+// independent app entries (e.g. a Discover Apps "Choose items" import that
+// happens to pick a path already covered by an existing app).
+func (c *Config) PathInUse(path string, excludeID string) (id, name string, found bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	clean := filepath.Clean(path)
+	for aid, a := range c.apps {
+		if aid == excludeID {
+			continue
+		}
+		for _, v := range a.Volumes {
+			if filepath.Clean(v.Path) == clean {
+				return aid, a.Name, true
+			}
+		}
+	}
+	return "", "", false
+}
+
 func (c *Config) AddApp(a AppConfig) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -332,6 +354,19 @@ func (c *Config) UpdateApp(a AppConfig) error {
 	defer c.mu.Unlock()
 	if _, exists := c.apps[a.ID]; !exists {
 		return fmt.Errorf("app '%s' not found", a.ID)
+	}
+	// The Edit App UI exposes a single "Config directory path" field, which
+	// maps to the top-level Path — but Path is normally just a *computed*
+	// display value derived from Volumes[0].Path (see PrimaryPath below).
+	// Without this, an edited Path is silently discarded a few lines down
+	// when it gets overwritten by PrimaryPath(). For the common single-volume
+	// case, treat an edited Path as an edit to that volume's own path, and
+	// re-derive its slug/label from the new location (matching what you'd
+	// get by deleting and re-adding the app at the new path).
+	if a.Path != "" && len(a.Volumes) == 1 && filepath.Clean(a.Path) != filepath.Clean(a.Volumes[0].Path) {
+		a.Volumes[0].Path = a.Path
+		a.Volumes[0].Slug = slugFromPath(a.Path)
+		a.Volumes[0].Label = a.Volumes[0].Slug
 	}
 	// Normalise volumes
 	for i := range a.Volumes {

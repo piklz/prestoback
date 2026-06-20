@@ -442,6 +442,12 @@ func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 		if a.ID == "" {
 			a.ID = sanitizeID(a.Name)
 		}
+		for _, v := range a.Volumes {
+			if dupID, dupName, found := s.cfg.PathInUse(v.Path, a.ID); found {
+				errOut(w, 409, fmt.Sprintf("path %q is already backed up under app %q (id: %s) — pick a different path, or use that app instead", v.Path, dupName, dupID))
+				return
+			}
+		}
 		if err := s.cfg.AddApp(a); err != nil {
 			errOut(w, 409, err.Error())
 			return
@@ -522,6 +528,18 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 			}}
 			a.Path = ""
 			a.Excludes = nil
+		}
+		// Mirror UpdateApp's own single-volume path-promotion here so the
+		// collision check below sees the path that will actually be saved
+		// (UpdateApp will harmlessly re-apply this — it's idempotent).
+		if a.Path != "" && len(a.Volumes) == 1 && a.Path != a.Volumes[0].Path {
+			a.Volumes[0].Path = a.Path
+		}
+		for _, v := range a.Volumes {
+			if dupID, dupName, found := s.cfg.PathInUse(v.Path, a.ID); found {
+				errOut(w, 409, fmt.Sprintf("path %q is already backed up under app %q (id: %s) — pick a different path, or use that app instead", v.Path, dupName, dupID))
+				return
+			}
 		}
 		if err := s.cfg.UpdateApp(a); err != nil {
 			errOut(w, 404, err.Error())
@@ -1346,10 +1364,18 @@ func errOut(w http.ResponseWriter, code int, msg string) {
 }
 
 func sanitizeID(name string) string {
-	r := strings.NewReplacer(" ", "_", "/", "_", ".", "_", "-", "_")
-	id := strings.ToLower(r.Replace(strings.TrimSpace(name)))
+	name = strings.ToLower(strings.TrimSpace(name))
+	var b strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	id := b.String()
 	for strings.Contains(id, "__") {
-		id = strings.ReplaceAll(id, "__", "__")
+		id = strings.ReplaceAll(id, "__", "_") // collapse runs of underscores
 	}
 	return strings.Trim(id, "_")
 }
