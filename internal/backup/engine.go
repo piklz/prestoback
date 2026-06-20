@@ -744,7 +744,11 @@ func SuggestExcludes(image string) []string {
 	return nil
 }
 
-func matchesExclude(relPath string, excludes []string) bool {
+// MatchesExclude reports whether relPath matches any of the given exclude
+// patterns. Exported so other parts of the app (e.g. the size-estimate
+// endpoint) can show numbers that agree with what actually gets archived,
+// instead of maintaining a second copy of this matching logic.
+func MatchesExclude(relPath string, excludes []string) bool {
 	for _, pattern := range excludes {
 		if strings.HasSuffix(pattern, "/") {
 			dir := strings.TrimSuffix(pattern, "/")
@@ -825,7 +829,16 @@ func tarGz(srcDir, destFile string, excludes []string) (int64, error) {
 	}
 	defer f.Close()
 
-	gw := gzip.NewWriter(f)
+	// BestSpeed, not the Go default (level 6): backup archives are dominated
+	// by already-compressed content in practice — media thumbnails, transcoded
+	// video, sqlite DBs — which barely shrinks at any gzip level. Spending
+	// extra CPU chasing a marginal size win isn't worth it, especially since
+	// this runs while the source container is stopped/paused — every second
+	// here is directly user-visible downtime, not just archive job time.
+	gw, err := gzip.NewWriterLevel(f, gzip.BestSpeed)
+	if err != nil {
+		return 0, fmt.Errorf("gzip writer: %w", err)
+	}
 	tw := tar.NewWriter(gw)
 
 	fileCount := 0
@@ -848,7 +861,7 @@ func tarGz(srcDir, destFile string, excludes []string) (int64, error) {
 		if idx := strings.Index(rel, "/"); idx >= 0 {
 			relFromApp = rel[idx+1:]
 		}
-		if len(excludes) > 0 && relFromApp != "" && matchesExclude(relFromApp, excludes) {
+		if len(excludes) > 0 && relFromApp != "" && MatchesExclude(relFromApp, excludes) {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}

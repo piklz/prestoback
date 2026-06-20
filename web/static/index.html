@@ -799,6 +799,7 @@ select.fi{cursor:pointer}
         <div class="step"><div class="sn">4</div>Restart container, verify health</div>
       </div>
       <div style="margin-top:14px;padding:10px 14px;background:var(--bg3);border-radius:var(--rs)"><div style="font-size:10px;color:var(--txt3);font-family:var(--mono);margin-bottom:4px">RESTORING ARCHIVE</div><div style="font-family:var(--mono);font-size:12px;color:var(--txt)" id="rs-id">—</div></div>
+      <div id="rs-size-warn" style="margin-top:10px;font-size:12px"></div>
     </div>
     <div class="mf"><button class="btn btn-g" onclick="CM('m-rs')">Cancel</button><button class="btn btn-d" id="rs-run" onclick="runRestore()">↺ Restore Now</button></div>
   </div>
@@ -1612,22 +1613,35 @@ function openBkModal(id,name) {
   document.getElementById('m-bk-title').textContent='Backup — '+name;
   document.getElementById('bk-prog').style.display='none';
   document.getElementById('bk-run').disabled=false;
-  document.getElementById('bk-size-warn').textContent='';
+  const warn = document.getElementById('bk-size-warn');
+  warn.innerHTML='';
   OM('m-bk');
   // Async size check — shows after modal opens
   const app = S.apps.find(a=>a.id===id);
-  if (app && app.path) {
-    api('/api/dir-size?path='+encodeURIComponent(app.path)).then(sz => {
-      if (!sz || !sz.bytes) return;
-      const gb = sz.bytes/(1024*1024*1024);
-      if (gb < 0.1) return; // < 100MB — no warning needed
-      const hasExcludes = app.excludes && app.excludes.length > 0;
-      const warn = document.getElementById('bk-size-warn');
-      warn.innerHTML = `⚠ Source: <strong>${sz.human}</strong> (${sz.file_count.toLocaleString()} files)`
-        + (gb > 2 && !hasExcludes ? ' — tip: add exclude patterns in app settings to skip cache dirs' : '');
-      warn.style.color = gb > 2 ? 'var(--amber)' : 'var(--txt2)';
-    }).catch(()=>{});
-  }
+  const vols = (app?.volumes||[]).filter(v=>v.enabled!==false && v.path);
+  if (!vols.length) return;
+  const params = new URLSearchParams();
+  vols.forEach(v => params.append('path', v.path));
+  vols.forEach(v => (v.excludes||[]).forEach(e => params.append('exclude', e)));
+  api('/api/dir-size?'+params.toString()).then(sz => {
+    if (!sz || !sz.bytes) return;
+    const gb = sz.bytes/(1024*1024*1024);
+    if (gb < 0.1) return; // < 100MB — no warning needed
+    if (gb < 1) {
+      warn.innerHTML = `Source: <strong>${sz.human}</strong> (${sz.file_count.toLocaleString()} files)`;
+      warn.style.color = 'var(--txt2)';
+      return;
+    }
+    // ≥1GB — call out the real consequence, not just the number
+    const strategy = app.container_strategy || 'stop';
+    const impact = strategy === 'none'
+      ? 'the container is left running, but compressing this much data is still real job time'
+      : strategy === 'pause'
+        ? 'the app will be frozen (paused) for the whole archive step — proportional to this size on slower hardware (e.g. a Raspberry Pi)'
+        : 'the app will be stopped for the whole archive step — proportional to this size on slower hardware (e.g. a Raspberry Pi)';
+    warn.innerHTML = `⚠ <strong>${sz.human}</strong> to archive (${sz.file_count.toLocaleString()} files) — ${impact}.`;
+    warn.style.color = 'var(--amber)';
+  }).catch(()=>{});
 }
 async function runBackup() {
   document.getElementById('bk-run').disabled=true;
@@ -1643,7 +1657,37 @@ function openRsModal(appID,backupID) {
   S.rsAppID=appID; S.rsID=backupID;
   document.getElementById('rs-id').textContent=backupID;
   document.getElementById('rs-run').disabled=false;
+  const warn = document.getElementById('rs-size-warn');
+  warn.innerHTML='';
   OM('m-rs');
+
+  // Restore isn't just "extract the archive" — RestoreVolume first takes a
+  // pre-restore safety snapshot of the CURRENT live volume (same compress
+  // cost as a normal backup), THEN extracts the chosen archive on top of it.
+  // Both happen while the container is stopped, so the real downtime is
+  // closer to (compress current size) + (extract archive size), not just one.
+  const meta = (S.bkAll||[]).find(m => m.id === backupID);
+  const app = S.apps.find(a => a.id === appID);
+  const vol = app && meta ? (app.volumes||[]).find(v => v.slug === meta.volume_slug) : null;
+
+  const archiveGB = meta ? meta.size_bytes/(1024*1024*1024) : 0;
+  const showWarn = (liveHuman) => {
+    const strategy = app?.container_strategy || 'stop';
+    const verb = strategy === 'pause' ? 'frozen (paused)' : 'stopped';
+    const parts = [];
+    if (meta && meta.size_bytes > 0) parts.push(`extracting <strong>${fmtBytes(meta.size_bytes)}</strong> archive`);
+    if (liveHuman) parts.push(`snapshotting the current <strong>${liveHuman}</strong> live volume first`);
+    if (!parts.length) return;
+    warn.innerHTML = `⚠ Restore ${parts.join(' + ')} — the app will be ${verb} for both steps. Expect real downtime on slower hardware (e.g. a Raspberry Pi), roughly proportional to the combined size.`;
+    warn.style.color = 'var(--amber)';
+  };
+
+  if (archiveGB >= 1) showWarn(null); // show something immediately, refine once live size is known
+  if (vol && vol.path) {
+    api('/api/dir-size?'+new URLSearchParams([['path', vol.path], ...(vol.excludes||[]).map(e=>['exclude',e])]).toString())
+      .then(sz => { if (sz && sz.bytes) showWarn(sz.human); })
+      .catch(()=>{});
+  }
 }
 async function runRestore() {
   document.getElementById('rs-run').disabled=true;

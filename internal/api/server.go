@@ -344,26 +344,49 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, candidates)
 }
 
+// handleDirSize estimates the archived size of one or more directories,
+// respecting exclude patterns — this is what powers the backup/restore size
+// warnings, so it deliberately reuses backup.MatchesExclude (the same logic
+// tarGz uses) rather than a second, potentially-divergent copy of it.
+//
+// GET /api/dir-size?path=A&path=B&exclude=Cache/&exclude=*.log
 func (s *Server) handleDirSize(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	if path == "" {
-		errOut(w, 400, "path required")
+	paths := r.URL.Query()["path"]
+	if len(paths) == 0 {
+		errOut(w, 400, "at least one path required")
 		return
 	}
+	excludes := r.URL.Query()["exclude"]
+
 	var totalBytes int64
 	fileCount := 0
-	_ = filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
-		if err != nil || info == nil {
+	for _, path := range paths {
+		_ = filepath.Walk(path, func(walked string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil || info == nil || walked == path {
+				return nil
+			}
+			rel, relErr := filepath.Rel(path, walked)
+			if relErr != nil {
+				return nil
+			}
+			if info.IsDir() {
+				if len(excludes) > 0 && backup.MatchesExclude(rel, excludes) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if info.Mode().IsRegular() {
+				if len(excludes) > 0 && backup.MatchesExclude(rel, excludes) {
+					return nil
+				}
+				totalBytes += info.Size()
+				fileCount++
+			}
 			return nil
-		}
-		if info.Mode().IsRegular() {
-			totalBytes += info.Size()
-			fileCount++
-		}
-		return nil
-	})
+		})
+	}
 	respond(w, 200, map[string]any{
-		"path":       path,
+		"paths":      paths,
 		"bytes":      totalBytes,
 		"file_count": fileCount,
 		"human":      humanBytes(totalBytes),
