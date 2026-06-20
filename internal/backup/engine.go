@@ -722,8 +722,12 @@ func slugFromPath(p string) string {
 // ── Tar/Gzip ──────────────────────────────────────────────────────────────────
 
 var KnownCachePatterns = map[string][]string{
-	"plex":          {"Cache/", "Transcodes/", "logs/"},
-	"jellyfin":      {"cache/", "log/"},
+	// Metadata/ and Media/ hold downloaded poster art, fanart, and episode
+	// thumbnails — fully regenerable by re-scanning the library, and often the
+	// single largest component of a real library (easily dwarfing Cache/).
+	// Transcode/ lives under Cache/ already, not as its own top-level folder.
+	"plex":          {"Cache/", "Metadata/", "Media/", "Logs/", "Crash Reports/"},
+	"jellyfin":      {"cache/", "metadata/", "log/"},
 	"sonarr":        {"logs/", "Backups/"},
 	"radarr":        {"logs/", "Backups/"},
 	"lidarr":        {"logs/", "Backups/"},
