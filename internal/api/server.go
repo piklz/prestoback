@@ -1208,16 +1208,28 @@ func (s *Server) handleOrphans(w http.ResponseWriter, r *http.Request) {
 
 // ── API Key ───────────────────────────────────────────────────────────────────
 //
-// GET /api/apikey  → returns the full API key for use with external integrations.
+// maskAPIKey returns a display-safe fingerprint of a key — enough to
+// recognize "yes, that's my key" without revealing anything brute-forceable.
+// Keys are 64-char hex (32 random bytes), so leaking 8 of 64 chars gives no
+// meaningful advantage to an attacker.
+func maskAPIKey(key string) string {
+	if len(key) <= 8 {
+		return strings.Repeat("•", len(key))
+	}
+	return key[:4] + strings.Repeat("•", 12) + key[len(key)-4:]
+}
 
+// GET /api/apikey → returns a masked fingerprint ONLY. The full key is
+// returned exactly once, at regeneration time (see handleRegenKey below) —
+// this endpoint must never hand the live key back out on a routine page
+// load, since the API key also doubles as the JWT signing secret.
 func (s *Server) handleAPIKey(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		errOut(w, 405, "method not allowed")
 		return
 	}
-	key := s.cfg.APIKey()
 	respond(w, 200, map[string]any{
-		"key":          key,
+		"masked":       maskAPIKey(s.cfg.APIKey()),
 		"usage_header": "X-API-Key",
 		"usage_param":  "api_key",
 	})
