@@ -635,6 +635,86 @@ func sha256File(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// OrphanInspection summarizes what a backup directory's manifests reveal
+// about the app that used to own it — enough to pre-fill a "recreate this
+// app" form. Live volume paths are deliberately NOT included: those are
+// genuinely specific to wherever the app lives on the new system, and have
+// to come from the person doing the recovery, not guessed.
+type OrphanInspection struct {
+	AppID       string    `json:"app_id"`
+	AppName     string    `json:"app_name"`
+	VolumeSlugs []string  `json:"volume_slugs"`
+	BackupCount int       `json:"backup_count"`
+	LatestRunAt time.Time `json:"latest_run_at"`
+}
+
+// InspectOrphan reads every manifest in dirName (oldest to newest) to recover
+// the app_id (= dirName itself), the most recently seen app_name, and the
+// union of every volume slug ever backed up there — including volumes that
+// may have been since disabled, so old recoverable history isn't hidden.
+func (e *Engine) InspectOrphan(dirName string) (*OrphanInspection, error) {
+	dir := filepath.Join(e.backupDir, dirName)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	var manifestNames []string
+	tarCount := 0
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		if strings.HasSuffix(ent.Name(), "_manifest.json") {
+			manifestNames = append(manifestNames, ent.Name())
+		}
+		if strings.HasSuffix(ent.Name(), ".tar.gz") {
+			tarCount++
+		}
+	}
+	if len(manifestNames) == 0 {
+		return nil, fmt.Errorf("no manifest files found in %q — can't auto-detect app details, but you can still add an app manually with ID %q to claim these backups", dirName, dirName)
+	}
+	sort.Strings(manifestNames) // timestamp is embedded in the filename, so this sorts chronologically
+
+	slugSeen := map[string]bool{}
+	var slugs []string
+	var appName string
+	var latestRunAt time.Time
+	for _, name := range manifestNames {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			continue // best-effort — one unreadable manifest shouldn't sink the whole inspection
+		}
+		var m Manifest
+		if err := json.Unmarshal(data, &m); err != nil {
+			continue
+		}
+		if m.AppName != "" {
+			appName = m.AppName // overwritten each iteration -> ends up as the most recent
+		}
+		if m.RunAt.After(latestRunAt) {
+			latestRunAt = m.RunAt
+		}
+		for _, ent := range m.Entries {
+			if ent.VolumeSlug != "" && !slugSeen[ent.VolumeSlug] {
+				slugSeen[ent.VolumeSlug] = true
+				slugs = append(slugs, ent.VolumeSlug)
+			}
+		}
+	}
+	if appName == "" {
+		appName = dirName
+	}
+	return &OrphanInspection{
+		AppID:       dirName,
+		AppName:     appName,
+		VolumeSlugs: slugs,
+		BackupCount: tarCount,
+		LatestRunAt: latestRunAt,
+	}, nil
+}
+
 // OrphanedBackupDirs returns backup directories that have no registered app.
 // registeredIDs is the set of known app IDs from config.
 func (e *Engine) OrphanedBackupDirs(registeredIDs map[string]bool) ([]string, error) {

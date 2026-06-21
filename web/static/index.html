@@ -76,6 +76,7 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 /* ── BACKUP CHIPS — reality-aware ── */
 .chips-wrap{display:flex;flex-direction:column;gap:10px;margin-bottom:18px}
 .chips-legend{display:flex;align-items:center;gap:14px;font-family:var(--mono);font-size:10px;color:var(--txt3);letter-spacing:.5px}
+.bk-adopt-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .lgi{display:flex;align-items:center;gap:5px}
 .lgi-dot{display:inline-block;width:7px;height:7px;border-radius:50%;flex-shrink:0}
 .lgi-dot.avail{background:var(--green)}
@@ -441,7 +442,7 @@ select.fi{cursor:pointer}
 <!-- BACKUPS -->
 <div id="view-bk" class="view-hidden">
   <div class="ph"><div><div class="pt">Backups</div><div class="ps">Browse and restore config archives</div></div>
-    <div class="ha"><button class="btn btn-g btn-sm" onclick="refreshBkView()">↺ Refresh</button></div>
+    <div class="ha"><button class="btn btn-g btn-sm" onclick="openImportModal()">⇪ Import Backup File</button><button class="btn btn-g btn-sm" onclick="refreshBkView()">↺ Refresh</button></div>
   </div>
   <div class="sec">
     <!-- chips with reality state -->
@@ -467,7 +468,13 @@ select.fi{cursor:pointer}
           <button class="btn btn-g btn-sm" onclick="loadBackups()">↺</button>
         </div>
       </div>
-      <div class="cb" id="bk-body"></div>
+      <div class="cb" id="bk-body">
+        <div id="bk-adopt-banner" class="bk-adopt-row" style="display:none;margin-bottom:14px;padding:12px 14px;background:var(--ad);border:1px solid rgba(245,166,35,.3);border-radius:var(--r)">
+          <div style="font-size:12.5px;color:var(--txt)">🔌 Backups exist on disk for this ID, but no app is registered for it — restore is disabled until it's adopted.</div>
+          <button class="btn btn-w btn-sm" id="bk-adopt-btn" style="white-space:nowrap">Adopt this app</button>
+        </div>
+        <div id="bk-list-area"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -805,6 +812,33 @@ select.fi{cursor:pointer}
   </div>
 </div>
 
+<!-- Adopt orphan backup -->
+<div class="overlay hidden" id="m-adopt">
+  <div class="modal">
+    <div class="mh"><div class="mt">Adopt Backup</div><button class="btn btn-g btn-ic" onclick="CM('m-adopt')">✕</button></div>
+    <div class="mb">
+      <div style="font-size:12.5px;color:var(--txt2);margin-bottom:14px" id="adopt-context"></div>
+      <div class="fg"><label class="fl">App ID (fixed — must match the existing backup folder)</label><input class="fi" id="adopt-id" disabled style="opacity:.5"></div>
+      <div class="fg"><label class="fl">App name</label><input class="fi" id="adopt-name"></div>
+      <div id="adopt-volumes"></div>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="CM('m-adopt')">Cancel</button><button class="btn btn-p" id="adopt-run" onclick="submitAdopt()">Create &amp; Adopt</button></div>
+  </div>
+</div>
+
+<!-- Import backup file -->
+<div class="overlay hidden" id="m-import">
+  <div class="modal">
+    <div class="mh"><div class="mt">Import Backup File</div><button class="btn btn-g btn-ic" onclick="CM('m-import')">✕</button></div>
+    <div class="mb">
+      <div style="font-size:12.5px;color:var(--txt2);margin-bottom:14px">Pick a single <code>.tar.gz</code> backup archive produced by PrestoBack — e.g. one you downloaded from remote storage onto a fresh install. We match it by filename, the same convention every PrestoBack archive already uses.</div>
+      <div class="fg"><label class="fl">Backup file (.tar.gz)</label><input class="fi" type="file" id="import-file" accept=".tar.gz" onchange="onImportFileChange()"></div>
+      <div id="import-analysis" style="margin-top:14px"></div>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="CM('m-import')">Cancel</button><button class="btn btn-p" id="import-run" style="display:none" onclick="confirmImport()">Import</button></div>
+  </div>
+</div>
+
 <!-- Update confirm -->
 <div class="overlay hidden" id="m-upd">
   <div class="modal">
@@ -1089,11 +1123,15 @@ async function probeAllApps() {
 
   S.backupCounts = counts;
 
-  // detect orphans: try listing known backup dir sub-folders
-  // We use a heuristic: query backups for any id that appears in disk
-  // but isn't in config. The API returns [] for unknown IDs harmlessly.
-  // No direct "list all folders" API — skip orphan detection for now.
-  // (would need a new /api/backups endpoint that lists all app dirs)
+  // Real orphan detection — directories on disk with no matching registered app.
+  try {
+    const orphans = await api('/api/backups-orphans') || [];
+    S.orphanIDs = orphans.map(o => o.dir_name);
+    S.orphanInfo = {};
+    orphans.forEach(o => S.orphanInfo[o.dir_name] = o);
+  } catch {
+    S.orphanIDs = [];
+  }
 
   // update total count
   const total = Object.values(counts).reduce((s,n)=>s+n,0);
@@ -1744,6 +1782,10 @@ async function selApp(id, name) {
   document.getElementById('bk-notice').style.display='none';
   document.getElementById('bk-card').style.display='';
   document.getElementById('bk-title').textContent = name + ' — Backups';
+  const isOrphan = !S.apps.find(a => a.id === id);
+  const banner = document.getElementById('bk-adopt-banner');
+  banner.style.display = isOrphan ? 'flex' : 'none';
+  if (isOrphan) document.getElementById('bk-adopt-btn').onclick = () => openAdoptModal(id);
   renderChips();
   await loadBackups();
 }
@@ -1752,7 +1794,7 @@ const BK_PER_PAGE = 20;
 
 async function loadBackups() {
   if (!S.selAppID) return;
-  const body = document.getElementById('bk-body');
+  const body = document.getElementById('bk-list-area');
   const sub = document.getElementById('bk-subtitle');
   const warnEl = document.getElementById('bk-missing-warn');
   body.innerHTML = '<div style="color:var(--txt3);font-size:13px">Loading…</div>';
@@ -1784,12 +1826,13 @@ async function loadBackups() {
 
 function renderBkPage() {
   const metas = S.bkAll;
+  const isOrphan = !S.apps.find(a => a.id === S.selAppID);
   const total = metas.length;
   const pages = Math.ceil(total / BK_PER_PAGE);
   const page = Math.min(S.bkPage, Math.max(0, pages-1));
   S.bkPage = page;
   const slice = metas.slice(page * BK_PER_PAGE, (page+1) * BK_PER_PAGE);
-  const body = document.getElementById('bk-body');
+  const body = document.getElementById('bk-list-area');
 
   let html = '<div class="bk-list">' + slice.map(m => {
     const missing = m.size_bytes === 0;
@@ -1803,7 +1846,8 @@ function renderBkPage() {
       </div>
       <span class="bsz">${missing?'<span style="color:var(--red)">corrupt/empty</span>':fmtBytes(m.size_bytes)}</span>
       <div style="display:flex;gap:6px">
-        ${!missing?`<button class="btn btn-g btn-sm" onclick="openRsModal('${S.selAppID}','${esc(m.id)}')">↺ Restore</button>`:''}
+        ${!missing && !isOrphan?`<button class="btn btn-g btn-sm" onclick="openRsModal('${S.selAppID}','${esc(m.id)}')">↺ Restore</button>`:''}
+        ${!missing && isOrphan?`<button class="btn btn-g btn-sm" disabled title="Adopt this app first" style="opacity:.5">↺ Restore</button>`:''}
         <button class="btn btn-d btn-sm btn-ic" onclick="delBackup('${esc(m.id)}')">🗑</button>
       </div>
     </div>`;
@@ -1832,6 +1876,174 @@ async function delBackup(id) {
   if (!confirm('Delete this archive? Cannot be undone.')) return;
   try { await api('/api/backups/'+S.selAppID+'/'+id,{method:'DELETE'}); toast('Deleted','success'); loadBackups(); }
   catch(e) { toast(e.message,'error'); }
+}
+
+// ════════════════════ Adopt Orphan ════════════════════
+// Brings a backup directory that exists on disk (but has no matching app in
+// config — e.g. after a fresh install restore) back into a real, restorable
+// app. The orphan's manifests already contain everything except the live
+// path on THIS system, which only the person doing the recovery can supply.
+
+S.adoptCtx = null; // { appID, appName, volumeSlugs, pendingImportFile }
+
+async function openAdoptModal(orphanDirName) {
+  try {
+    const insp = await api('/api/backups-orphans/'+encodeURIComponent(orphanDirName)+'/inspect');
+    S.adoptCtx = { appID: insp.app_id, appName: insp.app_name, volumeSlugs: insp.volume_slugs, pendingImportFile: null };
+    document.getElementById('adopt-context').textContent =
+      `Found ${insp.backup_count} backup${insp.backup_count!==1?'s':''} on disk`
+      + (insp.latest_run_at ? `, last run ${new Date(insp.latest_run_at).toLocaleString()}` : '')
+      + `. Confirm where each volume should live on this system.`;
+    renderAdoptForm();
+    OM('m-adopt');
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// Entry point from the Import flow when a dropped file's filename doesn't
+// match any registered app — we can't split app-id from volume-slug with
+// certainty (both use the same charset and either can contain underscores),
+// so this is a best-effort guess the person confirms/edits, not a silent action.
+function openAdoptModalManual(candidateID, candidateName, candidateSlug, pendingFile) {
+  S.adoptCtx = { appID: candidateID, appName: candidateName, volumeSlugs: [candidateSlug], pendingImportFile: pendingFile };
+  document.getElementById('adopt-context').textContent =
+    `Guessed from the filename — we can't tell the app name apart from the volume name with certainty, so double-check both below before confirming.`;
+  renderAdoptForm();
+  OM('m-adopt');
+}
+
+function renderAdoptForm() {
+  const ctx = S.adoptCtx;
+  document.getElementById('adopt-id').value = ctx.appID;
+  document.getElementById('adopt-name').value = ctx.appName;
+  document.getElementById('adopt-volumes').innerHTML = ctx.volumeSlugs.map(slug => `
+    <div class="fg">
+      <label class="fl">Live path for volume "${esc(slug)}"</label>
+      <input class="fi adopt-vol-path" data-slug="${esc(slug)}" placeholder="/volumes/...">
+    </div>
+  `).join('');
+}
+
+async function submitAdopt() {
+  const ctx = S.adoptCtx;
+  if (!ctx) return;
+  const name = gv('adopt-name') || ctx.appID;
+  const volumes = [...document.querySelectorAll('.adopt-vol-path')].map(el => ({
+    slug: el.dataset.slug, path: el.value.trim(), label: el.dataset.slug, enabled: true,
+  }));
+  if (volumes.some(v => !v.path)) { toast('Every volume needs a live path', 'error'); return; }
+
+  const btn = document.getElementById('adopt-run');
+  btn.disabled = true;
+  try {
+    await api('/api/apps', { method:'POST', body: JSON.stringify({ id: ctx.appID, name, retain: 5, volumes }) });
+    if (ctx.pendingImportFile) {
+      await uploadBackupFile(ctx.pendingImportFile, ctx.appID); // file the import in too, now that the app exists
+    }
+    toast(`'${name}' adopted — backups are now restorable`, 'success');
+    CM('m-adopt');
+    S.adoptCtx = null;
+    await loadApps();
+    await probeAllApps();
+    renderApps(); renderChips();
+    selApp(ctx.appID, name);
+  } catch(e) { toast(e.message, 'error'); }
+  finally { btn.disabled = false; }
+}
+
+// ════════════════════ Import Backup File ════════════════════
+// For when you only have a loose .tar.gz (not the whole backups/ folder) —
+// e.g. one file pulled down from remote storage. PrestoBack's own naming
+// convention is what makes this possible: appid_volumeslug_YYYYMMDD_HHMMSS.tar.gz.
+
+function openImportModal() {
+  document.getElementById('import-file').value = '';
+  document.getElementById('import-analysis').innerHTML = '';
+  document.getElementById('import-run').style.display = 'none';
+  S.importFile = null; S.importMatchedAppID = null;
+  OM('m-import');
+}
+
+// Mirrors backupArchiveNamePattern on the server — kept in sync deliberately,
+// since the server is the one that actually enforces this, not this preview.
+function parseBackupFilename(filename) {
+  const m = filename.match(/^(.+)_(\d{8})_(\d{6})(_prerestore)?\.tar\.gz$/);
+  if (!m) return null;
+  return { stem: m[1], date: m[2], time: m[3], preRestore: !!m[4] };
+}
+
+// Unambiguous matching: does the filename's stem start with a KNOWN app's
+// exact ID? Prefer the longest match, in case one app ID is a prefix of another.
+function matchKnownApp(stem) {
+  let best = null;
+  for (const a of S.apps) {
+    if (stem === a.id || stem.startsWith(a.id + '_')) {
+      if (!best || a.id.length > best.id.length) best = a;
+    }
+  }
+  return best;
+}
+
+function onImportFileChange() {
+  const f = document.getElementById('import-file').files[0];
+  const analysis = document.getElementById('import-analysis');
+  const runBtn = document.getElementById('import-run');
+  runBtn.style.display = 'none';
+  runBtn.onclick = confirmImport;
+  S.importFile = null; S.importMatchedAppID = null;
+  if (!f) { analysis.innerHTML = ''; return; }
+
+  if (!f.name.endsWith('.tar.gz')) {
+    analysis.innerHTML = `<div style="padding:10px 14px;background:var(--rd);border-radius:var(--rs);font-size:12.5px;color:var(--red)">Only .tar.gz files produced by PrestoBack can be smart-imported this way.</div>`;
+    return;
+  }
+  const parsed = parseBackupFilename(f.name);
+  if (!parsed) {
+    analysis.innerHTML = `<div style="padding:10px 14px;background:var(--rd);border-radius:var(--rs);font-size:12.5px;color:var(--red)">"${esc(f.name)}" doesn't match PrestoBack's naming pattern (appid_volumeslug_YYYYMMDD_HHMMSS.tar.gz) — can't auto-match it.</div>`;
+    return;
+  }
+  S.importFile = f;
+  const match = matchKnownApp(parsed.stem);
+  if (match) {
+    S.importMatchedAppID = match.id;
+    analysis.innerHTML = `<div style="padding:10px 14px;background:var(--gd);border-radius:var(--rs);font-size:12.5px;color:var(--green)">✓ Matches existing app <strong>${esc(match.name)}</strong> (${esc(match.id)}) — click Import to file this backup in.</div>`;
+    runBtn.textContent = 'Import';
+    runBtn.style.display = '';
+  } else {
+    const parts = parsed.stem.split('_');
+    const guessID = parts[0];
+    const guessSlug = parts.slice(1).join('_') || parts[0];
+    analysis.innerHTML = `<div style="padding:10px 14px;background:var(--ad);border-radius:var(--rs);font-size:12.5px;color:var(--txt)">No existing app matches "${esc(parsed.stem)}" — we can't reliably split the app name from the volume name. The next step lets you confirm both.</div>`;
+    runBtn.textContent = 'Set Up App & Import';
+    runBtn.style.display = '';
+    runBtn.onclick = () => { CM('m-import'); openAdoptModalManual(guessID, guessID, guessSlug, f); };
+  }
+}
+
+async function confirmImport() {
+  if (!S.importFile || !S.importMatchedAppID) return;
+  const btn = document.getElementById('import-run');
+  btn.disabled = true;
+  try {
+    await uploadBackupFile(S.importFile, S.importMatchedAppID);
+    toast('Backup imported', 'success');
+    CM('m-import');
+    if (S.selAppID === S.importMatchedAppID) loadBackups();
+  } catch(e) { toast(e.message, 'error'); }
+  finally { btn.disabled = false; }
+}
+
+// Shared by the direct-match import path and the post-adopt import path.
+// Deliberately not using the api() helper — it forces JSON Content-Type,
+// which would break the multipart boundary fetch needs to set itself.
+async function uploadBackupFile(file, appID) {
+  const fd = new FormData();
+  fd.append('app_id', appID);
+  fd.append('file', file, file.name);
+  const res = await fetch('/api/backups-import', { method:'POST', body: fd, headers: authHeader() });
+  if (res.status === 401) { authClear(); showAuthScreen('login'); throw new Error('session expired — please log in again'); }
+  const data = await res.json().catch(()=>({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
 }
 
 // ════════════════════ History ════════════════════

@@ -3,11 +3,13 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -89,7 +91,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/apps", s.authJWT(s.handleApps))
 	s.mux.HandleFunc("/api/apps/", s.authJWT(s.handleApp))
 	s.mux.HandleFunc("/api/backups/", s.authJWT(s.handleBackups))
+	s.mux.HandleFunc("/api/backups-orphans/", s.authJWT(s.handleOrphans))
 	s.mux.HandleFunc("/api/backups-orphans", s.authJWT(s.handleOrphans))
+	s.mux.HandleFunc("/api/backups-import", s.authJWT(s.handleBackupsImport))
 	s.mux.HandleFunc("/api/history", s.authJWT(s.handleHistory))
 	s.mux.HandleFunc("/api/notify", s.authJWT(s.handleNotify))
 	s.mux.HandleFunc("/api/notify/test", s.authJWT(s.handleNotifyTest))
@@ -1024,10 +1028,94 @@ func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ── Import a loose backup archive file ─────────────────────────────────────────
+//
+// POST /api/backups-import  (multipart: file=<.tar.gz>, app_id=<claimed owner>)
+//
+// This is for the "I only have one stray .tar.gz, not the whole backups/
+// directory" case. PrestoBack's own archive names are unambiguous to verify
+// against a CLAIMED app_id (filename must start with "{app_id}_" and match
+// the full naming pattern) — but they are NOT safely splittable from
+// scratch, because both the app_id and volume_slug segments use the same
+// charset and either can contain underscores. So this endpoint trusts the
+// app_id the client asked for, but independently verifies the filename is
+// actually consistent with it before accepting — it never blindly believes
+// an unverified claim. The client (see frontend) is responsible for
+// proposing that app_id, either by matching it against already-registered
+// apps, or via the Adopt Orphan flow for a brand new one.
+var backupArchiveNamePattern = regexp.MustCompile(`^[a-z0-9_]+_[a-z0-9_]+_\d{8}_\d{6}(_prerestore)?\.tar\.gz$`)
+
+func (s *Server) handleBackupsImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	if err := r.ParseMultipartForm(64 << 20); err != nil { // 64MB memory threshold; larger files spill to disk automatically
+		errOut(w, 400, "could not parse upload: "+err.Error())
+		return
+	}
+	appID := strings.TrimSpace(r.FormValue("app_id"))
+	if appID == "" {
+		errOut(w, 400, "app_id required")
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		errOut(w, 400, "file required: "+err.Error())
+		return
+	}
+	defer file.Close()
+
+	filename := filepath.Base(header.Filename)
+	if !backupArchiveNamePattern.MatchString(filename) {
+		errOut(w, 400, "filename doesn't match PrestoBack's backup naming pattern (appid_volumeslug_YYYYMMDD_HHMMSS.tar.gz) — only PrestoBack's own archives can be smart-imported this way")
+		return
+	}
+	if !strings.HasPrefix(filename, appID+"_") {
+		errOut(w, 400, fmt.Sprintf("filename %q doesn't start with %q — it doesn't look like it belongs to this app", filename, appID+"_"))
+		return
+	}
+
+	destDir := filepath.Join(s.cfg.BackupDir(), appID)
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		errOut(w, 500, "could not create backup directory: "+err.Error())
+		return
+	}
+	destPath := filepath.Join(destDir, filename)
+	if _, err := os.Stat(destPath); err == nil {
+		errOut(w, 409, "a backup with this exact filename already exists for this app — nothing to do")
+		return
+	}
+
+	out, err := os.Create(destPath)
+	if err != nil {
+		errOut(w, 500, "could not save file: "+err.Error())
+		return
+	}
+	defer out.Close()
+	written, err := io.Copy(out, file)
+	if err != nil {
+		out.Close()
+		os.Remove(destPath) // don't leave a truncated, half-written archive lying around
+		errOut(w, 500, "upload failed partway through: "+err.Error())
+		return
+	}
+
+	_, isRegistered := s.cfg.GetApp(appID)
+	respond(w, 200, map[string]any{
+		"status":         "imported",
+		"app_id":         appID,
+		"filename":       filename,
+		"size_bytes":     written,
+		"app_registered": isRegistered,
+	})
+}
+
 // ── Orphan backup directories ─────────────────────────────────────────────────
 //
-// GET  /api/backups-orphans          → list dir names with no registered app
-// DELETE /api/backups-orphans/{dir}  → remove an orphaned backup directory
+// GET    /api/backups-orphans                 → list dir names with no registered app
+// GET    /api/backups-orphans/{dir}/inspect   → recover app_id/name/volume slugs from manifests, for the Adopt flow
+// DELETE /api/backups-orphans/{dir}            → remove an orphaned backup directory
 
 func (s *Server) handleOrphans(w http.ResponseWriter, r *http.Request) {
 	// Build set of registered app IDs
@@ -1036,40 +1124,62 @@ func (s *Server) handleOrphans(w http.ResponseWriter, r *http.Request) {
 		registered[a.ID] = true
 	}
 
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/backups-orphans"), "/")
+
 	switch r.Method {
 	case http.MethodGet:
-		orphans, err := s.engine.OrphanedBackupDirs(registered)
-		if err != nil {
-			errOut(w, 500, err.Error())
+		if rest == "" {
+			orphans, err := s.engine.OrphanedBackupDirs(registered)
+			if err != nil {
+				errOut(w, 500, err.Error())
+				return
+			}
+			// Enrich with size info
+			type orphanInfo struct {
+				DirName   string `json:"dir_name"`
+				SizeBytes int64  `json:"size_bytes"`
+				Human     string `json:"human"`
+			}
+			var result []orphanInfo
+			for _, name := range orphans {
+				dir := filepath.Join(s.cfg.BackupDir(), name)
+				var size int64
+				_ = filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+					if err == nil && info != nil && info.Mode().IsRegular() {
+						size += info.Size()
+					}
+					return nil
+				})
+				result = append(result, orphanInfo{DirName: name, SizeBytes: size, Human: humanBytes(size)})
+			}
+			if result == nil {
+				result = []orphanInfo{}
+			}
+			respond(w, 200, result)
 			return
 		}
-		// Enrich with size info
-		type orphanInfo struct {
-			DirName   string `json:"dir_name"`
-			SizeBytes int64  `json:"size_bytes"`
-			Human     string `json:"human"`
+
+		// GET /api/backups-orphans/{dir}/inspect
+		parts := strings.SplitN(rest, "/", 2)
+		dirName := parts[0]
+		if len(parts) != 2 || parts[1] != "inspect" {
+			errOut(w, 404, "not found")
+			return
 		}
-		var result []orphanInfo
-		for _, name := range orphans {
-			dir := filepath.Join(s.cfg.BackupDir(), name)
-			var size int64
-			_ = filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
-				if err == nil && info != nil && info.Mode().IsRegular() {
-					size += info.Size()
-				}
-				return nil
-			})
-			result = append(result, orphanInfo{DirName: name, SizeBytes: size, Human: humanBytes(size)})
+		if registered[dirName] {
+			errOut(w, 409, fmt.Sprintf("'%s' is already a registered app", dirName))
+			return
 		}
-		if result == nil {
-			result = []orphanInfo{}
+		insp, err := s.engine.InspectOrphan(dirName)
+		if err != nil {
+			errOut(w, 404, err.Error())
+			return
 		}
-		respond(w, 200, result)
+		respond(w, 200, insp)
 
 	case http.MethodDelete:
 		// DELETE /api/backups-orphans/{dirName}
-		dirName := strings.TrimPrefix(r.URL.Path, "/api/backups-orphans/")
-		dirName = strings.Trim(dirName, "/")
+		dirName := rest
 		if dirName == "" {
 			errOut(w, 400, "dir name required")
 			return
