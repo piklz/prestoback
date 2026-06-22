@@ -35,6 +35,7 @@ type BackupMeta struct {
 	AppID      string     `json:"app_id"`
 	AppName    string     `json:"app_name"`
 	VolumeSlug string     `json:"volume_slug,omitempty"` // "config", "data", "log" etc.
+	SourcePath string     `json:"source_path,omitempty"` // original source directory that was archived
 	StartedAt  time.Time  `json:"started_at"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 	SizeBytes  int64      `json:"size_bytes"`
@@ -261,6 +262,7 @@ func (e *Engine) backupVolumes(appID, appName string, volumes []VolumeTarget, pr
 			AppID:      appID,
 			AppName:    appName,
 			VolumeSlug: vol.Slug,
+			SourcePath: vol.Path, // recorded in manifest for self-describing restore
 			StartedAt:  time.Now(),
 			Status:     StatusRunning,
 			FilePath:   destFile,
@@ -559,6 +561,11 @@ type ManifestEntry struct {
 	SHA256     string `json:"sha256"`
 	Status     Status `json:"status"`
 	Error      string `json:"error,omitempty"`
+	// SourcePath is the absolute path on the source system that was archived.
+	// Stored in every manifest so a restore-to-new-system flow can pre-fill
+	// volume paths exactly as they were, without needing the original config.json.
+	// Example: /home/pi/presto/volumes/plex/Library/Application Support/Plex Media Server/Plug-in Support/Databases
+	SourcePath string `json:"source_path,omitempty"`
 }
 
 // Manifest is the full record for a single backup run (all volumes).
@@ -589,6 +596,7 @@ func (e *Engine) WriteManifest(appID, appName string, metas []BackupMeta, durati
 	for _, meta := range metas {
 		entry := ManifestEntry{
 			VolumeSlug: meta.VolumeSlug,
+			SourcePath: meta.SourcePath,
 			FileName:   filepath.Base(meta.FilePath),
 			SizeBytes:  meta.SizeBytes,
 			Status:     meta.Status,
@@ -637,15 +645,14 @@ func sha256File(path string) (string, error) {
 
 // OrphanInspection summarizes what a backup directory's manifests reveal
 // about the app that used to own it — enough to pre-fill a "recreate this
-// app" form. Live volume paths are deliberately NOT included: those are
-// genuinely specific to wherever the app lives on the new system, and have
-// to come from the person doing the recovery, not guessed.
+// app" form, including the original source paths for each volume.
 type OrphanInspection struct {
-	AppID       string    `json:"app_id"`
-	AppName     string    `json:"app_name"`
-	VolumeSlugs []string  `json:"volume_slugs"`
-	BackupCount int       `json:"backup_count"`
-	LatestRunAt time.Time `json:"latest_run_at"`
+	AppID       string            `json:"app_id"`
+	AppName     string            `json:"app_name"`
+	VolumeSlugs []string          `json:"volume_slugs"`
+	VolumePaths map[string]string `json:"volume_paths"` // slug → last-known source path
+	BackupCount int               `json:"backup_count"`
+	LatestRunAt time.Time         `json:"latest_run_at"`
 }
 
 // InspectOrphan reads every manifest in dirName (oldest to newest) to recover
@@ -679,27 +686,36 @@ func (e *Engine) InspectOrphan(dirName string) (*OrphanInspection, error) {
 
 	slugSeen := map[string]bool{}
 	var slugs []string
+	volumePaths := map[string]string{} // slug → most recent known source path
 	var appName string
 	var latestRunAt time.Time
 	for _, name := range manifestNames {
 		data, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
-			continue // best-effort — one unreadable manifest shouldn't sink the whole inspection
+			continue
 		}
 		var m Manifest
 		if err := json.Unmarshal(data, &m); err != nil {
 			continue
 		}
 		if m.AppName != "" {
-			appName = m.AppName // overwritten each iteration -> ends up as the most recent
+			appName = m.AppName
 		}
 		if m.RunAt.After(latestRunAt) {
 			latestRunAt = m.RunAt
 		}
 		for _, ent := range m.Entries {
-			if ent.VolumeSlug != "" && !slugSeen[ent.VolumeSlug] {
+			if ent.VolumeSlug == "" {
+				continue
+			}
+			if !slugSeen[ent.VolumeSlug] {
 				slugSeen[ent.VolumeSlug] = true
 				slugs = append(slugs, ent.VolumeSlug)
+			}
+			// Always overwrite with the latest-seen path — later manifests
+			// are more up-to-date if paths ever changed between runs.
+			if ent.SourcePath != "" {
+				volumePaths[ent.VolumeSlug] = ent.SourcePath
 			}
 		}
 	}
@@ -710,6 +726,7 @@ func (e *Engine) InspectOrphan(dirName string) (*OrphanInspection, error) {
 		AppID:       dirName,
 		AppName:     appName,
 		VolumeSlugs: slugs,
+		VolumePaths: volumePaths,
 		BackupCount: tarCount,
 		LatestRunAt: latestRunAt,
 	}, nil

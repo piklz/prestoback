@@ -545,7 +545,7 @@ select.fi{cursor:pointer}
       <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">Use the <code>X-API-Key</code> header for scripts and automations. The web UI uses JWT tokens — you only need this for direct API access.</div></div>
       <div class="fg"><label class="fl">Current API Key</label>
         <div class="code-b" id="api-key-display">Loading…
-          <button class="btn btn-g btn-sm copy-btn" onclick="copyKey()" disabled style="opacity:.4;cursor:not-allowed">Copy</button>
+          <button class="btn btn-g btn-sm copy-btn" onclick="copyKey()" style="display:none">Copy</button>
         </div>
       </div>
       <div class="fg"><label class="fl">Use in curl:</label>
@@ -1886,7 +1886,7 @@ S.adoptCtx = null; // { appID, appName, volumeSlugs, pendingImportFile }
 async function openAdoptModal(orphanDirName) {
   try {
     const insp = await api('/api/backups-orphans/'+encodeURIComponent(orphanDirName)+'/inspect');
-    S.adoptCtx = { appID: insp.app_id, appName: insp.app_name, volumeSlugs: insp.volume_slugs, pendingImportFile: null };
+    S.adoptCtx = { appID: insp.app_id, appName: insp.app_name, volumeSlugs: insp.volume_slugs, volumePaths: insp.volume_paths || {}, pendingImportFile: null };
     document.getElementById('adopt-context').textContent =
       `Found ${insp.backup_count} backup${insp.backup_count!==1?'s':''} on disk`
       + (insp.latest_run_at ? `, last run ${new Date(insp.latest_run_at).toLocaleString()}` : '')
@@ -1912,12 +1912,19 @@ function renderAdoptForm() {
   const ctx = S.adoptCtx;
   document.getElementById('adopt-id').value = ctx.appID;
   document.getElementById('adopt-name').value = ctx.appName;
-  document.getElementById('adopt-volumes').innerHTML = ctx.volumeSlugs.map(slug => `
-    <div class="fg">
-      <label class="fl">Live path for volume "${esc(slug)}"</label>
-      <input class="fi adopt-vol-path" data-slug="${esc(slug)}" placeholder="/volumes/...">
-    </div>
-  `).join('');
+  const paths = ctx.volumePaths || {};
+  document.getElementById('adopt-volumes').innerHTML = ctx.volumeSlugs.map(slug => {
+    const known = paths[slug] || '';
+    const hint = known
+      ? `<div class="fh" style="color:var(--green)">✓ Original path recovered from backup manifest — confirm or change if different on this system.</div>`
+      : `<div class="fh" style="color:var(--amber)">Path not found in manifest (older backup or no manifest file) — enter where this volume should live on this system.</div>`;
+    return `
+      <div class="fg">
+        <label class="fl">Live path for volume "<strong>${esc(slug)}</strong>"</label>
+        <input class="fi adopt-vol-path" data-slug="${esc(slug)}" value="${esc(known)}" placeholder="/home/pi/presto/volumes/...">
+        ${hint}
+      </div>`;
+  }).join('');
 }
 
 async function submitAdopt() {
@@ -1986,7 +1993,7 @@ function onImportFileChange() {
   const runBtn = document.getElementById('import-run');
   runBtn.style.display = 'none';
   runBtn.onclick = confirmImport;
-  S.importFile = null; S.importMatchedAppID = null;
+  S.importFile = null; S.importMatchedAppID = null; S.importNewVolumeSlug = null;
   if (!f) { analysis.innerHTML = ''; return; }
 
   if (!f.name.endsWith('.tar.gz')) {
@@ -2002,9 +2009,25 @@ function onImportFileChange() {
   const match = matchKnownApp(parsed.stem);
   if (match) {
     S.importMatchedAppID = match.id;
-    analysis.innerHTML = `<div style="padding:10px 14px;background:var(--gd);border-radius:var(--rs);font-size:12.5px;color:var(--green)">✓ Matches existing app <strong>${esc(match.name)}</strong> (${esc(match.id)}) — click Import to file this backup in.</div>`;
-    runBtn.textContent = 'Import';
-    runBtn.style.display = '';
+    // We know exactly which ID matched, so the rest of the stem (after
+    // "{id}_") is unambiguously the volume slug — no guessing needed here.
+    const volSlug = parsed.stem.slice(match.id.length + 1);
+    const knownSlugs = (match.volumes||[]).map(v => v.slug);
+    if (volSlug && !knownSlugs.includes(volSlug)) {
+      // Matches the app, but it's a volume that app doesn't have registered
+      // yet — importing the file alone would place it on disk fine, but
+      // restore would later fail to find a destination path for it.
+      S.importNewVolumeSlug = volSlug;
+      analysis.innerHTML = `
+        <div style="padding:10px 14px;background:var(--ad);border-radius:var(--rs);font-size:12.5px;color:var(--txt);margin-bottom:10px">Matches existing app <strong>${esc(match.name)}</strong>, but it's a new volume ("${esc(volSlug)}") that app doesn't have yet.</div>
+        <div class="fg"><label class="fl">Live path for volume "${esc(volSlug)}"</label><input class="fi" id="import-new-vol-path" placeholder="/volumes/..."></div>`;
+      runBtn.textContent = 'Add Volume & Import';
+      runBtn.style.display = '';
+    } else {
+      analysis.innerHTML = `<div style="padding:10px 14px;background:var(--gd);border-radius:var(--rs);font-size:12.5px;color:var(--green)">✓ Matches existing app <strong>${esc(match.name)}</strong> (${esc(match.id)}) — click Import to file this backup in.</div>`;
+      runBtn.textContent = 'Import';
+      runBtn.style.display = '';
+    }
   } else {
     const parts = parsed.stem.split('_');
     const guessID = parts[0];
@@ -2021,6 +2044,15 @@ async function confirmImport() {
   const btn = document.getElementById('import-run');
   btn.disabled = true;
   try {
+    if (S.importNewVolumeSlug) {
+      const pathEl = document.getElementById('import-new-vol-path');
+      const path = pathEl ? pathEl.value.trim() : '';
+      if (!path) { toast('Live path required for the new volume', 'error'); btn.disabled = false; return; }
+      await api('/api/apps/'+S.importMatchedAppID+'/volumes', {
+        method:'POST', body: JSON.stringify({ slug: S.importNewVolumeSlug, path, label: S.importNewVolumeSlug, enabled: true })
+      });
+      await loadApps(); // so future imports in this session see it as known
+    }
     await uploadBackupFile(S.importFile, S.importMatchedAppID);
     toast('Backup imported', 'success');
     CM('m-import');
@@ -2108,10 +2140,7 @@ function setApiKeyDisplay(text, copyEnabled) {
   const el = document.getElementById('api-key-display');
   el.childNodes[0].textContent = text;
   const btn = el.querySelector('.copy-btn');
-  btn.disabled = !copyEnabled;
-  btn.style.opacity = copyEnabled ? '' : '.4';
-  btn.style.cursor = copyEnabled ? '' : 'not-allowed';
-  btn.title = copyEnabled ? '' : 'No full key available — regenerate to get a one-time copy';
+  btn.style.display = copyEnabled ? '' : 'none';
 }
 function copyKey() {
   // After JWT login the full key is never in memory — only the masked version.
