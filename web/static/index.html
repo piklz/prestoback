@@ -1451,12 +1451,25 @@ async function openDiscover() {
       updateDiscCaption();
       return;
     }
-    candidates.sort((a,b) => (b.label_hinted - a.label_hinted) || a.name.localeCompare(b.name));
+    const managedApps = candidates.filter(a => a.already_registered);
+
+    // Stable sort: label-hinted first (com.prestoback.backup=true), then alpha
+    newApps.sort((a,b) => (b.label_hinted - a.label_hinted) || a.name.localeCompare(b.name));
+
+    if (!newApps.length && !managedApps.length) {
+      list.innerHTML = '<div style="color:var(--txt2);font-size:13px">No containers found via Docker socket.</div>';
+      updateDiscCaption();
+      return;
+    }
 
     let html = '';
     let gIdx = 0;
 
-    for (const app of candidates) {
+    if (!newApps.length) {
+      html += '<div style="color:var(--txt2);font-size:13px;margin-bottom:16px">No new apps found — all discovered containers are already in PrestoBack.</div>';
+    }
+
+    for (const app of newApps) {
       const gid = 'dg' + (gIdx++);
       const hasSubdirs = Array.isArray(app.sub_dirs) && app.sub_dirs.length > 0;
       const hint = app.label_hinted
@@ -1526,9 +1539,37 @@ async function openDiscover() {
           </label>`).join('')}
         </div>` : ''}
       </div>`;
+    } // end newApps loop
+
+    // ── Already managed section ──────────────────────────────────────────────
+    // Shown collapsed by default — visible so you know discovery found them,
+    // but clearly separated so they don't clutter the actionable list.
+    if (managedApps.length) {
+      html += `
+        <details style="margin-top:12px">
+          <summary style="cursor:pointer;font-size:11px;font-family:var(--mono);color:var(--txt3);letter-spacing:.5px;list-style:none;display:flex;align-items:center;gap:6px;padding:6px 0;user-select:none">
+            <span id="disc-managed-arrow" style="font-size:10px">▶</span>
+            ALREADY IN PRESTOBACK (${managedApps.length})
+          </summary>
+          <div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
+            ${managedApps.map(app => `
+              <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:var(--bg3);border-radius:var(--rs);opacity:.6">
+                <div>
+                  <div style="font-size:13px;font-weight:500;color:var(--txt)">${esc(app.name)}</div>
+                  <div style="font-size:10px;font-family:var(--mono);color:var(--txt3);margin-top:2px">${esc(app.path)}</div>
+                </div>
+                <div style="font-size:11px;color:var(--green);white-space:nowrap;margin-left:12px">✓ ${esc(app.registered_as)}</div>
+              </div>`).join('')}
+          </div>
+        </details>`;
     }
 
     list.innerHTML = html;
+    // Toggle the arrow on the details element open/close
+    list.querySelector('details')?.addEventListener('toggle', e => {
+      const arrow = list.querySelector('#disc-managed-arrow');
+      if (arrow) arrow.textContent = e.target.open ? '▼' : '▶';
+    });
     updateDiscCaption();
 
   } catch(e) { toast(e.message,'error'); list.innerHTML=''; }

@@ -34,9 +34,15 @@ type DiscoveredApp struct {
 	Source        string        `json:"source"`     // "docker" | "volumes_dir"
 	Accessible    bool          `json:"accessible"` // can prestoback actually reach this path?
 	SubDirs       []SubDirInfo  `json:"sub_dirs,omitempty"`
-	RootFiles     bool          `json:"root_files"`             // true if path has files directly inside (not just subdirs)
-	RootSizeBytes int64         `json:"root_size_bytes"`        // size of files directly in the root (not recursive)
-	ComposeDeps   []ComposeLink `json:"compose_deps,omitempty"` // this container's own depends_on, resolved
+	RootFiles     bool          `json:"root_files"`
+	RootSizeBytes int64         `json:"root_size_bytes"`
+	ComposeDeps   []ComposeLink `json:"compose_deps,omitempty"`
+	// AlreadyRegistered is true when this path is already covered by an
+	// existing PrestoBack app — shown greyed in a separate "already managed"
+	// section rather than silently filtered out (so you know discovery found
+	// it, and what it's registered as).
+	AlreadyRegistered bool   `json:"already_registered,omitempty"`
+	RegisteredAs      string `json:"registered_as,omitempty"` // name of the existing app
 }
 
 type dockerContainer struct {
@@ -61,25 +67,21 @@ type dockerContainer struct {
 // so we can translate host paths into container-internal paths.
 // volumesDir is the optional flat-directory mount fallback.
 // alreadyRegistered is a set of paths already in config (filtered out).
-func DiscoverApps(selfName, volumesDir string, alreadyRegistered map[string]bool) []DiscoveredApp {
-	// ── Step 1: learn prestoback's own host→container path mappings ──────────
+func DiscoverApps(selfName, volumesDir string, registeredPaths map[string]string) []DiscoveredApp {
 	hostToContainer := inspectSelfMounts(selfName)
 	log.Printf("[discover] own mounts: %v", hostToContainer)
 
 	var results []DiscoveredApp
 	seen := map[string]bool{}
 
-	// ── Step 2: Docker socket discovery ──────────────────────────────────────
-	dockerResults := discoverFromDocker(selfName, hostToContainer, alreadyRegistered, seen)
+	dockerResults := discoverFromDocker(selfName, hostToContainer, registeredPaths, seen)
 	results = append(results, dockerResults...)
 
-	// ── Step 3: VolumesDir flat scan (fallback) ───────────────────────────────
 	if volumesDir != "" {
-		dirResults := discoverFromDir(volumesDir, alreadyRegistered, seen)
+		dirResults := discoverFromDir(volumesDir, registeredPaths, seen)
 		results = append(results, dirResults...)
 	}
 
-	// ── Step 4: Enrich each result with shallow sub-directory info ────────────
 	for i := range results {
 		if results[i].Accessible && results[i].Path != "" {
 			enrichWithSubDirs(&results[i])
@@ -188,7 +190,7 @@ func translateHostPath(hostPath string, hostToContainer map[string]string) (stri
 	return "", false
 }
 
-func discoverFromDocker(selfName string, hostToContainer map[string]string, alreadyRegistered map[string]bool, seen map[string]bool) []DiscoveredApp {
+func discoverFromDocker(selfName string, hostToContainer map[string]string, registeredPaths map[string]string, seen map[string]bool) []DiscoveredApp {
 	out, err := exec.Command("docker", "ps", "-a", "--format={{.ID}}").Output()
 	if err != nil {
 		log.Printf("[discover] docker ps failed: %v — is Docker socket mounted?", err)
@@ -244,14 +246,17 @@ func discoverFromDocker(selfName string, hostToContainer map[string]string, alre
 				accessible = pathAccessible(explicitPath)
 			}
 			key := containerPath
-			if !alreadyRegistered[key] && !seen[key] {
+			if !seen[key] {
 				seen[key] = true
+				registeredAs := registeredPaths[key]
 				results = append(results, DiscoveredApp{
 					Name: friendlyName, Path: containerPath,
 					ContainerName: name, Image: c.Config.Image,
 					Running: c.State.Running, LabelHinted: true,
 					Source: "docker", Accessible: accessible,
-					ComposeDeps: deps,
+					ComposeDeps:       deps,
+					AlreadyRegistered: registeredAs != "",
+					RegisteredAs:      registeredAs,
 				})
 			}
 			continue
@@ -272,22 +277,25 @@ func discoverFromDocker(selfName string, hostToContainer map[string]string, alre
 				continue
 			}
 
-			if alreadyRegistered[containerPath] || seen[containerPath] {
+			if seen[containerPath] {
 				continue
 			}
 
 			labelBacked := labels["com.prestoback.backup"] == "true"
 			seen[containerPath] = true
+			registeredAs := registeredPaths[containerPath]
 			results = append(results, DiscoveredApp{
-				Name:          friendlyName,
-				Path:          containerPath,
-				ContainerName: name,
-				Image:         c.Config.Image,
-				Running:       c.State.Running,
-				LabelHinted:   labelBacked,
-				Source:        "docker",
-				Accessible:    true,
-				ComposeDeps:   deps,
+				Name:              friendlyName,
+				Path:              containerPath,
+				ContainerName:     name,
+				Image:             c.Config.Image,
+				Running:           c.State.Running,
+				LabelHinted:       labelBacked,
+				Source:            "docker",
+				Accessible:        true,
+				ComposeDeps:       deps,
+				AlreadyRegistered: registeredAs != "",
+				RegisteredAs:      registeredAs,
 			})
 		}
 	}
@@ -298,7 +306,7 @@ var skipDirNames = map[string]bool{
 	"lost+found": true,
 }
 
-func discoverFromDir(dir string, alreadyRegistered map[string]bool, seen map[string]bool) []DiscoveredApp {
+func discoverFromDir(dir string, registeredPaths map[string]string, seen map[string]bool) []DiscoveredApp {
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
 		return nil
@@ -316,7 +324,7 @@ func discoverFromDir(dir string, alreadyRegistered map[string]bool, seen map[str
 			continue
 		}
 		path := filepath.Join(dir, e.Name())
-		if alreadyRegistered[path] || seen[path] {
+		if seen[path] {
 			continue
 		}
 		childFound := false
@@ -330,12 +338,15 @@ func discoverFromDir(dir string, alreadyRegistered map[string]bool, seen map[str
 			continue
 		}
 		seen[path] = true
+		registeredAs := registeredPaths[path]
 		results = append(results, DiscoveredApp{
-			Name:       e.Name(),
-			Path:       path,
-			Source:     "volumes_dir",
-			Accessible: true,
-			Running:    true,
+			Name:              e.Name(),
+			Path:              path,
+			Source:            "volumes_dir",
+			Accessible:        true,
+			Running:           true,
+			AlreadyRegistered: registeredAs != "",
+			RegisteredAs:      registeredAs,
 		})
 	}
 	return results

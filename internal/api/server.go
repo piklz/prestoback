@@ -335,13 +335,14 @@ func (s *Server) handleSuggestExcludes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
-	alreadyRegistered := map[string]bool{}
+	// path → registered app name (empty string = not registered)
+	registeredPaths := map[string]string{}
 	for _, a := range s.cfg.ListApps() {
 		for _, v := range a.Volumes {
-			alreadyRegistered[v.Path] = true
+			registeredPaths[v.Path] = a.Name
 		}
 	}
-	candidates := backup.DiscoverApps(s.selfName, s.cfg.VolumesDir, alreadyRegistered)
+	candidates := backup.DiscoverApps(s.selfName, s.cfg.VolumesDir, registeredPaths)
 	if candidates == nil {
 		candidates = []backup.DiscoveredApp{}
 	}
