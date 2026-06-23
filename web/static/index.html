@@ -1485,7 +1485,7 @@ async function openDiscover() {
 
       discGroups.push({ gid, app });
 
-      html += `<div class="disc-group" data-gid="${gid}" style="border-bottom:1px solid var(--line);padding:10px 0">
+      html += `<div class="disc-group" data-gid="${gid}" style="border-bottom:1px solid var(--line);padding:12px 0">
         <div class="disc-group-head" style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px">
           <div style="min-width:0">
             <div style="font-weight:600;display:flex;align-items:center;flex-wrap:wrap;gap:4px">
@@ -1495,44 +1495,43 @@ async function openDiscover() {
             <div style="margin-top:2px">${srcMeta}</div>
             ${depsNote}
           </div>
-          ${hasSubdirs ? `<div style="display:flex;border:1px solid var(--line2);border-radius:7px;overflow:hidden;flex-shrink:0">
-            <button type="button" class="disc-mode-btn disc-mode-whole active" data-gid="${gid}"
-              onclick="discSetMode('${gid}','whole')"
-              style="padding:5px 10px;font-size:11px;font-family:var(--body);border:none;cursor:pointer;background:var(--accent);color:#fff">Whole folder</button>
-            <button type="button" class="disc-mode-btn disc-mode-granular" data-gid="${gid}"
-              onclick="discSetMode('${gid}','granular')"
-              style="padding:5px 10px;font-size:11px;font-family:var(--body);border:none;cursor:pointer;background:transparent;color:var(--txt2)">Choose items</button>
-          </div>` : ''}
         </div>
 
-        <div class="disc-whole-row" data-gid="${gid}" style="margin-top:8px">
+        <!-- Primary option: whole folder, checked by default -->
+        <div class="disc-whole-row" data-gid="${gid}" style="margin-top:10px">
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
             <input type="checkbox" class="disc-whole-chk" data-gid="${gid}"
-              ${app.label_hinted ? 'checked' : ''} onchange="updateDiscCaption()"
+              checked onchange="onDiscWholeChkChange('${gid}')"
               style="accent-color:var(--accent);width:15px;height:15px;flex-shrink:0">
-            <span style="font-size:12px;color:var(--txt2)">Import entire folder as one app</span>
+            <span style="font-size:13px;color:var(--txt)">Backup entire folder</span>
             ${wholeTotalStr ? `<span style="font-family:var(--mono);font-size:11px;color:var(--txt3);margin-left:auto">~${wholeTotalStr}</span>` : ''}
           </label>
         </div>
 
-        ${hasSubdirs ? `<div class="disc-granular-box hidden" data-gid="${gid}" style="margin-top:8px;padding-left:23px">
-          ${app.root_files ? `<label style="display:flex;align-items:center;gap:8px;padding:5px 0;border-top:1px solid var(--line);cursor:pointer">
-            <input type="checkbox" class="disc-item-chk" data-gid="${gid}" data-kind="root"
-              data-name="${esc(app.name + ' (root)')}" data-path="${esc(app.path)}"
-              onchange="updateDiscCaption()"
-              style="accent-color:var(--accent);width:13px;height:13px;flex-shrink:0">
-            <span style="font-size:12px;font-weight:500;color:var(--txt2)">— Root files only</span>
-            <span style="font-family:var(--mono);font-size:10px;color:var(--txt3);margin-left:auto">${esc(app.root_size_bytes ? discFmtBytes(app.root_size_bytes) : '')}</span>
-          </label>` : ''}
-          ${app.sub_dirs.map(sd => `<label style="display:flex;align-items:center;gap:8px;padding:5px 0;border-top:1px solid var(--line);cursor:pointer">
-            <input type="checkbox" class="disc-item-chk" data-gid="${gid}" data-kind="subdir"
-              data-name="${esc(app.name + ' (' + sd.name + ')')}" data-path="${esc(sd.path)}"
-              onchange="updateDiscCaption()"
-              style="accent-color:var(--accent);width:13px;height:13px;flex-shrink:0">
-            <span style="font-size:12px;font-weight:500;color:var(--txt2)">— ${esc(sd.name)}</span>
-            <span style="font-family:var(--mono);font-size:10px;color:var(--txt3);margin-left:auto">${esc(sd.human || discFmtBytes(sd.size_bytes))}</span>
-          </label>`).join('')}
-        </div>` : ''}
+        <!-- Granular picker: collapsed by default, expands below the main option -->
+        ${hasSubdirs ? `<details class="disc-granular-details" data-gid="${gid}" style="margin-top:6px;padding-left:23px">
+          <summary style="cursor:pointer;font-size:11px;font-family:var(--mono);color:var(--txt3);letter-spacing:.3px;list-style:none;user-select:none;padding:4px 0">
+            ▶ Or choose specific sub-folders instead
+          </summary>
+          <div class="disc-granular-box" data-gid="${gid}" style="margin-top:6px">
+            ${app.root_files ? `<label style="display:flex;align-items:center;gap:8px;padding:5px 0;border-top:1px solid var(--line);cursor:pointer">
+              <input type="checkbox" class="disc-item-chk" data-gid="${gid}" data-kind="root"
+                data-name="${esc(app.name + ' (root)')}" data-path="${esc(app.path)}"
+                onchange="onDiscItemChkChange('${gid}')"
+                style="accent-color:var(--accent);width:13px;height:13px;flex-shrink:0">
+              <span style="font-size:12px;color:var(--txt2)">Root files only</span>
+              <span style="font-family:var(--mono);font-size:10px;color:var(--txt3);margin-left:auto">${esc(app.root_size_bytes ? discFmtBytes(app.root_size_bytes) : '')}</span>
+            </label>` : ''}
+            ${app.sub_dirs.map(sd => `<label style="display:flex;align-items:center;gap:8px;padding:5px 0;border-top:1px solid var(--line);cursor:pointer">
+              <input type="checkbox" class="disc-item-chk" data-gid="${gid}" data-kind="subdir"
+                data-name="${esc(app.name + ' (' + sd.name + ')')}" data-path="${esc(sd.path)}"
+                onchange="onDiscItemChkChange('${gid}')"
+                style="accent-color:var(--accent);width:13px;height:13px;flex-shrink:0">
+              <span style="font-size:12px;color:var(--txt2)">${esc(sd.name)}</span>
+              <span style="font-family:var(--mono);font-size:10px;color:var(--txt3);margin-left:auto">${esc(sd.human || discFmtBytes(sd.size_bytes))}</span>
+            </label>`).join('')}
+          </div>
+        </details>` : ''}
       </div>`;
     } // end newApps loop
 
@@ -1570,29 +1569,35 @@ async function openDiscover() {
   } catch(e) { toast(e.message,'error'); list.innerHTML=''; }
 }
 
-// discIsGranular reads the DOM directly to find out which mode a group is in —
-// there's no separate JS-side mode flag to keep in sync with the visible UI.
-function discIsGranular(gid) {
-  const box = document.querySelector(`.disc-granular-box[data-gid="${gid}"]`);
-  return !!box && !box.classList.contains('hidden');
+// When the whole-folder checkbox changes — uncheck any granular items
+// so the two selections can't overlap
+function onDiscWholeChkChange(gid) {
+  const wholeChk = document.querySelector(`.disc-whole-chk[data-gid="${gid}"]`);
+  if (wholeChk && wholeChk.checked) {
+    document.querySelectorAll(`.disc-item-chk[data-gid="${gid}"]`).forEach(c => { c.checked = false; });
+    // collapse the details if it's open to reinforce "you've chosen whole"
+    const det = document.querySelector(`.disc-granular-details[data-gid="${gid}"]`);
+    if (det) det.open = false;
+  }
+  updateDiscCaption();
 }
 
-// discSetMode toggles a group between "whole folder" and "choose items" modes.
-function discSetMode(gid, mode) {
-  document.querySelectorAll(`.disc-mode-btn[data-gid="${gid}"]`).forEach(btn => {
-    const isActive = (mode === 'whole' && btn.classList.contains('disc-mode-whole')) ||
-                      (mode === 'granular' && btn.classList.contains('disc-mode-granular'));
-    btn.classList.toggle('active', isActive);
-    btn.style.background = isActive ? 'var(--accent)' : 'transparent';
-    btn.style.color = isActive ? '#fff' : 'var(--txt2)';
-  });
-
-  const wholeRow = document.querySelector(`.disc-whole-row[data-gid="${gid}"]`);
-  const granularBox = document.querySelector(`.disc-granular-box[data-gid="${gid}"]`);
-  if (wholeRow) wholeRow.classList.toggle('hidden', mode !== 'whole');
-  if (granularBox) granularBox.classList.toggle('hidden', mode !== 'granular');
-
+// When a granular item changes — uncheck whole-folder so they don't conflict
+function onDiscItemChkChange(gid) {
+  const anyChecked = [...document.querySelectorAll(`.disc-item-chk[data-gid="${gid}"]`)].some(c => c.checked);
+  if (anyChecked) {
+    const wholeChk = document.querySelector(`.disc-whole-chk[data-gid="${gid}"]`);
+    if (wholeChk) wholeChk.checked = false;
+  }
   updateDiscCaption();
+}
+
+// discIsGranular: read from the DOM which mode is active for a group.
+// Granular mode = at least one item-checkbox is visible (details open) AND checked.
+function discIsGranular(gid) {
+  const det = document.querySelector(`.disc-granular-details[data-gid="${gid}"]`);
+  if (!det || !det.open) return false;
+  return [...document.querySelectorAll(`.disc-item-chk[data-gid="${gid}"]`)].some(c => c.checked);
 }
 
 // updateDiscCaption recomputes the live "N items selected · ~size" status line

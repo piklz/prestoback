@@ -245,6 +245,11 @@ func discoverFromDocker(selfName string, hostToContainer map[string]string, regi
 				containerPath = explicitPath
 				accessible = pathAccessible(explicitPath)
 			}
+			// Reject file paths — must be a directory to be a valid backup target
+			if info, err := os.Stat(containerPath); err != nil || !info.IsDir() {
+				log.Printf("[discover] skipping label path %s for %s — not a directory", explicitPath, name)
+				continue
+			}
 			key := containerPath
 			if !seen[key] {
 				seen[key] = true
@@ -274,6 +279,14 @@ func discoverFromDocker(selfName string, hostToContainer map[string]string, regi
 			containerPath, accessible := translateHostPath(hostPath, hostToContainer)
 			if !accessible {
 				log.Printf("[discover] skipping %s bind %s — not accessible inside prestoback", name, hostPath)
+				continue
+			}
+
+			// Skip file bind mounts — only directories are meaningful backup
+			// targets. File mounts (Caddyfile, config.yml, etc.) are common in
+			// compose files but produce broken single-file "apps" if imported.
+			if info, err := os.Stat(containerPath); err != nil || !info.IsDir() {
+				log.Printf("[discover] skipping %s bind %s — not a directory", name, hostPath)
 				continue
 			}
 
