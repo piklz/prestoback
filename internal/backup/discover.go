@@ -79,6 +79,33 @@ func DiscoverApps(selfName, volumesDir string, registeredPaths map[string]string
 
 	if volumesDir != "" {
 		dirResults := discoverFromDir(volumesDir, registeredPaths, seen)
+		// Reconcile: if the volumes_dir scan surfaced a parent path that
+		// supersedes one or more Docker-found child paths (because the parent
+		// has extra content Docker didn't cover), remove the child entries.
+		// This prevents the confusing "two Caddy entries" situation where
+		// /volumes/caddy (parent, complete) and /volumes/caddy/caddy_data
+		// (child, partial) both appear as separate importable options.
+		if len(dirResults) > 0 {
+			superseded := map[string]bool{}
+			for _, dr := range dirResults {
+				for _, doc := range results {
+					// A Docker result is superseded if the new volumes_dir
+					// result is its direct parent directory.
+					if filepath.Dir(doc.Path) == dr.Path {
+						superseded[doc.Path] = true
+					}
+				}
+			}
+			if len(superseded) > 0 {
+				filtered := results[:0]
+				for _, r := range results {
+					if !superseded[r.Path] {
+						filtered = append(filtered, r)
+					}
+				}
+				results = filtered
+			}
+		}
 		results = append(results, dirResults...)
 	}
 
@@ -341,27 +368,22 @@ func discoverFromDir(dir string, registeredPaths map[string]string, seen map[str
 			continue
 		}
 
-		// Check whether any already-seen (Docker-discovered) path is a child
-		// of this directory — which would mean Docker found a specific sub-mount
-		// (e.g. /volumes/caddy/caddy_data) before the volumes_dir scan gets here.
-		// BUT: only skip the parent if Docker's bind mounts account for ALL of
-		// the parent's content. If the parent has additional files or directories
-		// not covered by Docker (e.g. a Caddyfile alongside caddy_data), the
-		// parent is the correct app root and should be offered instead.
 		childFound := false
 		hasExtraContent := false
+		var childPaths []string
 		if subEntries, readErr := os.ReadDir(path); readErr == nil {
 			for _, sub := range subEntries {
 				childPath := filepath.Join(path, sub.Name())
 				if seen[childPath] {
 					childFound = true
+					childPaths = append(childPaths, childPath)
 				} else {
 					hasExtraContent = true
 				}
 			}
 		}
 		if childFound && !hasExtraContent {
-			// Docker already covers everything inside — no need to offer the parent.
+			// Docker already covers everything inside — the parent adds nothing.
 			continue
 		}
 
