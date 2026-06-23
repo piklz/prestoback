@@ -761,7 +761,13 @@ select.fi{cursor:pointer}
     <div class="mh"><div class="mt">Discover Apps</div><button class="btn btn-g btn-ic" onclick="CM('m-discover')">✕</button></div>
     <div class="mb">
       <div style="font-size:13px;color:var(--txt2);margin-bottom:6px">Running containers and their data directories, discovered via Docker socket.</div>
-      <div style="font-size:11px;color:var(--txt3);margin-bottom:14px;font-family:var(--mono)">Tip: add label <span style="color:var(--accent)">com.prestoback.backup=true</span> to your compose services to highlight them here.</div>
+      <div style="font-size:11px;color:var(--txt3);margin-bottom:10px;font-family:var(--mono)">Tip: add label <span style="color:var(--accent)">com.prestoback.backup=true</span> to your compose services to highlight them here.</div>
+      <div id="disc-toolbar" style="display:none;align-items:center;gap:6px;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--line)">
+        <span style="font-size:11px;color:var(--txt3);font-family:var(--mono);margin-right:4px">SELECT:</span>
+        <button class="btn btn-g btn-sm" onclick="discSelectAll()">All</button>
+        <button class="btn btn-g btn-sm" onclick="discSelectNone()">None</button>
+        <button class="btn btn-g btn-sm" onclick="discInvert()">Invert</button>
+      </div>
       <div id="disc-list"></div>
     </div>
     <div class="mf" style="display:flex;align-items:center;justify-content:space-between;gap:12px">
@@ -1501,7 +1507,7 @@ async function openDiscover() {
         <div class="disc-whole-row" data-gid="${gid}" style="margin-top:10px">
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
             <input type="checkbox" class="disc-whole-chk" data-gid="${gid}"
-              checked onchange="onDiscWholeChkChange('${gid}')"
+              onchange="onDiscWholeChkChange('${gid}')"
               style="accent-color:var(--accent);width:15px;height:15px;flex-shrink:0">
             <span style="font-size:13px;color:var(--txt)">Backup entire folder</span>
             ${wholeTotalStr ? `<span style="font-family:var(--mono);font-size:11px;color:var(--txt3);margin-left:auto">~${wholeTotalStr}</span>` : ''}
@@ -1559,6 +1565,8 @@ async function openDiscover() {
     }
 
     list.innerHTML = html;
+    // Show the selection toolbar only when there are actionable new apps
+    document.getElementById('disc-toolbar').style.display = newApps.length ? 'flex' : 'none';
     // Toggle the arrow on the details element open/close
     list.querySelector('details')?.addEventListener('toggle', e => {
       const arrow = list.querySelector('#disc-managed-arrow');
@@ -1598,6 +1606,29 @@ function discIsGranular(gid) {
   const det = document.querySelector(`.disc-granular-details[data-gid="${gid}"]`);
   if (!det || !det.open) return false;
   return [...document.querySelectorAll(`.disc-item-chk[data-gid="${gid}"]`)].some(c => c.checked);
+}
+
+// ── Discover selection toolbar ────────────────────────────────────────────────
+function discSelectAll() {
+  document.querySelectorAll('.disc-whole-chk').forEach(chk => {
+    chk.checked = true;
+    onDiscWholeChkChange(chk.dataset.gid);
+  });
+}
+function discSelectNone() {
+  document.querySelectorAll('.disc-whole-chk, .disc-item-chk').forEach(chk => { chk.checked = false; });
+  updateDiscCaption();
+}
+function discInvert() {
+  // Invert the whole-folder checkboxes — the primary selection surface
+  document.querySelectorAll('.disc-whole-chk').forEach(chk => {
+    chk.checked = !chk.checked;
+    // If we unchecked a whole-folder box, also clear any open granular items
+    if (!chk.checked) {
+      document.querySelectorAll(`.disc-item-chk[data-gid="${chk.dataset.gid}"]`).forEach(c => { c.checked = false; });
+    }
+  });
+  updateDiscCaption();
 }
 
 // updateDiscCaption recomputes the live "N items selected · ~size" status line

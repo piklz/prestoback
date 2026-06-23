@@ -340,16 +340,31 @@ func discoverFromDir(dir string, registeredPaths map[string]string, seen map[str
 		if seen[path] {
 			continue
 		}
+
+		// Check whether any already-seen (Docker-discovered) path is a child
+		// of this directory — which would mean Docker found a specific sub-mount
+		// (e.g. /volumes/caddy/caddy_data) before the volumes_dir scan gets here.
+		// BUT: only skip the parent if Docker's bind mounts account for ALL of
+		// the parent's content. If the parent has additional files or directories
+		// not covered by Docker (e.g. a Caddyfile alongside caddy_data), the
+		// parent is the correct app root and should be offered instead.
 		childFound := false
-		for seenPath := range seen {
-			if strings.HasPrefix(seenPath, path+"/") {
-				childFound = true
-				break
+		hasExtraContent := false
+		if subEntries, readErr := os.ReadDir(path); readErr == nil {
+			for _, sub := range subEntries {
+				childPath := filepath.Join(path, sub.Name())
+				if seen[childPath] {
+					childFound = true
+				} else {
+					hasExtraContent = true
+				}
 			}
 		}
-		if childFound {
+		if childFound && !hasExtraContent {
+			// Docker already covers everything inside — no need to offer the parent.
 			continue
 		}
+
 		seen[path] = true
 		registeredAs := registeredPaths[path]
 		results = append(results, DiscoveredApp{

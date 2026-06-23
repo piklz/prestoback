@@ -905,18 +905,64 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, ba
 	// backupID format: {appID}_{volumeSlug}_{timestamp}[_prerestore]
 	volumeSlug := volumeSlugFromBackupID(appID, backupID)
 	destPath := ""
+
+	// Pass 1: exact slug match
 	for _, v := range app.Volumes {
 		if v.Slug == volumeSlug {
 			destPath = v.Path
 			break
 		}
 	}
+
+	// Pass 2: if no exact slug match (common after adopt-at-parent-path where
+	// the registered slug is "caddy" but the archive slug is "caddy_data"),
+	// read the manifest to get the original source_path and use that instead —
+	// the user told us where they want things to go during adopt, so
+	// we pick the volume whose registered path is the best parent match for
+	// the manifest's source_path.
 	if destPath == "" {
-		// Fallback: if we can't identify the volume, let the caller supply ?path=
+		manifestPath := filepath.Join(s.cfg.BackupDir(), appID, backupID+"_manifest.json")
+		if manifestData, err := os.ReadFile(manifestPath); err == nil {
+			var mf backup.Manifest
+			if err := json.Unmarshal(manifestData, &mf); err == nil {
+				for _, ent := range mf.Entries {
+					if ent.VolumeSlug == volumeSlug && ent.SourcePath != "" {
+						// Find the registered volume whose path is the best
+						// match — either an exact match, or is a parent of the
+						// original source path (e.g. registered=/volumes/caddy,
+						// source=/volumes/caddy/caddy_data → use /volumes/caddy).
+						bestLen := -1
+						for _, v := range app.Volumes {
+							vClean := filepath.Clean(v.Path)
+							sClean := filepath.Clean(ent.SourcePath)
+							if vClean == sClean || strings.HasPrefix(sClean, vClean+"/") {
+								if len(vClean) > bestLen {
+									bestLen = len(vClean)
+									destPath = v.Path
+								}
+							}
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Pass 3: single-volume app — just use the one registered path regardless
+	// of slug. Handles the case where slug naming drifted from what was archived
+	// (e.g. app renamed, or parent-path adoption changed the derived slug).
+	if destPath == "" && len(app.Volumes) == 1 {
+		destPath = app.Volumes[0].Path
+		log.Printf("[restore] slug %q not matched, using single-volume fallback path %s", volumeSlug, destPath)
+	}
+
+	if destPath == "" {
+		// Last resort: let the caller supply ?path=
 		destPath = r.URL.Query().Get("path")
 		if destPath == "" {
 			errOut(w, 400, fmt.Sprintf(
-				"cannot determine restore path for volume slug '%s' — volume not found in app config. Add ?path=/volumes/... to override",
+				"cannot determine restore path for volume slug %q — no matching volume in app config, and no manifest source_path available. Add ?path=/volumes/... to override",
 				volumeSlug))
 			return
 		}
