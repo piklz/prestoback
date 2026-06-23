@@ -1451,16 +1451,11 @@ async function openDiscover() {
       updateDiscCaption();
       return;
     }
+    const newApps = candidates.filter(a => !a.already_registered);
     const managedApps = candidates.filter(a => a.already_registered);
 
     // Stable sort: label-hinted first (com.prestoback.backup=true), then alpha
     newApps.sort((a,b) => (b.label_hinted - a.label_hinted) || a.name.localeCompare(b.name));
-
-    if (!newApps.length && !managedApps.length) {
-      list.innerHTML = '<div style="color:var(--txt2);font-size:13px">No containers found via Docker socket.</div>';
-      updateDiscCaption();
-      return;
-    }
 
     let html = '';
     let gIdx = 0;
