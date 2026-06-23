@@ -450,9 +450,13 @@ func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 			errOut(w, 400, "name is required")
 			return
 		}
+		// Derive ID early so slug derivation can avoid a collision with it
+		if a.ID == "" {
+			a.ID = sanitizeID(a.Name)
+		}
 		// Legacy single-path promotion
 		if len(a.Volumes) == 0 && a.Path != "" {
-			slug := slugFromPath(a.Path)
+			slug := slugFromPathForID(a.Path, a.ID)
 			a.Volumes = []config.VolumeConfig{{
 				Slug:     slug,
 				Path:     a.Path,
@@ -466,9 +470,6 @@ func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 		if len(a.Volumes) == 0 {
 			errOut(w, 400, "at least one volume is required")
 			return
-		}
-		if a.ID == "" {
-			a.ID = sanitizeID(a.Name)
 		}
 		for _, v := range a.Volumes {
 			if dupID, dupName, found := s.cfg.PathInUse(v.Path, a.ID); found {
@@ -546,7 +547,7 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 		a.ID = appID
 		// Legacy single-path promotion on PUT too
 		if len(a.Volumes) == 0 && a.Path != "" {
-			slug := slugFromPath(a.Path)
+			slug := slugFromPathForID(a.Path, a.ID)
 			a.Volumes = []config.VolumeConfig{{
 				Slug:     slug,
 				Path:     a.Path,
@@ -1574,6 +1575,10 @@ func sanitizeID(name string) string {
 
 // slugFromPath mirrors the config package helper (avoids import cycle).
 func slugFromPath(p string) string {
+	return slugFromPathForID(p, "")
+}
+
+func slugFromPathForID(p, appID string) string {
 	base := filepath.Base(filepath.Clean(p))
 	var b strings.Builder
 	for _, r := range strings.ToLower(base) {
@@ -1584,8 +1589,8 @@ func slugFromPath(p string) string {
 		}
 	}
 	s := strings.Trim(b.String(), "_")
-	if s == "" {
-		return "vol"
+	if s == "" || (appID != "" && s == appID) {
+		return "data"
 	}
 	return s
 }

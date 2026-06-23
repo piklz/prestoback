@@ -335,7 +335,7 @@ func (c *Config) AddApp(a AppConfig) error {
 	// Normalise volumes
 	for i := range a.Volumes {
 		if a.Volumes[i].Slug == "" {
-			a.Volumes[i].Slug = slugFromPath(a.Volumes[i].Path)
+			a.Volumes[i].Slug = slugFromPathFor(a.Volumes[i].Path, a.ID)
 		}
 		if a.Volumes[i].Label == "" {
 			a.Volumes[i].Label = a.Volumes[i].Slug
@@ -371,7 +371,7 @@ func (c *Config) UpdateApp(a AppConfig) error {
 	// Normalise volumes
 	for i := range a.Volumes {
 		if a.Volumes[i].Slug == "" {
-			a.Volumes[i].Slug = slugFromPath(a.Volumes[i].Path)
+			a.Volumes[i].Slug = slugFromPathFor(a.Volumes[i].Path, a.ID)
 		}
 		if a.Volumes[i].Label == "" {
 			a.Volumes[i].Label = a.Volumes[i].Slug
@@ -427,9 +427,17 @@ func generateKey() string {
 // slugFromPath derives a short identifier from the last component of a path.
 // "/volumes/mosquitto/config" → "config"
 // "/volumes/homepage"         → "homepage"
+// slugFromPath derives a short identifier from the last path component.
+// appID is provided so we can avoid producing a slug identical to it —
+// that causes archive names like "caddy_caddy_..." which is confusing.
+// When the path tail matches the app ID, we use "data" instead, which
+// is the conventional name for an app's primary data volume.
 func slugFromPath(p string) string {
+	return slugFromPathFor(p, "")
+}
+
+func slugFromPathFor(p, appID string) string {
 	base := filepath.Base(filepath.Clean(p))
-	// Replace non-alphanumeric (except dash) with underscore, lowercase
 	var b strings.Builder
 	for _, r := range strings.ToLower(base) {
 		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
@@ -439,8 +447,8 @@ func slugFromPath(p string) string {
 		}
 	}
 	s := strings.Trim(b.String(), "_")
-	if s == "" {
-		return "vol"
+	if s == "" || (appID != "" && s == appID) {
+		return "data"
 	}
 	return s
 }
