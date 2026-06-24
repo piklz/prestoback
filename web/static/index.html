@@ -724,8 +724,10 @@ select.fi{cursor:pointer}
       </div>
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
         <div class="divlbl">Pre-backup command <span style="color:var(--txt3);font-weight:400;font-size:11px">(optional — runs before container stops)</span></div>
-        <input class="fi" id="ea-prebakcmd" placeholder="docker exec homebox sqlite3 /data/homebox.db '.backup /data/homebox.db.bak'" style="font-family:var(--mono);font-size:11.5px">
-        <div class="fh">Runs via <code>sh -c</code> while the container is still up, before it's stopped or paused. Use this for database dumps (pg_dump, sqlite3 .backup, mysqldump) so the archive includes a clean, consistent snapshot even if the raw DB files look partial on disk. Output streams to the activity log. Failures are logged but don't abort the backup.</div>
+        <input class="fi" id="ea-prebakcmd" placeholder="docker exec myapp sqlite3 /data/app.db '.backup /data/app.db.bak'" style="font-family:var(--mono);font-size:11.5px">
+        <div id="ea-prebakcmd-hint" class="fh" style="margin-top:6px"></div>
+        <input type="hidden" id="ea-postrestorehint">
+        <div class="fh">Runs via <code>sh -c</code> while the container is still up, before it's stopped. Use for database dumps (sqlite3, pg_dump, mysqldump) running <em>inside</em> the target container — no extra tools needed on your Pi. Output streams to the activity log. Failures are logged but don't abort the backup.</div>
       </div>
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
         <div class="divlbl">Exclude patterns <span style="color:var(--txt3);font-weight:400;font-size:11px">(one per line — dirs: Cache/, globs: *.log)</span></div>
@@ -823,6 +825,7 @@ select.fi{cursor:pointer}
       </div>
       <div style="margin-top:14px;padding:10px 14px;background:var(--bg3);border-radius:var(--rs)"><div style="font-size:10px;color:var(--txt3);font-family:var(--mono);margin-bottom:4px">RESTORING ARCHIVE</div><div style="font-family:var(--mono);font-size:12px;color:var(--txt)" id="rs-id">—</div></div>
       <div id="rs-size-warn" style="margin-top:10px;font-size:12px"></div>
+      <div id="rs-postrestore-hint"></div>
     </div>
     <div class="mf"><button class="btn btn-g" onclick="CM('m-rs')">Cancel</button><button class="btn btn-d" id="rs-run" onclick="runRestore()">↺ Restore Now</button></div>
   </div>
@@ -1316,16 +1319,33 @@ function openEditApp(id) {
   S.editPinOn=a.pinned||false; setTog('edit-pin-tog',S.editPinOn);
   document.getElementById('ea-excludes').value=(a.excludes||[]).join('\n');
   document.getElementById('ea-prebakcmd').value=a.pre_backup_cmd||'';
+  document.getElementById('ea-postrestorehint').value=a.post_restore_hint||'';
   loadLinkedContainers(a);
-  // Fetch suggested excludes for this app's image (best-effort)
+  // Fetch suggested excludes AND pre-backup cmd for this app's image (best-effort)
   const hint = document.getElementById('ea-suggest-hint');
+  const preHint = document.getElementById('ea-prebakcmd-hint');
   hint.textContent = '';
+  if (preHint) preHint.innerHTML = '';
   if (a.image) {
-    api('/api/suggest-excludes?image='+encodeURIComponent(a.image)).then(r => {
+    const params = new URLSearchParams({image: a.image});
+    if (a.container_name) params.set('container', a.container_name);
+    api('/api/suggest-excludes?'+params.toString()).then(r => {
       if (r.patterns && r.patterns.length) {
         hint.innerHTML = '💡 Suggested for '+esc(a.image.split('/').pop())+': ' +
           r.patterns.map(p=>`<code style="background:var(--bg3);padding:1px 5px;border-radius:3px">${esc(p)}</code>`).join(' ') +
           ` <a href="#" onclick="document.getElementById('ea-excludes').value=${JSON.stringify(r.patterns.join('\n'))};return false" style="color:var(--accent)">apply</a>`;
+      }
+      if (r.pre_backup_cmd && !gv('ea-prebakcmd')) {
+        // Only suggest if the field is currently empty — respect what user already set
+        const sug = r.pre_backup_cmd;
+        if (preHint) preHint.innerHTML =
+          `💡 <strong>Optional DB dump detected</strong> — runs inside the container (no extra tools needed on Pi):<br>` +
+          `<code style="display:block;background:var(--bg3);padding:6px 8px;border-radius:4px;font-size:11px;margin:5px 0;word-break:break-all">${esc(sug.cmd)}</code>` +
+          `<span style="color:var(--txt3);font-size:11px">${esc(sug.doc_note)}</span><br>` +
+          `<a href="#" onclick="document.getElementById('ea-prebakcmd').value=${JSON.stringify(sug.cmd)};` +
+          `document.getElementById('ea-postrestorehint').value=${JSON.stringify(sug.post_restore_hint)};` +
+          `this.closest('[style*=hint]')||this.parentElement.style.setProperty('display','none');return false" ` +
+          `style="color:var(--accent);font-size:12px">Apply this suggestion</a>`;
       }
     }).catch(()=>{});
   }
@@ -1338,6 +1358,7 @@ async function submitEditApp() {
     .split('\n').map(s=>s.trim()).filter(Boolean);
   const linkedContainers = [...document.querySelectorAll('.ea-linked-chk:checked')].map(el => el.value);
   const preCmd = gv('ea-prebakcmd').trim();
+  const postRestoreHint = (document.getElementById('ea-postrestorehint').value||'').trim();
   const a = {
     ...S.editApp,
     name:gv('ea-name'), path:gv('ea-path'),
@@ -1345,6 +1366,7 @@ async function submitEditApp() {
     pinned:S.editPinOn,
     container_strategy:gv('ea-strategy'),
     pre_backup_cmd: preCmd||undefined,
+    post_restore_hint: postRestoreHint||undefined,
     linked_containers: linkedContainers,
     schedule:{enabled:S.editSchedOn, cron_expr:gv('ea-cron')},
     excludes: excludesRaw,
@@ -1781,15 +1803,27 @@ function openRsModal(appID,backupID) {
   document.getElementById('rs-run').disabled=false;
   const warn = document.getElementById('rs-size-warn');
   warn.innerHTML='';
+
+  // Show post-restore hint if this app uses a pre-backup dump command
+  const app = S.apps.find(a=>a.id===appID);
+  const hintEl = document.getElementById('rs-postrestore-hint');
+  if (hintEl) {
+    if (app?.post_restore_hint) {
+      hintEl.innerHTML = `<div style="margin-top:12px;padding:10px 14px;background:var(--bld);border:1px solid rgba(79,156,249,.2);border-radius:var(--rs);font-size:12px">
+        <div style="font-weight:500;color:var(--accent);margin-bottom:4px">📦 This app uses a pre-backup dump</div>
+        <div style="color:var(--txt2)">${esc(app.post_restore_hint)}</div>
+      </div>`;
+    } else {
+      hintEl.innerHTML = '';
+    }
+  }
+
   OM('m-rs');
 
   // Restore isn't just "extract the archive" — RestoreVolume first takes a
   // pre-restore safety snapshot of the CURRENT live volume (same compress
   // cost as a normal backup), THEN extracts the chosen archive on top of it.
-  // Both happen while the container is stopped, so the real downtime is
-  // closer to (compress current size) + (extract archive size), not just one.
   const meta = (S.bkAll||[]).find(m => m.id === backupID);
-  const app = S.apps.find(a => a.id === appID);
   const vol = app && meta ? (app.volumes||[]).find(v => v.slug === meta.volume_slug) : null;
 
   const archiveGB = meta ? meta.size_bytes/(1024*1024*1024) : 0;

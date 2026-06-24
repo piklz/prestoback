@@ -835,6 +835,81 @@ var KnownCachePatterns = map[string][]string{
 	"homeassistant": {".cache/", "home-assistant.log"},
 }
 
+// PreBackupSuggestion pairs a command template with a post-restore instruction
+// so both halves of the workflow are surfaced, not just the backup side.
+type PreBackupSuggestion struct {
+	// Cmd is the shell command to run before backup, with {container} as a
+	// placeholder for the actual container name (substituted in the UI).
+	Cmd string `json:"cmd"`
+	// DumpFile is the path (inside the volume) where the dump lands — shown
+	// in the UI and in the post-restore hint so the user knows where to look.
+	DumpFile string `json:"dump_file"`
+	// PostRestoreHint is a human-readable instruction shown after a successful
+	// restore if this app has a PreBackupCmd set. The dump file is already on
+	// disk (extracted from the tar), but the user needs to activate it.
+	PostRestoreHint string `json:"post_restore_hint"`
+	// DocNote explains why this approach is safe (runs inside the target
+	// container — no dependencies on the Pi host or PrestoBack image).
+	DocNote string `json:"doc_note"`
+}
+
+// KnownPreBackupCmds maps image-name substrings to suggested pre-backup
+// commands. All commands use `docker exec {container}` so they run inside
+// the target container — no sqlite3/pg_dump/mysqldump needs to be installed
+// on the Pi host or inside the PrestoBack image.
+var KnownPreBackupCmds = map[string]PreBackupSuggestion{
+	"homebox": {
+		Cmd:      `docker exec {container} sqlite3 /data/homebox-data/homebox.db ".backup /data/homebox-data/homebox.db.bak"`,
+		DumpFile: "homebox-data/homebox.db.bak",
+		PostRestoreHint: "The archive contains a clean SQLite dump at homebox-data/homebox.db.bak. " +
+			"To activate it: docker exec {container} cp /data/homebox-data/homebox.db.bak /data/homebox-data/homebox.db",
+		DocNote: "Runs sqlite3 inside the Homebox container — no extra tools needed on your Pi.",
+	},
+	"vaultwarden": {
+		Cmd:      `docker exec {container} sqlite3 /data/db.sqlite3 ".backup /data/db.sqlite3.bak"`,
+		DumpFile: "db.sqlite3.bak",
+		PostRestoreHint: "The archive contains a clean SQLite dump at db.sqlite3.bak. " +
+			"To activate it: docker exec {container} cp /data/db.sqlite3.bak /data/db.sqlite3",
+		DocNote: "Runs sqlite3 inside the Vaultwarden container — no extra tools needed on your Pi.",
+	},
+	"postgres": {
+		Cmd:      `docker exec {container} pg_dump -U postgres --format=custom --file=/var/lib/postgresql/data/prestoback_dump.pgdump`,
+		DumpFile: "prestoback_dump.pgdump",
+		PostRestoreHint: "The archive contains a pg_dump at prestoback_dump.pgdump. " +
+			"To restore it: docker exec {container} pg_restore -U postgres -d postgres /var/lib/postgresql/data/prestoback_dump.pgdump",
+		DocNote: "Runs pg_dump inside the Postgres container — no extra tools needed on your Pi.",
+	},
+	"mariadb": {
+		Cmd:      `docker exec {container} sh -c 'mysqldump -u root -p"$MYSQL_ROOT_PASSWORD" --all-databases > /var/lib/mysql/prestoback_dump.sql'`,
+		DumpFile: "prestoback_dump.sql",
+		PostRestoreHint: "The archive contains a mysqldump at prestoback_dump.sql. " +
+			`To restore it: docker exec {container} sh -c 'mysql -u root -p"$MYSQL_ROOT_PASSWORD" < /var/lib/mysql/prestoback_dump.sql'`,
+		DocNote: "Runs mysqldump inside the MariaDB container — no extra tools needed on your Pi.",
+	},
+	"mysql": {
+		Cmd:      `docker exec {container} sh -c 'mysqldump -u root -p"$MYSQL_ROOT_PASSWORD" --all-databases > /var/lib/mysql/prestoback_dump.sql'`,
+		DumpFile: "prestoback_dump.sql",
+		PostRestoreHint: "The archive contains a mysqldump at prestoback_dump.sql. " +
+			`To restore it: docker exec {container} sh -c 'mysql -u root -p"$MYSQL_ROOT_PASSWORD" < /var/lib/mysql/prestoback_dump.sql'`,
+		DocNote: "Runs mysqldump inside the MySQL container — no extra tools needed on your Pi.",
+	},
+}
+
+// SuggestPreBackupCmd returns a pre-backup command suggestion for a given
+// container image, or nil if no suggestion is available. The {container}
+// placeholder in Cmd and PostRestoreHint is substituted by the caller
+// using the app's actual ContainerName.
+func SuggestPreBackupCmd(image string) *PreBackupSuggestion {
+	imageLower := strings.ToLower(image)
+	for key, suggestion := range KnownPreBackupCmds {
+		if strings.Contains(imageLower, key) {
+			s := suggestion // copy to avoid returning pointer into the map
+			return &s
+		}
+	}
+	return nil
+}
+
 func SuggestExcludes(image string) []string {
 	imageLower := strings.ToLower(image)
 	for key, patterns := range KnownCachePatterns {

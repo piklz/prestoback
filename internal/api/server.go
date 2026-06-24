@@ -324,13 +324,29 @@ func (s *Server) handleListVolumes(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSuggestExcludes(w http.ResponseWriter, r *http.Request) {
 	image := r.URL.Query().Get("image")
+	containerName := r.URL.Query().Get("container") // used to substitute {container} placeholder
 	patterns := backup.SuggestExcludes(image)
 	if patterns == nil {
 		patterns = []string{}
 	}
+	var preSuggestion any
+	if sug := backup.SuggestPreBackupCmd(image); sug != nil {
+		// Substitute the {container} placeholder if we know the container name
+		name := containerName
+		if name == "" {
+			name = "{container}"
+		}
+		preSuggestion = map[string]string{
+			"cmd":               strings.ReplaceAll(sug.Cmd, "{container}", name),
+			"dump_file":         sug.DumpFile,
+			"post_restore_hint": strings.ReplaceAll(sug.PostRestoreHint, "{container}", name),
+			"doc_note":          sug.DocNote,
+		}
+	}
 	respond(w, 200, map[string]any{
-		"image":    image,
-		"patterns": patterns,
+		"image":          image,
+		"patterns":       patterns,
+		"pre_backup_cmd": preSuggestion,
 	})
 }
 

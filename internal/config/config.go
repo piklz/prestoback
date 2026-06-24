@@ -51,6 +51,13 @@ type AppConfig struct {
 	// do not abort the backup (the command may be best-effort, e.g. a cache warm).
 	PreBackupCmd string `json:"pre_backup_cmd,omitempty"`
 
+	// PostRestoreHint is set automatically when a PreBackupCmd suggestion is
+	// applied. Shown in the Restore modal after a successful restore to tell
+	// the user how to activate the dump file that's now on disk (e.g. rename
+	// db.sqlite3.bak → db.sqlite3 or run pg_restore). Empty for apps that
+	// don't use a pre-backup dump command.
+	PostRestoreHint string `json:"post_restore_hint,omitempty"`
+
 	// LinkedContainers names additional containers (by exact Docker name,
 	// not service name) to quiesce alongside this app's own matched
 	// containers — typically a compose-declared dependency like a database
