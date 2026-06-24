@@ -659,6 +659,11 @@ select.fi{cursor:pointer}
         <div class="fh">Pause freezes the container instead of restarting it — much faster, fine for apps with a journaling DB (SQLite/Postgres/MySQL).</div>
       </div>
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
+        <div class="divlbl">Pre-backup command <span style="color:var(--txt3);font-weight:400;font-size:11px">(optional — runs before container stops)</span></div>
+        <input class="fi" id="a-prebakcmd" placeholder="docker exec myapp sqlite3 /data/app.db '.backup /data/app.db.bak'" style="font-family:var(--mono);font-size:11.5px">
+        <div class="fh">Runs while the container is still up, before it's stopped. Use for database dumps so the archive includes a consistent snapshot.</div>
+      </div>
+      <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
         <div class="divlbl">Scheduled backup (optional)</div>
         <div class="ftog" onclick="togAddSched()"><div class="ftog-sw" id="add-sched-tog"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable scheduled backup</div></div>
         <div id="add-sched-fields" style="display:none">
@@ -716,6 +721,11 @@ select.fi{cursor:pointer}
         <label class="fl">Detected dependencies</label>
         <div id="ea-linked-list" style="display:flex;flex-direction:column;gap:6px"></div>
         <div class="fh">Detected via Docker Compose's <code>depends_on</code> — checked containers are paused/stopped alongside this app. We only read what this app itself depends on, never the reverse (e.g. a reverse proxy in front of it is never included).</div>
+      </div>
+      <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
+        <div class="divlbl">Pre-backup command <span style="color:var(--txt3);font-weight:400;font-size:11px">(optional — runs before container stops)</span></div>
+        <input class="fi" id="ea-prebakcmd" placeholder="docker exec homebox sqlite3 /data/homebox.db '.backup /data/homebox.db.bak'" style="font-family:var(--mono);font-size:11.5px">
+        <div class="fh">Runs via <code>sh -c</code> while the container is still up, before it's stopped or paused. Use this for database dumps (pg_dump, sqlite3 .backup, mysqldump) so the archive includes a clean, consistent snapshot even if the raw DB files look partial on disk. Output streams to the activity log. Failures are logged but don't abort the backup.</div>
       </div>
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
         <div class="divlbl">Exclude patterns <span style="color:var(--txt3);font-weight:400;font-size:11px">(one per line — dirs: Cache/, globs: *.log)</span></div>
@@ -1260,7 +1270,7 @@ async function delApp(id) {
 
 // Add App
 function openAddApp() {
-  ['a-name','a-path','a-id','a-cron'].forEach(x=>document.getElementById(x).value='');
+  ['a-name','a-path','a-id','a-cron','a-prebakcmd'].forEach(x=>document.getElementById(x).value='');
   document.getElementById('a-retain').value=5;
   document.getElementById('a-strategy').value='stop';
   S.addSchedOn=false; setTog('add-sched-tog',false);
@@ -1275,7 +1285,9 @@ function togAddSched() {
 async function submitAddApp() {
   const name=gv('a-name'), path=gv('a-path'), retain=parseInt(gv('a-retain'))||5, id=gv('a-id')||undefined;
   if (!name||!path) { toast('Name and path required','error'); return; }
+  const preCmd = gv('a-prebakcmd').trim();
   const app = {name,path,retain,id,container_strategy:gv('a-strategy'),
+    pre_backup_cmd: preCmd||undefined,
     schedule:{enabled:S.addSchedOn, cron_expr: S.addSchedOn?gv('a-cron'):''}};
   try { await api('/api/apps',{method:'POST',body:JSON.stringify(app)}); toast('App added','success'); CM('m-add-app'); loadApps(); }
   catch(e) { toast(e.message,'error'); }
@@ -1303,6 +1315,7 @@ function openEditApp(id) {
   document.getElementById('edit-sched-fields').style.display=S.editSchedOn?'':'none';
   S.editPinOn=a.pinned||false; setTog('edit-pin-tog',S.editPinOn);
   document.getElementById('ea-excludes').value=(a.excludes||[]).join('\n');
+  document.getElementById('ea-prebakcmd').value=a.pre_backup_cmd||'';
   loadLinkedContainers(a);
   // Fetch suggested excludes for this app's image (best-effort)
   const hint = document.getElementById('ea-suggest-hint');
@@ -1324,12 +1337,14 @@ async function submitEditApp() {
   const excludesRaw = (document.getElementById('ea-excludes').value||'')
     .split('\n').map(s=>s.trim()).filter(Boolean);
   const linkedContainers = [...document.querySelectorAll('.ea-linked-chk:checked')].map(el => el.value);
+  const preCmd = gv('ea-prebakcmd').trim();
   const a = {
     ...S.editApp,
     name:gv('ea-name'), path:gv('ea-path'),
     retain:parseInt(gv('ea-retain'))||5,
     pinned:S.editPinOn,
     container_strategy:gv('ea-strategy'),
+    pre_backup_cmd: preCmd||undefined,
     linked_containers: linkedContainers,
     schedule:{enabled:S.editSchedOn, cron_expr:gv('ea-cron')},
     excludes: excludesRaw,
