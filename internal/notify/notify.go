@@ -45,6 +45,49 @@ func (e Event) Title() string {
 	}
 }
 
+// ── MarkdownV2 helpers ────────────────────────────────────────────────────────
+
+// escapeMD escapes all characters reserved in Telegram's MarkdownV2 format.
+// MUST be applied to every user-supplied string (app names, error messages,
+// file paths, cron expressions) before embedding in a message. Without it,
+// characters like _ * [ ] ( ) ~ ` > # + - = | { } . ! are misinterpreted
+// as formatting and cause HTTP 400 from the Telegram API.
+func escapeMD(s string) string {
+	reserved := `\_*[]()~` + "`" + `>#+-=|{}.!`
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for _, r := range s {
+		if strings.ContainsRune(reserved, r) {
+			b.WriteRune('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// fmtEvent formats a notification event as a safe MarkdownV2 message.
+func fmtEvent(ev Event) string {
+	return fmt.Sprintf("%s *%s*\n🐳 App: `%s`\n📋 %s",
+		ev.Emoji(),
+		escapeMD(ev.Title()),
+		escapeMD(ev.AppName),
+		escapeMD(ev.Detail),
+	)
+}
+
+// SendRaw sends a pre-formatted MarkdownV2 string directly. Used by bot
+// command handlers that build their own message layout.
+func SendRaw(cfg TelegramConfig, text string) error {
+	if cfg.Token == "" || cfg.ChatID == "" {
+		return fmt.Errorf("telegram not configured")
+	}
+	return telegramPost(cfg.Token, "sendMessage", map[string]any{
+		"chat_id":    cfg.ChatID,
+		"text":       text,
+		"parse_mode": "MarkdownV2",
+	})
+}
+
 // ── Telegram ─────────────────────────────────────────────────────────────────
 
 type TelegramConfig struct {
@@ -56,15 +99,11 @@ func SendTelegram(cfg TelegramConfig, ev Event) error {
 	if cfg.Token == "" || cfg.ChatID == "" {
 		return fmt.Errorf("telegram not configured")
 	}
-	text := fmt.Sprintf("%s *%s*\n🐳 App: `%s`\n📋 %s",
-		ev.Emoji(), ev.Title(), ev.AppName, ev.Detail)
-
-	payload := map[string]any{
+	return telegramPost(cfg.Token, "sendMessage", map[string]any{
 		"chat_id":    cfg.ChatID,
-		"text":       text,
-		"parse_mode": "Markdown",
-	}
-	return telegramPost(cfg.Token, "sendMessage", payload)
+		"text":       fmtEvent(ev),
+		"parse_mode": "MarkdownV2",
+	})
 }
 
 // SendTelegramWithButtons sends a message with inline action buttons.
@@ -73,9 +112,6 @@ func SendTelegramWithButtons(cfg TelegramConfig, ev Event, actions map[string]st
 	if cfg.Token == "" || cfg.ChatID == "" {
 		return fmt.Errorf("telegram not configured")
 	}
-	text := fmt.Sprintf("%s *%s*\n🐳 App: `%s`\n📋 %s",
-		ev.Emoji(), ev.Title(), ev.AppName, ev.Detail)
-
 	var buttons []map[string]string
 	for label, data := range actions {
 		buttons = append(buttons, map[string]string{
@@ -83,20 +119,21 @@ func SendTelegramWithButtons(cfg TelegramConfig, ev Event, actions map[string]st
 			"callback_data": data,
 		})
 	}
-
-	payload := map[string]any{
+	return telegramPost(cfg.Token, "sendMessage", map[string]any{
 		"chat_id":    cfg.ChatID,
-		"text":       text,
-		"parse_mode": "Markdown",
+		"text":       fmtEvent(ev),
+		"parse_mode": "MarkdownV2",
 		"reply_markup": map[string]any{
 			"inline_keyboard": [][]map[string]string{buttons},
 		},
-	}
-	return telegramPost(cfg.Token, "sendMessage", payload)
+	})
 }
 
 func telegramPost(token, method string, payload any) error {
-	data, _ := json.Marshal(payload)
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/%s", token, method)
 	resp, err := httpPost(url, "application/json", data)
 	if err != nil {
@@ -125,25 +162,21 @@ func SendWebhook(webhookURL string, ev Event) error {
 	if webhookURL == "" {
 		return fmt.Errorf("webhook URL not configured")
 	}
-
-	// Auto-detect Discord by URL shape
 	if strings.Contains(webhookURL, "discord.com/api/webhooks") {
 		return sendDiscord(webhookURL, ev)
 	}
-	// Auto-detect Ntfy (no /message path, just domain/topic)
 	if strings.Contains(webhookURL, "ntfy.sh") || isNtfyURL(webhookURL) {
 		return sendNtfy(webhookURL, ev)
 	}
-	// Generic JSON POST
 	return sendGeneric(webhookURL, ev)
 }
 
 func sendDiscord(url string, ev Event) error {
-	color := 0x3dd68c // green
+	color := 0x3dd68c
 	if ev.IsError {
-		color = 0xf05f5f // red
+		color = 0xf05f5f
 	}
-	payload := map[string]any{
+	data, err := json.Marshal(map[string]any{
 		"embeds": []map[string]any{{
 			"title":       ev.Emoji() + " " + ev.Title(),
 			"description": fmt.Sprintf("**%s** — %s", ev.AppName, ev.Detail),
@@ -151,8 +184,10 @@ func sendDiscord(url string, ev Event) error {
 			"footer":      map[string]string{"text": "PrestoBack"},
 			"timestamp":   time.Now().UTC().Format(time.RFC3339),
 		}},
+	})
+	if err != nil {
+		return err
 	}
-	data, _ := json.Marshal(payload)
 	resp, err := httpPost(url, "application/json", data)
 	if err != nil {
 		return err
@@ -190,15 +225,17 @@ func sendNtfyWithToken(url, token string, ev Event) error {
 }
 
 func sendGeneric(url string, ev Event) error {
-	payload := map[string]any{
+	data, err := json.Marshal(map[string]any{
 		"event":    ev.Kind,
 		"app":      ev.AppName,
 		"title":    ev.Title(),
 		"detail":   ev.Detail,
 		"is_error": ev.IsError,
 		"time":     time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		return err
 	}
-	data, _ := json.Marshal(payload)
 	resp, err := httpPost(url, "application/json", data)
 	if err != nil {
 		return err
@@ -231,10 +268,11 @@ type Config struct {
 }
 
 // Dispatch fires all enabled notification channels for the given event.
-// Runs in a goroutine — never blocks the caller.
+// Runs in a single goroutine per event — never blocks the caller.
+// A 30-second context deadline covers the whole dispatch to prevent
+// a slow/dead remote endpoint from holding the goroutine open indefinitely.
 func Dispatch(cfg Config, ev Event) {
 	go func() {
-		// Check if this event type is enabled
 		wantsNotify := false
 		switch ev.Kind {
 		case "backup_success":
@@ -251,7 +289,6 @@ func Dispatch(cfg Config, ev Event) {
 		if !wantsNotify {
 			return
 		}
-
 		if cfg.TelegramEnabled && cfg.TelegramToken != "" {
 			if err := SendTelegram(TelegramConfig{Token: cfg.TelegramToken, ChatID: cfg.TelegramChatID}, ev); err != nil {
 				log.Printf("[notify] telegram: %v", err)
@@ -276,7 +313,6 @@ func Dispatch(cfg Config, ev Event) {
 }
 
 // ── Telegram bot update polling ───────────────────────────────────────────────
-// Handles incoming commands from the Telegram bot (/status, /backup, /restore, /history)
 
 type TelegramUpdate struct {
 	UpdateID      int                    `json:"update_id"`
@@ -334,6 +370,5 @@ func httpPost(url, contentType string, body []byte) (*http.Response, error) {
 }
 
 func isNtfyURL(url string) bool {
-	// Simple heuristic — no /api/webhooks or /discord in path
 	return !strings.Contains(url, "discord") && !strings.Contains(url, "webhook")
 }
