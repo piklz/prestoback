@@ -651,12 +651,12 @@ select.fi{cursor:pointer}
       </div>
       <div class="fg">
         <label class="fl">Container handling during backup</label>
-        <select class="fi" id="a-strategy">
+        <select class="fi" id="a-strategy" onchange="updateStrategyHint('a')">
           <option value="stop" selected>Stop &amp; restart (safest)</option>
           <option value="pause">Pause &amp; resume (faster, crash-consistent)</option>
           <option value="none">Don't touch container</option>
         </select>
-        <div class="fh">Pause freezes the container instead of restarting it — much faster, fine for apps with a journaling DB (SQLite/Postgres/MySQL).</div>
+        <div class="fh" id="a-strategy-hint"></div>
       </div>
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
         <div class="divlbl">Pre-backup command <span style="color:var(--txt3);font-weight:400;font-size:11px">(optional — runs before container stops)</span></div>
@@ -710,12 +710,12 @@ select.fi{cursor:pointer}
       </div>
       <div class="fg">
         <label class="fl">Container handling during backup</label>
-        <select class="fi" id="ea-strategy">
+        <select class="fi" id="ea-strategy" onchange="updateStrategyHint('ea')">
           <option value="stop">Stop &amp; restart (safest)</option>
           <option value="pause">Pause &amp; resume (faster, crash-consistent)</option>
           <option value="none">Don't touch container</option>
         </select>
-        <div class="fh">Pause freezes the container instead of restarting it — much faster, fine for apps with a journaling DB (SQLite/Postgres/MySQL).</div>
+        <div class="fh" id="ea-strategy-hint"></div>
       </div>
       <div class="fg" id="ea-linked-wrap" style="display:none">
         <label class="fl">Detected dependencies</label>
@@ -723,11 +723,18 @@ select.fi{cursor:pointer}
         <div class="fh">Detected via Docker Compose's <code>depends_on</code> — checked containers are paused/stopped alongside this app. We only read what this app itself depends on, never the reverse (e.g. a reverse proxy in front of it is never included).</div>
       </div>
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
-        <div class="divlbl">Pre-backup command <span style="color:var(--txt3);font-weight:400;font-size:11px">(optional — runs before container stops)</span></div>
-        <input class="fi" id="ea-prebakcmd" placeholder="docker exec myapp sqlite3 /data/app.db '.backup /data/app.db.bak'" style="font-family:var(--mono);font-size:11.5px">
+        <div class="divlbl" style="display:flex;align-items:center;gap:8px">
+          Pre-backup command
+          <span id="ea-prebakcmd-badge" style="display:none;background:var(--gd);color:var(--green);border-radius:4px;padding:1px 7px;font-size:10px;font-family:var(--mono)">ACTIVE</span>
+          <span style="color:var(--txt3);font-weight:400;font-size:11px">(optional — runs before container stops, while app is still live)</span>
+        </div>
+        <input class="fi" id="ea-prebakcmd"
+          placeholder="e.g. docker exec homebox sqlite3 /data/homebox-data/homebox.db '.backup /data/homebox-data/homebox.db.bak'"
+          style="font-family:var(--mono);font-size:11.5px"
+          oninput="document.getElementById('ea-prebakcmd-badge').style.display=this.value.trim()?'':'none'">
         <div id="ea-prebakcmd-hint" class="fh" style="margin-top:6px"></div>
         <input type="hidden" id="ea-postrestorehint">
-        <div class="fh">Runs via <code>sh -c</code> while the container is still up, before it's stopped. Use for database dumps (sqlite3, pg_dump, mysqldump) running <em>inside</em> the target container — no extra tools needed on your Pi. Output streams to the activity log. Failures are logged but don't abort the backup.</div>
+        <div class="fh">Uses <code>docker exec</code> to run inside the target container — no extra tools needed on your Pi or in PrestoBack. The dump file lands in your volume and is included in the tar automatically. Use for: SQLite → <code>.backup</code>, Postgres → <code>pg_dump</code>, MySQL → <code>mysqldump</code>.</div>
       </div>
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
         <div class="divlbl">Exclude patterns <span style="color:var(--txt3);font-weight:400;font-size:11px">(one per line — dirs: Cache/, globs: *.log)</span></div>
@@ -850,8 +857,13 @@ select.fi{cursor:pointer}
   <div class="modal">
     <div class="mh"><div class="mt">Import Backup File</div><button class="btn btn-g btn-ic" onclick="CM('m-import')">✕</button></div>
     <div class="mb">
-      <div style="font-size:12.5px;color:var(--txt2);margin-bottom:14px">Pick a single <code>.tar.gz</code> backup archive produced by PrestoBack — e.g. one you downloaded from remote storage onto a fresh install. We match it by filename, the same convention every PrestoBack archive already uses.</div>
-      <div class="fg"><label class="fl">Backup file (.tar.gz)</label><input class="fi" type="file" id="import-file" accept=".tar.gz" onchange="onImportFileChange()"></div>
+      <div style="font-size:12.5px;color:var(--txt2);margin-bottom:12px">Upload a <code>.tar.gz</code> backup archive from your device (phone, tablet, laptop) to this PrestoBack instance. The file is uploaded via your browser and placed into <code>backups/{app_id}/</code> on the Pi — exactly where PrestoBack expects its own archives to live.</div>
+      <div style="padding:8px 12px;background:var(--bg3);border-radius:var(--rs);font-size:11.5px;color:var(--txt3);margin-bottom:12px">
+        <strong style="color:var(--txt)">Expected filename format:</strong> <code>{appid}_{volumeslug}_{YYYYMMDD}_{HHMMSS}.tar.gz</code><br>
+        Example: <code>homebox_homebox-data_20260623_222239.tar.gz</code><br>
+        PrestoBack reads the app ID from the filename automatically.
+      </div>
+      <div class="fg"><label class="fl">Choose backup file (.tar.gz)</label><input class="fi" type="file" id="import-file" accept=".tar.gz" onchange="onImportFileChange()"></div>
       <div id="import-analysis" style="margin-top:14px"></div>
     </div>
     <div class="mf"><button class="btn btn-g" onclick="CM('m-import')">Cancel</button><button class="btn btn-p" id="import-run" style="display:none" onclick="confirmImport()">Import</button></div>
@@ -885,6 +897,7 @@ const S = {
   pathStatuses:{},   // appID → 'ok'|'missing'|'unknown'
   backupCounts:{},   // appID → number (from real disk listing)
   orphanIDs:[],      // appIDs found on disk but not in config
+  containerHealth:{}, // appID → {state, health, name}
   bkPage:0, bkPerPage:20, bkAll:[],
 };
 const VIEWS = ['dash','apps','bk','hist','notif','sec','upd'];
@@ -894,6 +907,13 @@ function authHeader() {
   if (S.token) return {'Authorization':'Bearer '+S.token};
   if (S.apiKey) return {'X-API-Key':S.apiKey}; // legacy compat
   return {};
+}
+// For browser navigations (downloads, SSE) that can't set request headers —
+// the backend accepts ?token= or ?api_key= as a fallback.
+function authQueryParam() {
+  if (S.token) return 'token='+encodeURIComponent(S.token);
+  if (S.apiKey) return 'api_key='+encodeURIComponent(S.apiKey);
+  return '';
 }
 
 function authSave(data) {
@@ -1054,8 +1074,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
 async function loadAll() {
   await Promise.all([loadApps(), loadStatus(), loadNotify()]);
-  // after apps loaded, probe paths and backup counts in background
+  // after apps loaded, probe paths, backup counts, and container health
   probeAllApps();
+  pollContainerHealth();
+}
+
+async function pollContainerHealth() {
+  try {
+    const results = await api('/api/container-health');
+    S.containerHealth = {};
+    (results||[]).forEach(h => { S.containerHealth[h.app_id] = h; });
+    renderApps(); // re-render inline status badges
+  } catch { /* docker socket may not be available — silently skip */ }
+  // Re-poll every 30s. Uses setTimeout not setInterval so a slow response
+  // doesn't stack up concurrent requests.
+  setTimeout(pollContainerHealth, 30_000);
 }
 
 async function loadStatus() {
@@ -1247,12 +1280,29 @@ function renderApps() {
     const cntHtml = cnt !== undefined
       ? `<span style="font-family:var(--mono);font-size:10px;color:${cnt>0?'var(--green)':'var(--txt3)'};margin-left:4px">[${cnt}]</span>`
       : '';
+    // Container health badge — shown under the app name once polling data arrives
+    const ch = S.containerHealth[a.id];
+    const healthBadge = ch ? (() => {
+      const state = ch.state || 'unknown';
+      const health = ch.health || '';
+      // Determine colour and label
+      let col, label;
+      if (state === 'running') {
+        if (health === 'healthy')   { col='var(--green)'; label='● running · healthy'; }
+        else if (health === 'unhealthy') { col='var(--red)'; label='● running · unhealthy'; }
+        else if (health === 'starting') { col='var(--amber)'; label='● running · starting'; }
+        else                         { col='var(--green)'; label='● running'; }
+      } else if (state === 'paused')  { col='var(--amber)'; label='⏸ paused'; }
+      else if (state === 'exited')    { col='var(--red)';   label='● stopped'+(ch.exit_code?` (exit ${ch.exit_code})`:''); }
+      else                            { col='var(--txt3)';  label='● '+state; }
+      return `<div style="font-size:10px;color:${col};margin-top:2px;font-family:var(--mono)">${label}</div>`;
+    })() : '';
     const schedPill = a.schedule?.enabled && !a.pinned
       ? `<span class="pill pg"><span class="pd"></span>${esc(a.schedule.cron_expr)}</span>`
       : `<span class="pill" style="background:var(--bg4);color:var(--txt3)">manual</span>`;
     const pinPill = a.pinned ? `<span class="pill pa" style="margin-left:4px">📌 pinned</span>` : '';
     return `<tr class="${rowCls}">
-      <td data-label="Application"><div class="an">${esc(a.name)}${cntHtml}</div></td>
+      <td data-label="Application"><div class="an">${esc(a.name)}${cntHtml}</div>${healthBadge}</td>
       <td data-label="Path"><div style="display:flex;align-items:center;gap:4px"><span class="path-status-dot ${dotCls}" title="${dotTitle}"></span><span class="ap" style="margin-top:0">${esc(a.path)}</span></div></td>
       <td data-label="Retain"><span class="pill pb">${a.retain||5}</span></td>
       <td data-label="Schedule">${schedPill}${pinPill}</td>
@@ -1276,6 +1326,7 @@ function openAddApp() {
   ['a-name','a-path','a-id','a-cron','a-prebakcmd'].forEach(x=>document.getElementById(x).value='');
   document.getElementById('a-retain').value=5;
   document.getElementById('a-strategy').value='stop';
+  updateStrategyHint('a');
   S.addSchedOn=false; setTog('add-sched-tog',false);
   document.getElementById('add-sched-fields').style.display='none';
   document.getElementById('path-status').textContent='';
@@ -1313,12 +1364,14 @@ function openEditApp(id) {
   document.getElementById('ea-retain').value=a.retain||5;
   document.getElementById('ea-id').value=a.id;
   document.getElementById('ea-strategy').value=a.container_strategy||'stop';
+  updateStrategyHint('ea');
   document.getElementById('ea-cron').value=a.schedule?.cron_expr||'';
   S.editSchedOn=a.schedule?.enabled||false; setTog('edit-sched-tog',S.editSchedOn);
   document.getElementById('edit-sched-fields').style.display=S.editSchedOn?'':'none';
   S.editPinOn=a.pinned||false; setTog('edit-pin-tog',S.editPinOn);
   document.getElementById('ea-excludes').value=(a.excludes||[]).join('\n');
   document.getElementById('ea-prebakcmd').value=a.pre_backup_cmd||'';
+  document.getElementById('ea-prebakcmd-badge').style.display=a.pre_backup_cmd?'':'none';
   document.getElementById('ea-postrestorehint').value=a.post_restore_hint||'';
   loadLinkedContainers(a);
   // Fetch suggested excludes AND pre-backup cmd for this app's image (best-effort)
@@ -1397,6 +1450,18 @@ function loadLinkedContainers(a) {
       </label>`;
     }).join('');
   }).catch(()=>{}); // best-effort — no Docker socket access, or nothing detected
+}
+
+// Strategy hint text — shown dynamically below the container handling dropdown
+const STRATEGY_HINTS = {
+  stop:  '🔴 Container is gracefully stopped (SIGTERM) before archiving, then restarted after. The app gets to flush caches and close open files cleanly. Safest for all database types. Downtime = stop + archive + start time.',
+  pause: '🟡 Container is frozen (SIGSTOP) — paused mid-execution, not stopped. No restart needed so recovery is instant. Crash-consistent: same guarantee as a VM snapshot. Fine for SQLite, Postgres, MySQL (all have WAL journaling). Not suitable for apps that write non-journaled flat files.',
+  none:  '🟢 Container keeps running. Only use this for stateless apps, or when your Pre-backup command already produces a consistent dump. Archiving a live database without stopping or pausing risks a corrupt backup.',
+};
+function updateStrategyHint(prefix) {
+  const val = document.getElementById(prefix+'-strategy').value;
+  const el = document.getElementById(prefix+'-strategy-hint');
+  if (el) el.textContent = STRATEGY_HINTS[val] || '';
 }
 
 // Cron preset buttons
@@ -1966,6 +2031,7 @@ function renderBkPage() {
       <div style="display:flex;gap:6px">
         ${!missing && !isOrphan?`<button class="btn btn-g btn-sm" onclick="openRsModal('${S.selAppID}','${esc(m.id)}')">↺ Restore</button>`:''}
         ${!missing && isOrphan?`<button class="btn btn-g btn-sm" disabled title="Adopt this app first" style="opacity:.5">↺ Restore</button>`:''}
+        ${!missing?`<a class="btn btn-g btn-sm btn-ic" href="/api/backups/${S.selAppID}/${esc(m.id)}/download?${authQueryParam()}" download title="Download to this device" style="text-decoration:none">⬇</a>`:''}
         <button class="btn btn-d btn-sm btn-ic" onclick="delBackup('${esc(m.id)}')">🗑</button>
       </div>
     </div>`;

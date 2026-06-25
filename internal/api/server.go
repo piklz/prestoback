@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -91,6 +92,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/apps", s.authJWT(s.handleApps))
 	s.mux.HandleFunc("/api/apps/", s.authJWT(s.handleApp))
 	s.mux.HandleFunc("/api/backups/", s.authJWT(s.handleBackups))
+	s.mux.HandleFunc("/api/container-health", s.authJWT(s.handleContainerHealth))
 	s.mux.HandleFunc("/api/backups-orphans/", s.authJWT(s.handleOrphans))
 	s.mux.HandleFunc("/api/backups-orphans", s.authJWT(s.handleOrphans))
 	s.mux.HandleFunc("/api/backups-import", s.authJWT(s.handleBackupsImport))
@@ -348,6 +350,56 @@ func (s *Server) handleSuggestExcludes(w http.ResponseWriter, r *http.Request) {
 		"patterns":       patterns,
 		"pre_backup_cmd": preSuggestion,
 	})
+}
+
+// ContainerHealth is what the frontend receives per app.
+type ContainerHealth struct {
+	AppID    string `json:"app_id"`
+	Name     string `json:"name"`   // container name
+	State    string `json:"state"`  // "running" | "exited" | "paused" | "unknown"
+	Health   string `json:"health"` // "healthy" | "unhealthy" | "starting" | "" (no healthcheck)
+	ExitCode int    `json:"exit_code,omitempty"`
+}
+
+// GET /api/container-health — returns live container state for every registered
+// app. Called periodically by the frontend to show inline status in the app list.
+// Uses the same FindContainers matching as the backup pipeline so the displayed
+// container is always the one that would actually be stopped/paused on backup.
+func (s *Server) handleContainerHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	apps := s.cfg.ListApps()
+	result := make([]ContainerHealth, 0, len(apps))
+	for _, a := range apps {
+		containers := backup.FindContainers(a.ID)
+		if len(containers) == 0 {
+			result = append(result, ContainerHealth{AppID: a.ID, State: "unknown"})
+			continue
+		}
+		// Use the first matched container (primary one for this app).
+		c := containers[0]
+		h := ContainerHealth{AppID: a.ID, Name: c.Name, State: c.Status}
+		// Try to get health check status from docker inspect.
+		out, err := exec.Command("docker", "inspect",
+			"--format={{.State.Health.Status}}:{{.State.ExitCode}}", c.ID).Output()
+		if err == nil {
+			parts := strings.SplitN(strings.TrimSpace(string(out)), ":", 2)
+			healthStr := parts[0]
+			// Docker returns "<nil>" when there is no healthcheck configured.
+			if healthStr != "" && healthStr != "<nil>" {
+				h.Health = healthStr
+			}
+			if len(parts) == 2 {
+				if code, err := strconv.Atoi(parts[1]); err == nil && code != 0 {
+					h.ExitCode = code
+				}
+			}
+		}
+		result = append(result, h)
+	}
+	respond(w, 200, result)
 }
 
 func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
@@ -1068,6 +1120,12 @@ func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// GET /api/backups/{appID}/{backupID}/download — serve the archive file
+	if len(parts) == 3 && parts[2] == "download" && r.Method == http.MethodGet {
+		s.handleBackupDownload(w, r, appID, parts[1])
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
 		metas, err := s.engine.ListBackups(appID)
@@ -1090,6 +1148,41 @@ func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
 	default:
 		errOut(w, 405, "method not allowed")
 	}
+}
+
+// GET /api/backups/{appID}/{backupID}/download — serves the archive as a
+// browser download. Works from any device: mobile browser, laptop, desktop.
+// The file is streamed directly from disk — no memory buffering.
+func (s *Server) handleBackupDownload(w http.ResponseWriter, r *http.Request, appID, backupID string) {
+	if backupID == "" {
+		errOut(w, 400, "backup ID required")
+		return
+	}
+	filename := backupID + ".tar.gz"
+	archivePath := filepath.Join(s.cfg.BackupDir(), appID, filename)
+
+	f, err := os.Open(archivePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			errOut(w, 404, "backup archive not found")
+			return
+		}
+		errOut(w, 500, err.Error())
+		return
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		errOut(w, 500, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	w.Header().Set("Content-Type", "application/gzip")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", stat.Size()))
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeContent(w, r, filename, stat.ModTime(), f)
 }
 
 // ── Import a loose backup archive file ─────────────────────────────────────────
