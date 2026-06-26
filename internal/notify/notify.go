@@ -47,12 +47,13 @@ func (e Event) Title() string {
 
 // ── MarkdownV2 helpers ────────────────────────────────────────────────────────
 
-// escapeMD escapes all characters reserved in Telegram's MarkdownV2 format.
+// EscapeMD escapes all characters reserved in Telegram's MarkdownV2 format.
+// Exported so bot command handlers in other packages can build safe messages.
 // MUST be applied to every user-supplied string (app names, error messages,
 // file paths, cron expressions) before embedding in a message. Without it,
 // characters like _ * [ ] ( ) ~ ` > # + - = | { } . ! are misinterpreted
 // as formatting and cause HTTP 400 from the Telegram API.
-func escapeMD(s string) string {
+func EscapeMD(s string) string {
 	reserved := `\_*[]()~` + "`" + `>#+-=|{}.!`
 	var b strings.Builder
 	b.Grow(len(s) + 8)
@@ -64,6 +65,9 @@ func escapeMD(s string) string {
 	}
 	return b.String()
 }
+
+// escapeMD is the unexported alias used internally within this package.
+func escapeMD(s string) string { return EscapeMD(s) }
 
 // fmtEvent formats a notification event as a safe MarkdownV2 message.
 func fmtEvent(ev Event) string {

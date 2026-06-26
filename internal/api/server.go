@@ -1516,31 +1516,58 @@ func (s *Server) runTelegramBot() {
 
 func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.TelegramMessage) {
 	tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
-	if fmt.Sprintf("%d", msg.Chat.ID) != nc.TelegramChatID {
+
+	// Security: verify BOTH the chat the message came from AND the sender's
+	// user ID match the configured chat ID. This prevents two attack vectors:
+	// 1. Messages from strangers in direct chat (Chat.ID check)
+	// 2. Messages from other members in a group chat where the bot is a member
+	//    but only the admin's user ID should be able to run commands (From.ID check)
+	chatIDStr := fmt.Sprintf("%d", msg.Chat.ID)
+	fromIDStr := fmt.Sprintf("%d", msg.From.ID)
+	if chatIDStr != nc.TelegramChatID && fromIDStr != nc.TelegramChatID {
+		// Neither the chat nor the sender matches — silently ignore.
+		// No response: telling strangers the bot exists is itself a security leak.
+		log.Printf("[bot] rejected message from chat=%s from=%s (not authorised)", chatIDStr, fromIDStr)
 		return
 	}
+
 	text := strings.TrimSpace(msg.Text)
-	cmd := strings.SplitN(text, " ", 2)[0]
-	arg := ""
-	if len(strings.SplitN(text, " ", 2)) > 1 {
-		arg = strings.TrimSpace(strings.SplitN(text, " ", 2)[1])
+	if text == "" {
+		return
 	}
+	// Strip bot@username suffix that Telegram adds in group chats: /backup@MyBot → /backup
+	parts := strings.SplitN(text, " ", 2)
+	cmd := strings.SplitN(parts[0], "@", 2)[0]
+	arg := ""
+	if len(parts) > 1 {
+		arg = strings.TrimSpace(parts[1])
+	}
+
 	switch cmd {
 	case "/status":
 		apps := s.cfg.ListApps()
-		reply := fmt.Sprintf("*PrestoBack v%s*\n🐳 Apps: %d\n\n", config.Version, len(apps))
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("*PrestoBack v%s*\n🐳 *%d apps*\n\n", notify.EscapeMD(config.Version), len(apps)))
 		for _, a := range apps {
-			pin := ""
+			badges := ""
 			if a.Pinned {
-				pin = " 📌"
+				badges += " 📌"
 			}
-			running := ""
 			if s.engine.IsRunning(a.ID) {
-				running = " ⏳"
+				badges += " ⏳"
 			}
-			reply += fmt.Sprintf("• `%s`%s%s — %d volume(s)\n", a.Name, pin, running, len(a.Volumes))
+			schedInfo := "manual"
+			if a.Schedule.Enabled {
+				schedInfo = notify.EscapeMD(a.Schedule.CronExpr)
+			}
+			sb.WriteString(fmt.Sprintf("• `%s`%s\n  📁 `%s`\n  🗓 `%s` · retain %d\n\n",
+				notify.EscapeMD(a.Name), badges,
+				notify.EscapeMD(a.PrimaryPath()),
+				schedInfo, a.Retain))
 		}
-		_ = notify.SendTelegram(tgCfg, notify.Event{AppName: "PrestoBack", Detail: reply})
+		if err := notify.SendRaw(tgCfg, sb.String()); err != nil {
+			log.Printf("[bot] send status: %v", err)
+		}
 
 	case "/backup":
 		if arg == "" {
@@ -1549,43 +1576,147 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 		}
 		app := s.findAppByNameFragment(arg)
 		if app == nil {
-			_ = notify.SendTelegram(tgCfg, notify.Event{AppName: "PrestoBack", Detail: "App not found: " + arg, IsError: true})
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ App not found: `%s`", notify.EscapeMD(arg)))
 			return
 		}
 		if s.engine.IsRunning(app.ID) {
-			_ = notify.SendTelegram(tgCfg, notify.Event{AppName: app.Name, Detail: "A job is already running", IsError: true})
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("⏳ `%s` — a job is already running", notify.EscapeMD(app.Name)))
 			return
 		}
-		_ = notify.SendTelegram(tgCfg, notify.Event{AppName: app.Name, Detail: "Backup started ⏳"})
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf("▶ Backup started for `%s`", notify.EscapeMD(app.Name)))
 		go s.runBackup(*app, false)
 
 	case "/history":
 		entries := s.hist.List(10)
-		reply := "*Recent history (last 10)*\n\n"
+		var sb strings.Builder
+		sb.WriteString("*Recent history \\(last 10\\)*\n\n")
 		for _, e := range entries {
 			icon := "✅"
 			if strings.Contains(string(e.Event), "fail") {
 				icon = "❌"
 			}
-			reply += fmt.Sprintf("%s `%s` — %s\n_%s_\n\n", icon, e.AppName, e.Event, e.Time.Format("02 Jan 15:04"))
+			sb.WriteString(fmt.Sprintf("%s `%s` — %s\n_%s_\n\n",
+				icon,
+				notify.EscapeMD(e.AppName),
+				notify.EscapeMD(string(e.Event)),
+				notify.EscapeMD(e.Time.Format("02 Jan 15:04")),
+			))
 		}
 		if len(entries) == 0 {
-			reply = "No history yet."
+			sb.WriteString("No history yet\\.")
 		}
-		_ = notify.SendTelegram(tgCfg, notify.Event{AppName: "PrestoBack", Detail: reply})
+		if err := notify.SendRaw(tgCfg, sb.String()); err != nil {
+			log.Printf("[bot] send history: %v", err)
+		}
+
+	case "/settings":
+		n := s.cfg.GetNotify()
+		apps := s.cfg.ListApps()
+		scheduledCount := 0
+		for _, a := range apps {
+			if a.Schedule.Enabled {
+				scheduledCount++
+			}
+		}
+		var sb strings.Builder
+		sb.WriteString("*PrestoBack Settings*\n\n")
+		sb.WriteString(fmt.Sprintf("🐳 *Apps:* `%d` \\(%d scheduled\\)\n", len(apps), scheduledCount))
+		sb.WriteString(fmt.Sprintf("🔔 *Telegram:* `%s`\n", boolStr(n.TelegramEnabled)))
+		sb.WriteString(fmt.Sprintf("💬 *Discord:* `%s`\n", boolStr(n.DiscordEnabled)))
+		sb.WriteString(fmt.Sprintf("📣 *Ntfy:* `%s`\n", boolStr(n.NtfyEnabled)))
+		sb.WriteString(fmt.Sprintf("🔗 *Webhook:* `%s`\n", boolStr(n.WebhookEnabled)))
+		sb.WriteString("\n*Notify on:*\n")
+		sb.WriteString(fmt.Sprintf("  ✅ Backup success: `%s`\n", boolStr(n.OnBackupSuccess)))
+		sb.WriteString(fmt.Sprintf("  ❌ Backup fail: `%s`\n", boolStr(n.OnBackupFail)))
+		sb.WriteString(fmt.Sprintf("  ✅ Restore success: `%s`\n", boolStr(n.OnRestoreSuccess)))
+		sb.WriteString(fmt.Sprintf("  ❌ Restore fail: `%s`\n", boolStr(n.OnRestoreFail)))
+		if s.image != "" {
+			sb.WriteString(fmt.Sprintf("\n🐋 *Image:* `%s`\n", notify.EscapeMD(s.image)))
+		}
+		sb.WriteString(fmt.Sprintf("📦 *Version:* `%s`\n", notify.EscapeMD(config.Version)))
+		if err := notify.SendRaw(tgCfg, sb.String()); err != nil {
+			log.Printf("[bot] send settings: %v", err)
+		}
+
+	case "/selfupdate":
+		if s.image == "" || s.selfName == "" {
+			_ = notify.SendRaw(tgCfg, "❌ Self\\-update not available: `PRESTOBACK_IMAGE` or `PRESTOBACK_CONTAINER` not set in your compose config\\.")
+			return
+		}
+		_ = notify.SendRaw(tgCfg, "🔍 Checking for updates\\.\\.\\.")
+		hasUpdate, local, remote, err := backup.ForceCheckForUpdate(s.image)
+		if err != nil {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Update check failed: `%s`", notify.EscapeMD(err.Error())))
+			return
+		}
+		if !hasUpdate {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("✅ Already up to date\\.\nDigest: `%s`", notify.EscapeMD(local[:min(12, len(local))])))
+			return
+		}
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+			"🆕 Update available\\!\n📦 Local: `%s`\n🌐 Remote: `%s`\n\nPulling and restarting now\\.\\.\\. PrestoBack will go offline briefly and send a message when it's back\\.",
+			notify.EscapeMD(local[:min(12, len(local))]),
+			notify.EscapeMD(remote[:min(12, len(remote))]),
+		))
+		go func() {
+			if err := backup.SelfUpdate(s.image, s.selfName, s.engine.AnyRunning, func(r backup.UpdateResult) {
+				s.engine.EmitUpdate(r)
+				if r.Stage == "done" {
+					// Container will restart; this message may or may not send before restart.
+					_ = notify.SendRaw(tgCfg, "✅ Update applied — PrestoBack is restarting\\. You'll receive backup notifications once it's back online\\.")
+				} else if r.Stage == "error" {
+					_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Update failed: `%s`", notify.EscapeMD(r.Error)))
+				}
+			}); err != nil {
+				log.Printf("[bot] selfupdate: %v", err)
+				_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Update error: `%s`", notify.EscapeMD(err.Error())))
+			}
+		}()
 
 	case "/help":
 		help := "*PrestoBack Bot Commands*\n\n" +
-			"/status — list all apps\n" +
-			"/backup \\<name\\> — backup an app\n" +
-			"/history — last 10 events\n" +
-			"/help — this message"
-		_ = notify.SendTelegram(tgCfg, notify.Event{AppName: "PrestoBack", Detail: help})
+			"📊 /status — list all apps with paths & schedules\n" +
+			"▶ /backup \\<name\\> — trigger a backup \\(or pick from list\\)\n" +
+			"📜 /history — last 10 backup/restore events\n" +
+			"⚙️ /settings — show current notification & app settings\n" +
+			"🔄 /selfupdate — check for a new image and apply if available\n" +
+			"❓ /help — this message"
+		if err := notify.SendRaw(tgCfg, help); err != nil {
+			log.Printf("[bot] send help: %v", err)
+		}
 	}
+}
+
+func boolStr(b bool) string {
+	if b {
+		return "ON"
+	}
+	return "OFF"
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.TelegramCallbackQuery) {
 	tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
+
+	// Security: verify the callback came from the configured chat/user.
+	// Without this, ANY Telegram user who somehow obtains your bot link can
+	// trigger backups by sending callback_query events (e.g. from a forwarded
+	// button message). Chat.ID on a callback_query is the chat where the
+	// original button message was sent; From.ID is the user who tapped it.
+	chatIDStr := fmt.Sprintf("%d", cb.Message.Chat.ID)
+	fromIDStr := fmt.Sprintf("%d", cb.From.ID)
+	if chatIDStr != nc.TelegramChatID && fromIDStr != nc.TelegramChatID {
+		log.Printf("[bot] rejected callback from chat=%s from=%s (not authorised)", chatIDStr, fromIDStr)
+		_ = notify.AnswerCallbackQuery(nc.TelegramToken, cb.ID, "Not authorised")
+		return
+	}
+
 	_ = notify.AnswerCallbackQuery(nc.TelegramToken, cb.ID, "Processing…")
 	parts := strings.SplitN(cb.Data, ":", 3)
 	if len(parts) < 2 {
@@ -1598,10 +1729,10 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 			return
 		}
 		if s.engine.IsRunning(app.ID) {
-			_ = notify.SendTelegram(tgCfg, notify.Event{AppName: app.Name, Detail: "Already running", IsError: true})
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("⏳ `%s` — already running", notify.EscapeMD(app.Name)))
 			return
 		}
-		_ = notify.SendTelegram(tgCfg, notify.Event{AppName: app.Name, Detail: "Backup started ⏳"})
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf("▶ Backup started for `%s`", notify.EscapeMD(app.Name)))
 		go s.runBackup(app, false)
 	}
 }
