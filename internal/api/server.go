@@ -1487,6 +1487,20 @@ func (s *Server) syncSchedule(app config.AppConfig) {
 // ── Telegram bot ──────────────────────────────────────────────────────────────
 
 func (s *Server) runTelegramBot() {
+	// Send a startup notification so the user knows PrestoBack is online —
+	// especially useful after a /selfupdate restart where the user is waiting
+	// to know the new version came up cleanly.
+	go func() {
+		time.Sleep(3 * time.Second) // wait for initial config to load
+		nc := s.cfg.GetNotify()
+		if nc.TelegramEnabled && nc.TelegramToken != "" && nc.TelegramChatID != "" {
+			_ = notify.SendRaw(
+				notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID},
+				fmt.Sprintf("🟢 *PrestoBack online* — v%s\nType /help for available commands\\.", notify.EscapeMD(config.Version)),
+			)
+		}
+	}()
+
 	offset := 0
 	for {
 		nc := s.cfg.GetNotify()
@@ -1640,7 +1654,7 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 
 	case "/selfupdate":
 		if s.image == "" || s.selfName == "" {
-			_ = notify.SendRaw(tgCfg, "❌ Self\\-update not available: `PRESTOBACK_IMAGE` or `PRESTOBACK_CONTAINER` not set in your compose config\\.")
+			_ = notify.SendRaw(tgCfg, "❌ Self\\-update not available: `PRESTOBACK_IMAGE` and `PRESTOBACK_CONTAINER` must be set in your compose config\\.")
 			return
 		}
 		_ = notify.SendRaw(tgCfg, "🔍 Checking for updates\\.\\.\\.")
@@ -1649,28 +1663,31 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Update check failed: `%s`", notify.EscapeMD(err.Error())))
 			return
 		}
+		localShort := local
+		if len(localShort) > 12 {
+			localShort = localShort[:12]
+		}
+		remoteShort := remote
+		if len(remoteShort) > 12 {
+			remoteShort = remoteShort[:12]
+		}
 		if !hasUpdate {
-			_ = notify.SendRaw(tgCfg, fmt.Sprintf("✅ Already up to date\\.\nDigest: `%s`", notify.EscapeMD(local[:min(12, len(local))])))
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("✅ Already up to date\\.\nDigest: `%s`", notify.EscapeMD(localShort)))
 			return
 		}
 		_ = notify.SendRaw(tgCfg, fmt.Sprintf(
-			"🆕 Update available\\!\n📦 Local: `%s`\n🌐 Remote: `%s`\n\nPulling and restarting now\\.\\.\\. PrestoBack will go offline briefly and send a message when it's back\\.",
-			notify.EscapeMD(local[:min(12, len(local))]),
-			notify.EscapeMD(remote[:min(12, len(remote))]),
+			"🆕 Update available\\!\n📦 Local: `%s`\n🌐 Remote: `%s`\n\nPulling and restarting now\\. PrestoBack will briefly go offline — you'll get backup notifications once it's back\\.",
+			notify.EscapeMD(localShort),
+			notify.EscapeMD(remoteShort),
 		))
 		go func() {
-			if err := backup.SelfUpdate(s.image, s.selfName, s.engine.AnyRunning, func(r backup.UpdateResult) {
-				s.engine.EmitUpdate(r)
-				if r.Stage == "done" {
-					// Container will restart; this message may or may not send before restart.
-					_ = notify.SendRaw(tgCfg, "✅ Update applied — PrestoBack is restarting\\. You'll receive backup notifications once it's back online\\.")
-				} else if r.Stage == "error" {
-					_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Update failed: `%s`", notify.EscapeMD(r.Error)))
-				}
-			}); err != nil {
+			if err := backup.SelfUpdate(s.image, s.selfName, s.engine.AnyRunning, s.engine.EmitUpdate); err != nil {
 				log.Printf("[bot] selfupdate: %v", err)
-				_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Update error: `%s`", notify.EscapeMD(err.Error())))
+				_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Self\\-update failed: `%s`", notify.EscapeMD(err.Error())))
 			}
+			// If SelfUpdate succeeds, the container is replaced — this goroutine
+			// will never reach here. The "back online" message must be sent
+			// on startup instead (see the startup notification in runTelegramBot).
 		}()
 
 	case "/help":
@@ -1692,13 +1709,6 @@ func boolStr(b bool) string {
 		return "ON"
 	}
 	return "OFF"
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.TelegramCallbackQuery) {
