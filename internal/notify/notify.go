@@ -351,6 +351,26 @@ type BotUpdates struct {
 	Result []TelegramUpdate `json:"result"`
 }
 
+// BotCommand describes a bot command for Telegram's autocomplete picker.
+// Command must be lowercase, no leading slash (Telegram adds it).
+// Description is shown in the picker; max 256 characters.
+type BotCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+// SetMyCommands registers the bot's full command list with Telegram so the
+// "/" autocomplete picker displays all available commands with descriptions.
+// Call once on startup after confirming the token is valid.
+func SetMyCommands(token string, commands []BotCommand) error {
+	if token == "" {
+		return fmt.Errorf("telegram token not configured")
+	}
+	return telegramPost(token, "setMyCommands", map[string]any{
+		"commands": commands,
+	})
+}
+
 func GetUpdates(token string, offset int) ([]TelegramUpdate, error) {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=10", token, offset)
 	client := &http.Client{Timeout: 15 * time.Second}

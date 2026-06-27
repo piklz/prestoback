@@ -479,6 +479,32 @@ func humanBytes(b int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
+// formatDurationMs formats a millisecond duration as a compact human string.
+// e.g. 45000 → "45s", 90000 → "1m 30s", 3700000 → "1h 1m"
+func formatDurationMs(ms int64) string {
+	d := time.Duration(ms) * time.Millisecond
+	if d < time.Second {
+		return fmt.Sprintf("%dms", ms)
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		m := int(d.Minutes())
+		s := int(d.Seconds()) % 60
+		if s == 0 {
+			return fmt.Sprintf("%dm", m)
+		}
+		return fmt.Sprintf("%dm %ds", m, s)
+	}
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	if m == 0 {
+		return fmt.Sprintf("%dh", h)
+	}
+	return fmt.Sprintf("%dh %dm", h, m)
+}
+
 func (s *Server) handleValidatePath(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	if path == "" {
@@ -1486,6 +1512,26 @@ func (s *Server) syncSchedule(app config.AppConfig) {
 
 // ── Telegram bot ──────────────────────────────────────────────────────────────
 
+// prestoBackBotCommands returns the full list of bot commands registered with
+// Telegram's setMyCommands API. This is what populates the "/" autocomplete
+// picker in every Telegram client. Command names must be lowercase, no slash.
+func prestoBackBotCommands() []notify.BotCommand {
+	return []notify.BotCommand{
+		{Command: "status", Description: "All apps with paths, schedules, and backup retain counts"},
+		{Command: "apps", Description: "Compact app overview with readable schedule descriptions"},
+		{Command: "backup", Description: "Trigger a backup — /backup <name> or pick from list"},
+		{Command: "history", Description: "Last 10 events — or /history <name> to filter by app"},
+		{Command: "logs", Description: "Detailed recent backups for one app — /logs <name>"},
+		{Command: "disk", Description: "Backup directory disk usage (free / used / total)"},
+		{Command: "next", Description: "Upcoming scheduled backup times across all apps"},
+		{Command: "pause", Description: "Disable an app schedule — /pause <name>"},
+		{Command: "resume", Description: "Re-enable an app schedule — /resume <name>"},
+		{Command: "settings", Description: "Show current notification and app configuration"},
+		{Command: "selfupdate", Description: "Check for a new PrestoBack image and apply it"},
+		{Command: "help", Description: "Show all available commands"},
+	}
+}
+
 func (s *Server) runTelegramBot() {
 	// Send a startup notification so the user knows PrestoBack is online —
 	// especially useful after a /selfupdate restart where the user is waiting
@@ -1498,6 +1544,21 @@ func (s *Server) runTelegramBot() {
 				notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID},
 				fmt.Sprintf("🟢 *PrestoBack online* — v%s\nType /help for available commands\\.", notify.EscapeMD(config.Version)),
 			)
+		}
+	}()
+
+	// Register commands with Telegram so the "/" autocomplete picker is populated.
+	// Runs after the startup notification so the token is confirmed working first.
+	go func() {
+		time.Sleep(5 * time.Second)
+		nc := s.cfg.GetNotify()
+		if nc.TelegramEnabled && nc.TelegramToken != "" {
+			cmds := prestoBackBotCommands()
+			if err := notify.SetMyCommands(nc.TelegramToken, cmds); err != nil {
+				log.Printf("[bot] setMyCommands: %v", err)
+			} else {
+				log.Printf("[bot] registered %d commands with Telegram autocomplete", len(cmds))
+			}
 		}
 	}()
 
@@ -1601,9 +1662,33 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 		go s.runBackup(*app, false)
 
 	case "/history":
-		entries := s.hist.List(10)
+		// /history           → last 10 events across all apps
+		// /history <name>    → last 10 events for that specific app
+		allEntries := s.hist.List(50)
+		var entries []history.Entry
+		if arg == "" {
+			if len(allEntries) > 10 {
+				entries = allEntries[:10]
+			} else {
+				entries = allEntries
+			}
+		} else {
+			lower := strings.ToLower(arg)
+			for _, e := range allEntries {
+				if strings.Contains(strings.ToLower(e.AppName), lower) || strings.Contains(strings.ToLower(e.AppID), lower) {
+					entries = append(entries, e)
+					if len(entries) == 10 {
+						break
+					}
+				}
+			}
+		}
 		var sb strings.Builder
-		sb.WriteString("*Recent history \\(last 10\\)*\n\n")
+		if arg == "" {
+			sb.WriteString("*Recent history \\(last 10\\)*\n\n")
+		} else {
+			sb.WriteString(fmt.Sprintf("*History — %s \\(last 10\\)*\n\n", notify.EscapeMD(arg)))
+		}
 		for _, e := range entries {
 			icon := "✅"
 			if strings.Contains(string(e.Event), "fail") {
@@ -1690,13 +1775,252 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			// on startup instead (see the startup notification in runTelegramBot).
 		}()
 
+	case "/apps":
+		// Compact overview: name, badges, human schedule, volume count, retain
+		apps := s.cfg.ListApps()
+		nextRunMap := map[string]time.Time{}
+		for _, nr := range s.sched.NextRuns() {
+			nextRunMap[nr.AppID] = nr.NextRun
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("*Apps \\(%d\\)*\n\n", len(apps)))
+		for _, a := range apps {
+			// Badges
+			badges := ""
+			if a.Pinned {
+				badges += " 📌"
+			}
+			if s.engine.IsRunning(a.ID) {
+				badges += " ⏳"
+			}
+			if a.Schedule.Enabled && a.Schedule.CronExpr != "" {
+				badges += " 🗓"
+			}
+
+			// Schedule description
+			schedLine := "manual"
+			if a.Schedule.Enabled && a.Schedule.CronExpr != "" {
+				schedLine = scheduler.DescribeCron(a.Schedule.CronExpr)
+				if nr, ok := nextRunMap[a.ID]; ok {
+					schedLine += fmt.Sprintf(" \\(next: %s\\)", notify.EscapeMD(nr.Format("02 Jan 15:04")))
+				}
+			} else if !a.Schedule.Enabled && a.Schedule.CronExpr != "" {
+				schedLine = "⏸ paused"
+			}
+
+			// Volume count
+			volCount := len(a.EnabledVolumes())
+			volLabel := "vol"
+			if volCount != 1 {
+				volLabel = "vols"
+			}
+
+			sb.WriteString(fmt.Sprintf("• *%s*%s\n  🗓 %s\n  📦 %d %s · retain %d\n\n",
+				notify.EscapeMD(a.Name), badges,
+				notify.EscapeMD(schedLine),
+				volCount, volLabel, a.Retain,
+			))
+		}
+		if len(apps) == 0 {
+			sb.WriteString("No apps registered yet\\.")
+		}
+		if err := notify.SendRaw(tgCfg, sb.String()); err != nil {
+			log.Printf("[bot] send apps: %v", err)
+		}
+
+	case "/disk":
+		stat, err := diskUsage(s.cfg.BackupDir())
+		if err != nil {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Could not read disk: `%s`", notify.EscapeMD(err.Error())))
+			return
+		}
+		used := stat.total - stat.free
+		pct := 0
+		if stat.total > 0 {
+			pct = int(100 * used / stat.total)
+		}
+		// Build a simple 10-char bar
+		filled := pct / 10
+		bar := strings.Repeat("█", filled) + strings.Repeat("░", 10-filled)
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+			"*Backup Disk Usage*\n\n"+
+				"📁 `%s`\n"+
+				"💾 Used: `%s`\n"+
+				"🆓 Free: `%s`\n"+
+				"📦 Total: `%s`\n"+
+				"`%s` %d%%",
+			notify.EscapeMD(s.cfg.BackupDir()),
+			notify.EscapeMD(humanBytes(int64(used))),
+			notify.EscapeMD(humanBytes(int64(stat.free))),
+			notify.EscapeMD(humanBytes(int64(stat.total))),
+			bar, pct,
+		))
+
+	case "/next":
+		nextRuns := s.sched.NextRuns()
+		if len(nextRuns) == 0 {
+			_ = notify.SendRaw(tgCfg, "📭 No scheduled backups configured\\.")
+			return
+		}
+		// Sort by next run time
+		sorted := make([]scheduler.NextRunInfo, len(nextRuns))
+		copy(sorted, nextRuns)
+		for i := 1; i < len(sorted); i++ {
+			for j := i; j > 0 && sorted[j].NextRun.Before(sorted[j-1].NextRun); j-- {
+				sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+			}
+		}
+		now := time.Now()
+		var sb strings.Builder
+		sb.WriteString("*Upcoming Backups*\n\n")
+		for _, nr := range sorted {
+			app, ok := s.cfg.GetApp(nr.AppID)
+			name := nr.AppID
+			if ok {
+				name = app.Name
+			}
+			diff := nr.NextRun.Sub(now)
+			var countdown string
+			switch {
+			case diff < time.Minute:
+				countdown = "< 1 min"
+			case diff < time.Hour:
+				countdown = fmt.Sprintf("%d min", int(diff.Minutes()))
+			case diff < 24*time.Hour:
+				h := int(diff.Hours())
+				m := int(diff.Minutes()) % 60
+				if m > 0 {
+					countdown = fmt.Sprintf("%dh %dm", h, m)
+				} else {
+					countdown = fmt.Sprintf("%dh", h)
+				}
+			default:
+				countdown = fmt.Sprintf("%dd %dh", int(diff.Hours())/24, int(diff.Hours())%24)
+			}
+			sb.WriteString(fmt.Sprintf("⏰ *%s*\n   %s _\\(%s\\)_\n\n",
+				notify.EscapeMD(name),
+				notify.EscapeMD(nr.NextRun.Format("02 Jan 15:04")),
+				notify.EscapeMD(countdown),
+			))
+		}
+		if err := notify.SendRaw(tgCfg, sb.String()); err != nil {
+			log.Printf("[bot] send next: %v", err)
+		}
+
+	case "/logs":
+		if arg == "" {
+			_ = notify.SendRaw(tgCfg, "Usage: `/logs \\<app name\\>`")
+			return
+		}
+		app := s.findAppByNameFragment(arg)
+		if app == nil {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ App not found: `%s`", notify.EscapeMD(arg)))
+			return
+		}
+		all := s.hist.List(200)
+		var entries []history.Entry
+		for _, e := range all {
+			if e.AppID == app.ID {
+				entries = append(entries, e)
+				if len(entries) == 5 {
+					break
+				}
+			}
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("*Logs — %s*\n\n", notify.EscapeMD(app.Name)))
+		if len(entries) == 0 {
+			sb.WriteString("No history for this app yet\\.")
+		}
+		for _, e := range entries {
+			icon := "✅"
+			if strings.Contains(string(e.Event), "fail") {
+				icon = "❌"
+			}
+			sb.WriteString(fmt.Sprintf("%s *%s*\n", icon, notify.EscapeMD(string(e.Event))))
+			sb.WriteString(fmt.Sprintf("   🕐 _%s_\n", notify.EscapeMD(e.Time.Format("02 Jan 2006 15:04"))))
+			if e.Detail != "" {
+				sb.WriteString(fmt.Sprintf("   📋 `%s`\n", notify.EscapeMD(e.Detail)))
+			}
+			if e.SizeBytes > 0 {
+				sb.WriteString(fmt.Sprintf("   💾 %s\n", notify.EscapeMD(humanBytes(e.SizeBytes))))
+			}
+			if e.DurationMs > 0 {
+				sb.WriteString(fmt.Sprintf("   ⏱ %s\n", notify.EscapeMD(formatDurationMs(e.DurationMs))))
+			}
+			sb.WriteString("\n")
+		}
+		if err := notify.SendRaw(tgCfg, sb.String()); err != nil {
+			log.Printf("[bot] send logs: %v", err)
+		}
+
+	case "/pause":
+		if arg == "" {
+			_ = notify.SendRaw(tgCfg, "Usage: `/pause \\<app name\\>`")
+			return
+		}
+		app := s.findAppByNameFragment(arg)
+		if app == nil {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ App not found: `%s`", notify.EscapeMD(arg)))
+			return
+		}
+		if !app.Schedule.Enabled {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("⚠️ `%s` schedule is already paused", notify.EscapeMD(app.Name)))
+			return
+		}
+		app.Schedule.Enabled = false
+		if err := s.cfg.UpdateApp(*app); err != nil {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Failed to update: `%s`", notify.EscapeMD(err.Error())))
+			return
+		}
+		_ = s.cfg.Save()
+		s.syncSchedule(*app) // removes the job from the scheduler
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf("⏸ *%s* — schedule paused\nUse /resume %s to re\\-enable\\.",
+			notify.EscapeMD(app.Name), notify.EscapeMD(app.Name)))
+
+	case "/resume":
+		if arg == "" {
+			_ = notify.SendRaw(tgCfg, "Usage: `/resume \\<app name\\>`")
+			return
+		}
+		app := s.findAppByNameFragment(arg)
+		if app == nil {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ App not found: `%s`", notify.EscapeMD(arg)))
+			return
+		}
+		if app.Schedule.CronExpr == "" {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("⚠️ `%s` has no cron expression configured — edit the app first", notify.EscapeMD(app.Name)))
+			return
+		}
+		if app.Schedule.Enabled {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("⚠️ `%s` schedule is already active \\(%s\\)",
+				notify.EscapeMD(app.Name), notify.EscapeMD(scheduler.DescribeCron(app.Schedule.CronExpr))))
+			return
+		}
+		app.Schedule.Enabled = true
+		if err := s.cfg.UpdateApp(*app); err != nil {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Failed to update: `%s`", notify.EscapeMD(err.Error())))
+			return
+		}
+		_ = s.cfg.Save()
+		s.syncSchedule(*app) // re-upserts the job into the scheduler
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf("▶ *%s* — schedule resumed\n🗓 %s",
+			notify.EscapeMD(app.Name),
+			notify.EscapeMD(scheduler.DescribeCron(app.Schedule.CronExpr))))
+
 	case "/help":
 		help := "*PrestoBack Bot Commands*\n\n" +
-			"📊 /status — list all apps with paths & schedules\n" +
+			"📊 /status — all apps with paths, cron, retain counts\n" +
+			"📱 /apps — compact overview with readable schedules\n" +
 			"▶ /backup \\<name\\> — trigger a backup \\(or pick from list\\)\n" +
-			"📜 /history — last 10 backup/restore events\n" +
-			"⚙️ /settings — show current notification & app settings\n" +
-			"🔄 /selfupdate — check for a new image and apply if available\n" +
+			"📜 /history — last 10 events \\(or /history \\<name\\> to filter\\)\n" +
+			"🔍 /logs \\<name\\> — detailed recent backups for one app\n" +
+			"💾 /disk — backup directory disk usage\n" +
+			"⏰ /next — upcoming scheduled backup times\n" +
+			"⏸ /pause \\<name\\> — disable an app's automatic schedule\n" +
+			"▶ /resume \\<name\\> — re\\-enable an app's schedule\n" +
+			"⚙️ /settings — notification and app configuration\n" +
+			"🔄 /selfupdate — check for a new image and apply\n" +
 			"❓ /help — this message"
 		if err := notify.SendRaw(tgCfg, help); err != nil {
 			log.Printf("[bot] send help: %v", err)
