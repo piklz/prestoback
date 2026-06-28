@@ -15,6 +15,7 @@ func main() {
 	port := flag.Int("port", 8765, "HTTP server port")
 	dataDir := flag.String("data", "/data", "PrestoBack data directory")
 	volumesDir := flag.String("volumes", "/volumes", "Presto volumes directory")
+	composeFile := flag.String("compose-file", "", "Path inside this container to your docker-compose.yml (enables /update auto-restart). E.g. /compose/docker-compose.yml")
 	flag.Parse()
 
 	image := envOr("PRESTOBACK_IMAGE", "")
@@ -28,6 +29,15 @@ func main() {
 	}
 	cfg.VolumesDir = *volumesDir
 	cfg.DataDir = *dataDir
+
+	// Compose file: flag takes precedence over env var.
+	cfg.ComposeFile = *composeFile
+	if cfg.ComposeFile == "" {
+		cfg.ComposeFile = envOr("PRESTOBACK_COMPOSE_FILE", "")
+	}
+	if cfg.ComposeFile != "" {
+		log.Printf("compose file: %s (used by /update for auto-restart)", cfg.ComposeFile)
+	}
 
 	if err := os.MkdirAll(cfg.BackupDir(), 0755); err != nil {
 		log.Fatalf("mkdir backup dir: %v", err)

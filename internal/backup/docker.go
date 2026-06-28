@@ -447,19 +447,30 @@ type ContainerUpdate struct {
 
 const pullTimeout = 10 * time.Minute
 
-// UpdateContainer pulls the latest image for c and, if the container is
-// compose-managed (has com.docker.compose.project.working_dir label), recreates
-// it via "docker compose up -d --no-deps <service>".
+// UpdateContainer pulls the latest image for c and attempts to recreate it
+// via Docker Compose. The recreation strategy is tried in this order:
 //
-// docker pull has a 10-minute timeout — sufficient for large images on a Pi
-// while preventing the goroutine hanging indefinitely on a network stall.
+//  1. composeFile (non-empty): docker compose -f <file> up -d --no-deps <service>
+//     Use this when the host's compose file is mounted into the prestoback
+//     container (e.g. - ./docker-compose.yml:/compose/docker-compose.yml:ro)
+//     and PRESTOBACK_COMPOSE_FILE=/compose/docker-compose.yml is set.
 //
-// Important: this does NOT back up the container's data first. Callers should
-// run a backup (or accept the risk) before calling this.
-func UpdateContainer(c ContainerInfo) ContainerUpdate {
+//  2. working_dir label fallback: docker compose --project-directory <wd> …
+//     Only works if the host's project directory is ALSO mounted inside the
+//     prestoback container at the same path — uncommon, but supported.
+//
+//  3. NeedsManual: image was pulled but we cannot recreate automatically.
+//     The user must restart the container themselves (docker compose up -d).
+//
+// docker pull carries a 10-minute timeout to prevent indefinite hangs on a
+// slow connection or a stalled registry.
+//
+// This does NOT back up the container's data. Run a backup first if the app
+// stores state — /update is for stateless or low-risk image refreshes.
+func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 	res := ContainerUpdate{ContainerName: c.Name}
 
-	// Resolve the image name from the live container config.
+	// Step 1: resolve image name.
 	out, err := exec.Command("docker", "inspect", "--format={{.Config.Image}}", c.ID).Output()
 	if err != nil {
 		res.Err = "inspect failed: " + err.Error()
@@ -471,7 +482,7 @@ func UpdateContainer(c ContainerInfo) ContainerUpdate {
 		return res
 	}
 
-	// Pull the latest digest — with a hard timeout so we don't hang forever.
+	// Step 2: pull latest — with a hard deadline.
 	ctx, cancel := context.WithTimeout(context.Background(), pullTimeout)
 	defer cancel()
 	pullOut, err := exec.CommandContext(ctx, "docker", "pull", res.Image).CombinedOutput()
@@ -484,27 +495,49 @@ func UpdateContainer(c ContainerInfo) ContainerUpdate {
 		return res
 	}
 	res.Pulled = true
-	// Detect "already up to date" so callers can report it differently.
 	res.AlreadyUpToDate = strings.Contains(string(pullOut), "up to date")
 
-	// Re-create via compose if we know the project working directory.
+	// Step 3: recreate via compose.
 	labels := inspectLabels(c.ID)
-	wd := labels["com.docker.compose.project.working_dir"]
 	service := labels["com.docker.compose.service"]
-	if wd != "" && service != "" {
+
+	if service != "" && composeFile != "" {
+		// Strategy A: user-configured compose file (the recommended path).
+		// The file is mounted into this container, so docker compose can read it.
+		// Docker Compose sends container config to the daemon (via socket) which
+		// creates the container on the host — volume paths stay host-relative.
 		upOut, err := exec.Command("docker", "compose",
-			"--project-directory", wd,
+			"-f", composeFile,
 			"up", "-d", "--no-deps", service,
 		).CombinedOutput()
 		if err != nil {
-			res.Err = "compose up failed: " + strings.TrimSpace(string(upOut))
+			res.Err = fmt.Sprintf("compose up failed (file: %s, service: %s): %s",
+				composeFile, service, strings.TrimSpace(string(upOut)))
 			return res
 		}
 		res.Restarted = true
 		return res
 	}
 
-	// No compose metadata — pulled OK but cannot auto-recreate.
+	if service != "" {
+		// Strategy B: working_dir label — only succeeds if the host project dir
+		// is also bind-mounted into prestoback at the same absolute path.
+		wd := labels["com.docker.compose.project.working_dir"]
+		if wd != "" {
+			_, err := exec.Command("docker", "compose",
+				"--project-directory", wd,
+				"up", "-d", "--no-deps", service,
+			).CombinedOutput()
+			if err == nil {
+				res.Restarted = true
+				return res
+			}
+			// Path not mounted — expected in most setups. Fall through to NeedsManual.
+			log.Printf("[docker] compose up via working_dir %q not accessible inside container, falling back to manual: %v", wd, err)
+		}
+	}
+
+	// Strategy C: image pulled but container recreation requires user action.
 	res.NeedsManual = true
 	return res
 }

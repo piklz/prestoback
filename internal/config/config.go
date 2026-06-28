@@ -158,6 +158,11 @@ type disk struct {
 type Config struct {
 	DataDir    string
 	VolumesDir string
+	// ComposeFile is the path, inside this container, to the docker-compose.yml
+	// that manages the apps PrestoBack monitors. Set via PRESTOBACK_COMPOSE_FILE
+	// env var or --compose-file flag. Not persisted — set at startup only.
+	// Example: /compose/docker-compose.yml (with host ~/presto mounted at /compose).
+	ComposeFile string
 
 	mu            sync.RWMutex
 	apiKey        string

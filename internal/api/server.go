@@ -237,8 +237,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"time":              time.Now().UTC(),
 		"disk_free_bytes":   diskFreeBytes,
 		"disk_total_bytes":  diskTotalBytes,
-		"disk_low_pct":      diskLowPct,    // non-zero = warning; value = % free
-		"maintenance_until": maintUntilStr, // RFC3339 or "" if not in maintenance
+		"disk_low_pct":      diskLowPct,        // non-zero = warning; value = % free
+		"maintenance_until": maintUntilStr,     // RFC3339 or "" if not in maintenance
+		"compose_file":      s.cfg.ComposeFile, // "" if /update auto-restart not configured
 		"next_runs":         nextRuns,
 	})
 }
@@ -747,7 +748,7 @@ func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.
 			type res struct{ r backup.ContainerUpdate }
 			ch := make(chan res, 1)
 			cStart := time.Now()
-			go func(ci backup.ContainerInfo) { ch <- res{r: backup.UpdateContainer(ci)} }(c)
+			go func(ci backup.ContainerInfo) { ch <- res{r: backup.UpdateContainer(ci, s.cfg.ComposeFile)} }(c)
 
 			var cr cResult
 			cr.name = c.Name
@@ -798,6 +799,9 @@ func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.
 			case cr.res.NeedsManual:
 				sb.WriteString(fmt.Sprintf("  📥 `%s` — pulled, manual restart needed _%s_\n",
 					notify.EscapeMD(cr.name), notify.EscapeMD(formatDuration(cr.dur))))
+				if s.cfg.ComposeFile == "" {
+					sb.WriteString("     💡 _Add `PRESTOBACK\\_COMPOSE\\_FILE` to enable auto\\-restart — see /update help_\n")
+				}
 			}
 			if cr.res.Image != "" && !cr.res.AlreadyUpToDate {
 				sb.WriteString(fmt.Sprintf("     📦 `%s`\n", notify.EscapeMD(cr.res.Image)))
@@ -2050,6 +2054,12 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			sb.WriteString(fmt.Sprintf("\n🐋 *Image:* `%s`\n", notify.EscapeMD(s.image)))
 		}
 		sb.WriteString(fmt.Sprintf("📦 *Version:* `%s`\n", notify.EscapeMD(config.Version)))
+		// /update compose config
+		if s.cfg.ComposeFile != "" {
+			sb.WriteString(fmt.Sprintf("🔄 *Compose file:* `%s`\n", notify.EscapeMD(s.cfg.ComposeFile)))
+		} else {
+			sb.WriteString("🔄 *Compose file:* _not set_ \\(/update help for setup\\)\n")
+		}
 		if err := notify.SendRaw(tgCfg, sb.String()); err != nil {
 			log.Printf("[bot] send settings: %v", err)
 		}
@@ -2406,6 +2416,33 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 		if lower == "" {
 			// No arg — show app picker with an "Update ALL" option at top
 			s.sendTelegramAppList(tgCfg, "update")
+			return
+		}
+		if lower == "help" {
+			composeStatus := "❌ not configured"
+			if s.cfg.ComposeFile != "" {
+				composeStatus = fmt.Sprintf("✅ `%s`", notify.EscapeMD(s.cfg.ComposeFile))
+			}
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+				"*\\/update — how auto\\-restart works*\n\n"+
+					"*Current compose file:* %s\n\n"+
+					"PrestoBack runs inside Docker and cannot see your host's `~/presto/` directory\\. "+
+					"To enable automatic container recreation after a pull, mount your compose file "+
+					"into the prestoback container and set the env var:\n\n"+
+					"```yaml\n"+
+					"# In your docker-compose.yml:\n"+
+					"prestoback:\n"+
+					"  environment:\n"+
+					"    - PRESTOBACK_COMPOSE_FILE=/compose/docker-compose.yml\n"+
+					"  volumes:\n"+
+					"    - ./docker-compose.yml:/compose/docker-compose.yml:ro\n"+
+					"```\n\n"+
+					"After adding this, `/update <name>` will:\n"+
+					"1\\. `docker pull` the latest image\n"+
+					"2\\. `docker compose -f /compose/docker-compose.yml up -d --no-deps <service>`\n\n"+
+					"Use `/selfupdate` to update PrestoBack itself\\.",
+				composeStatus,
+			))
 			return
 		}
 		if lower == "all" {
