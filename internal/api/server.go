@@ -713,38 +713,105 @@ func (s *Server) runPruneAll(tgCfg notify.TelegramConfig) {
 	_ = notify.SendRaw(tgCfg, sb.String())
 }
 
-// runContainerUpdates pulls + recreates containers for each app, then sends a summary.
+// runContainerUpdates pulls + recreates containers for each app, streaming a
+// timed summary back to Telegram when all work is done.
+// isSingle=true produces a focused single-app format; false produces a table.
 func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.AppConfig) {
-	var sb strings.Builder
-	sb.WriteString("*Container Update Results*\n\n")
-	anyResult := false
+	type cResult struct {
+		name     string
+		res      backup.ContainerUpdate
+		dur      time.Duration
+		timedOut bool
+	}
+	type aResult struct {
+		appName      string
+		noContainers bool
+		containers   []cResult
+		dur          time.Duration
+	}
+
+	overallStart := time.Now()
+	results := make([]aResult, 0, len(apps))
 
 	for _, app := range apps {
+		appStart := time.Now()
 		containers := backup.DedupeContainers(backup.FindContainers(app.ID))
 		if len(containers) == 0 {
-			sb.WriteString(fmt.Sprintf("⚠️ `%s` — no containers found\n\n", notify.EscapeMD(app.Name)))
-			anyResult = true
+			results = append(results, aResult{appName: app.Name, noContainers: true, dur: time.Since(appStart)})
 			continue
 		}
-		sb.WriteString(fmt.Sprintf("*%s*\n", notify.EscapeMD(app.Name)))
+		ar := aResult{appName: app.Name}
 		for _, c := range containers {
-			res := backup.UpdateContainer(c)
-			switch {
-			case res.Err != "":
-				sb.WriteString(fmt.Sprintf("  ❌ `%s`: %s\n", notify.EscapeMD(c.Name), notify.EscapeMD(res.Err)))
-			case res.Restarted:
-				sb.WriteString(fmt.Sprintf("  ✅ `%s` — pulled \\+ recreated\n", notify.EscapeMD(c.Name)))
-			case res.NeedsManual:
-				sb.WriteString(fmt.Sprintf("  📥 `%s` — image pulled \\(`%s`\\)\n     ⚠️ Not compose\\-managed — please recreate manually\n",
-					notify.EscapeMD(c.Name), notify.EscapeMD(res.Image)))
+			// Run pull+recreate in a goroutine so we can enforce a deadline
+			// independently of the Docker client's own handling.
+			type res struct{ r backup.ContainerUpdate }
+			ch := make(chan res, 1)
+			cStart := time.Now()
+			go func(ci backup.ContainerInfo) { ch <- res{r: backup.UpdateContainer(ci)} }(c)
+
+			var cr cResult
+			cr.name = c.Name
+			select {
+			case r := <-ch:
+				cr.res = r.r
+			case <-time.After(11 * time.Minute): // slightly > pull's own ctx timeout
+				cr.timedOut = true
 			}
-			anyResult = true
+			cr.dur = time.Since(cStart)
+			ar.containers = append(ar.containers, cr)
 		}
-		sb.WriteString("\n")
+		ar.dur = time.Since(appStart)
+		results = append(results, ar)
 	}
-	if !anyResult {
-		sb.WriteString("No containers found to update\\.")
+
+	totalDur := time.Since(overallStart)
+	isSingle := len(apps) == 1
+
+	var sb strings.Builder
+	if isSingle && len(results) > 0 {
+		sb.WriteString(fmt.Sprintf("*Update — %s*\n\n", notify.EscapeMD(results[0].appName)))
+	} else {
+		sb.WriteString(fmt.Sprintf("*Update Results* — %d app\\(s\\) in %s\n\n",
+			len(apps), notify.EscapeMD(formatDuration(totalDur))))
 	}
+
+	for _, ar := range results {
+		if ar.noContainers {
+			sb.WriteString(fmt.Sprintf("⚠️ *%s* — no containers found\n\n", notify.EscapeMD(ar.appName)))
+			continue
+		}
+		if !isSingle {
+			sb.WriteString(fmt.Sprintf("*%s* _%s_\n", notify.EscapeMD(ar.appName), notify.EscapeMD(formatDuration(ar.dur))))
+		}
+		for _, cr := range ar.containers {
+			switch {
+			case cr.timedOut:
+				sb.WriteString(fmt.Sprintf("  ❌ `%s` — timed out \\(pull \\>10 min\\)\n", notify.EscapeMD(cr.name)))
+			case cr.res.Err != "":
+				sb.WriteString(fmt.Sprintf("  ❌ `%s` — %s\n", notify.EscapeMD(cr.name), notify.EscapeMD(cr.res.Err)))
+			case cr.res.AlreadyUpToDate:
+				sb.WriteString(fmt.Sprintf("  ✔ `%s` — already up to date _%s_\n",
+					notify.EscapeMD(cr.name), notify.EscapeMD(formatDuration(cr.dur))))
+			case cr.res.Restarted:
+				sb.WriteString(fmt.Sprintf("  ✅ `%s` — pulled \\+ recreated _%s_\n",
+					notify.EscapeMD(cr.name), notify.EscapeMD(formatDuration(cr.dur))))
+			case cr.res.NeedsManual:
+				sb.WriteString(fmt.Sprintf("  📥 `%s` — pulled, manual restart needed _%s_\n",
+					notify.EscapeMD(cr.name), notify.EscapeMD(formatDuration(cr.dur))))
+			}
+			if cr.res.Image != "" && !cr.res.AlreadyUpToDate {
+				sb.WriteString(fmt.Sprintf("     📦 `%s`\n", notify.EscapeMD(cr.res.Image)))
+			}
+		}
+		if !isSingle {
+			sb.WriteString("\n")
+		}
+	}
+
+	if isSingle {
+		sb.WriteString(fmt.Sprintf("\n⏱ _%s_", notify.EscapeMD(formatDuration(totalDur))))
+	}
+
 	_ = notify.SendRaw(tgCfg, sb.String())
 }
 
@@ -2337,30 +2404,39 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 	case "/update":
 		lower := strings.ToLower(strings.TrimSpace(arg))
 		if lower == "" {
-			_ = notify.SendRaw(tgCfg,
-				"Usage:\n`/update \\<name\\>` — pull \\+ recreate one app's container\\(s\\)\n`/update all` — update all registered apps' containers")
+			// No arg — show app picker with an "Update ALL" option at top
+			s.sendTelegramAppList(tgCfg, "update")
 			return
 		}
-		var targets []config.AppConfig
 		if lower == "all" {
-			targets = s.cfg.ListApps()
+			targets := s.cfg.ListApps()
 			sort.Slice(targets, func(i, j int) bool { return targets[i].Name < targets[j].Name })
-			_ = notify.SendRaw(tgCfg, fmt.Sprintf(
-				"🔄 Pulling images for *%d* apps\\. This may take a few minutes\\.\\.\\.",
-				len(targets),
-			))
-		} else {
-			app := s.findAppByNameFragment(arg)
-			if app == nil {
-				_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ App not found: `%s`", notify.EscapeMD(arg)))
+			if len(targets) == 0 {
+				_ = notify.SendRaw(tgCfg, "❌ No apps registered\\.")
 				return
 			}
-			targets = []config.AppConfig{*app}
-			_ = notify.SendRaw(tgCfg, fmt.Sprintf("🔄 Pulling `%s`\\.\\.\\.", notify.EscapeMD(app.Name)))
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+				"🔄 Pulling latest images for *%d* app\\(s\\)\\. Results incoming when complete\\.\\.\\.",
+				len(targets),
+			))
+			go s.runContainerUpdates(tgCfg, targets)
+			return
 		}
-		go s.runContainerUpdates(tgCfg, targets)
+		app := s.findAppByNameFragment(arg)
+		if app == nil {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+				"❌ App not found: `%s`\nUse /update with no args to pick from list\\.",
+				notify.EscapeMD(arg),
+			))
+			return
+		}
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf("🔄 Pulling `%s`\\.\\.\\.", notify.EscapeMD(app.Name)))
+		go s.runContainerUpdates(tgCfg, []config.AppConfig{*app})
 
 	case "/help":
+		// NOTE: every special MarkdownV2 character in this literal must be escaped with \.
+		// Reserved chars: _ * [ ] ( ) ~ ` > # + - = | { } . !
+		// The | in <name|all> and () throughout are the most common sources of 400 errors.
 		help := "*PrestoBack Bot Commands*\n\n" +
 			"📊 /status — all apps with paths, cron, retain counts\n" +
 			"📱 /apps — compact overview with readable schedules\n" +
@@ -2372,7 +2448,7 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			"⏸ /pause \\<name\\> — disable an app's automatic schedule\n" +
 			"▶ /resume \\<name\\> — re\\-enable an app's schedule\n" +
 			"🔧 /maintenance \\<2h/1d/1w/on/off\\> — freeze all schedules temporarily\n" +
-			"🔄 /update \\<name|all\\> — pull \\+ recreate container\\(s\\)\n" +
+			"🔄 /update \\<name\\|all\\> — pull \\+ recreate container\\(s\\)\n" +
 			"⚙️ /settings — notification and app configuration\n" +
 			"🔃 /selfupdate — check for a new PrestoBack image and apply\n" +
 			"❓ /help — this message"
@@ -2452,6 +2528,24 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 		}
 		_ = notify.SendRaw(tgCfg, fmt.Sprintf("▶ Backup started for `%s`", notify.EscapeMD(app.Name)))
 		go s.runBackup(app, false)
+
+	case "update":
+		if parts[1] == "all" {
+			targets := s.cfg.ListApps()
+			sort.Slice(targets, func(i, j int) bool { return targets[i].Name < targets[j].Name })
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+				"🔄 Pulling latest images for *%d* app\\(s\\)\\. Results incoming when complete\\.\\.\\.",
+				len(targets),
+			))
+			go s.runContainerUpdates(tgCfg, targets)
+		} else {
+			app, ok := s.cfg.GetApp(parts[1])
+			if !ok {
+				return
+			}
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("🔄 Pulling `%s`\\.\\.\\.", notify.EscapeMD(app.Name)))
+			go s.runContainerUpdates(tgCfg, []config.AppConfig{app})
+		}
 	}
 }
 
@@ -2459,6 +2553,9 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 // alphabetically. Using SendRawWithButtons (one per row) instead of the old
 // map-based approach fixes the button truncation seen when all buttons were
 // crammed into a single scrollable horizontal row.
+//
+// For the "update" action an extra "Update ALL" button is prepended so the
+// user can trigger a bulk update without typing /update all.
 func (s *Server) sendTelegramAppList(tgCfg notify.TelegramConfig, action string) {
 	apps := s.cfg.ListApps()
 	if len(apps) == 0 {
@@ -2466,9 +2563,17 @@ func (s *Server) sendTelegramAppList(tgCfg notify.TelegramConfig, action string)
 		return
 	}
 	sort.Slice(apps, func(i, j int) bool { return apps[i].Name < apps[j].Name })
-	btns := make([]notify.ButtonAction, len(apps))
-	for i, a := range apps {
-		btns[i] = notify.ButtonAction{Label: a.Name, Data: action + ":" + a.ID}
+
+	var btns []notify.ButtonAction
+	// Prepend a bulk-action button for update so users can choose All without typing.
+	if action == "update" {
+		btns = append(btns, notify.ButtonAction{
+			Label: fmt.Sprintf("⬆️ Update ALL %d apps", len(apps)),
+			Data:  "update:all",
+		})
+	}
+	for _, a := range apps {
+		btns = append(btns, notify.ButtonAction{Label: a.Name, Data: action + ":" + a.ID})
 	}
 	_ = notify.SendRawWithButtons(tgCfg,
 		fmt.Sprintf("Choose an app to *%s*:", notify.EscapeMD(action)),

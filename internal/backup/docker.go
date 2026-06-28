@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -435,17 +436,23 @@ func dedupe(ss []string) []string {
 
 // ContainerUpdate holds the result of pulling and recreating one container.
 type ContainerUpdate struct {
-	ContainerName string
-	Image         string
-	Pulled        bool   // image was pulled from registry
-	Restarted     bool   // container was recreated via compose up -d
-	NeedsManual   bool   // pulled OK but no compose info — user must recreate
-	Err           string // non-empty on failure
+	ContainerName   string
+	Image           string
+	Pulled          bool   // image was pulled from registry
+	AlreadyUpToDate bool   // pull succeeded but image was already current
+	Restarted       bool   // container was recreated via compose up -d
+	NeedsManual     bool   // pulled OK but no compose info — user must recreate
+	Err             string // non-empty on failure
 }
+
+const pullTimeout = 10 * time.Minute
 
 // UpdateContainer pulls the latest image for c and, if the container is
 // compose-managed (has com.docker.compose.project.working_dir label), recreates
 // it via "docker compose up -d --no-deps <service>".
+//
+// docker pull has a 10-minute timeout — sufficient for large images on a Pi
+// while preventing the goroutine hanging indefinitely on a network stall.
 //
 // Important: this does NOT back up the container's data first. Callers should
 // run a backup (or accept the risk) before calling this.
@@ -464,17 +471,23 @@ func UpdateContainer(c ContainerInfo) ContainerUpdate {
 		return res
 	}
 
-	// Pull the latest digest for this image.
-	pullOut, err := exec.Command("docker", "pull", res.Image).CombinedOutput()
+	// Pull the latest digest — with a hard timeout so we don't hang forever.
+	ctx, cancel := context.WithTimeout(context.Background(), pullTimeout)
+	defer cancel()
+	pullOut, err := exec.CommandContext(ctx, "docker", "pull", res.Image).CombinedOutput()
 	if err != nil {
-		res.Err = "pull failed: " + strings.TrimSpace(string(pullOut))
+		if ctx.Err() == context.DeadlineExceeded {
+			res.Err = fmt.Sprintf("pull timed out after %s", pullTimeout)
+		} else {
+			res.Err = "pull failed: " + strings.TrimSpace(string(pullOut))
+		}
 		return res
 	}
 	res.Pulled = true
+	// Detect "already up to date" so callers can report it differently.
+	res.AlreadyUpToDate = strings.Contains(string(pullOut), "up to date")
 
 	// Re-create via compose if we know the project working directory.
-	// Compose reads its own compose.yml / docker-compose.yml from that dir,
-	// so we don't need to guess the filename.
 	labels := inspectLabels(c.ID)
 	wd := labels["com.docker.compose.project.working_dir"]
 	service := labels["com.docker.compose.service"]
@@ -491,8 +504,7 @@ func UpdateContainer(c ContainerInfo) ContainerUpdate {
 		return res
 	}
 
-	// No compose metadata — we pulled the image but cannot auto-recreate.
-	// The user must stop + rm + docker run (or docker compose up) themselves.
+	// No compose metadata — pulled OK but cannot auto-recreate.
 	res.NeedsManual = true
 	return res
 }
