@@ -445,6 +445,30 @@ type ContainerUpdate struct {
 	Err             string // non-empty on failure
 }
 
+// stripDockerOutput removes terminal control sequences and Unicode braille
+// spinner frames (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ and similar) that docker compose writes to
+// stderr for progress display. These characters survive EscapeMD but can cause
+// Telegram's MarkdownV2 parser to reject messages in certain positions.
+func stripDockerOutput(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		// Skip Braille Patterns block (U+2800–U+28FF) — used as CLI spinners
+		if r >= 0x2800 && r <= 0x28FF {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	// Collapse runs of whitespace/newlines left by removed chars
+	out := strings.TrimSpace(b.String())
+	// Keep only the last N lines — Docker output can be very verbose
+	const maxLines = 8
+	lines := strings.Split(out, "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
 const pullTimeout = 10 * time.Minute
 
 // UpdateContainer pulls the latest image for c and attempts to recreate it
@@ -490,7 +514,7 @@ func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 		if ctx.Err() == context.DeadlineExceeded {
 			res.Err = fmt.Sprintf("pull timed out after %s", pullTimeout)
 		} else {
-			res.Err = "pull failed: " + strings.TrimSpace(string(pullOut))
+			res.Err = "pull failed: " + stripDockerOutput(string(pullOut))
 		}
 		return res
 	}
@@ -502,17 +526,13 @@ func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 	service := labels["com.docker.compose.service"]
 
 	if service != "" && composeFile != "" {
-		// Strategy A: user-configured compose file (the recommended path).
-		// The file is mounted into this container, so docker compose can read it.
-		// Docker Compose sends container config to the daemon (via socket) which
-		// creates the container on the host — volume paths stay host-relative.
 		upOut, err := exec.Command("docker", "compose",
 			"-f", composeFile,
 			"up", "-d", "--no-deps", service,
 		).CombinedOutput()
 		if err != nil {
 			res.Err = fmt.Sprintf("compose up failed (file: %s, service: %s): %s",
-				composeFile, service, strings.TrimSpace(string(upOut)))
+				composeFile, service, stripDockerOutput(string(upOut)))
 			return res
 		}
 		res.Restarted = true
@@ -520,8 +540,6 @@ func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 	}
 
 	if service != "" {
-		// Strategy B: working_dir label — only succeeds if the host project dir
-		// is also bind-mounted into prestoback at the same absolute path.
 		wd := labels["com.docker.compose.project.working_dir"]
 		if wd != "" {
 			_, err := exec.Command("docker", "compose",
@@ -532,7 +550,6 @@ func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 				res.Restarted = true
 				return res
 			}
-			// Path not mounted — expected in most setups. Fall through to NeedsManual.
 			log.Printf("[docker] compose up via working_dir %q not accessible inside container, falling back to manual: %v", wd, err)
 		}
 	}

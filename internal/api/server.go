@@ -716,8 +716,15 @@ func (s *Server) runPruneAll(tgCfg notify.TelegramConfig) {
 
 // runContainerUpdates pulls + recreates containers for each app, streaming a
 // timed summary back to Telegram when all work is done.
-// isSingle=true produces a focused single-app format; false produces a table.
 func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.AppConfig) {
+	// Belt-and-suspenders: a panic in a goroutine would crash the bot loop.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[update] PANIC in runContainerUpdates: %v", r)
+			_ = notify.SendRaw(tgCfg, "❌ Internal error during update — check container logs\\.")
+		}
+	}()
+
 	type cResult struct {
 		name     string
 		res      backup.ContainerUpdate
@@ -735,16 +742,17 @@ func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.
 	results := make([]aResult, 0, len(apps))
 
 	for _, app := range apps {
+		log.Printf("[update] processing app %s (id: %s)", app.Name, app.ID)
 		appStart := time.Now()
 		containers := backup.DedupeContainers(backup.FindContainers(app.ID))
 		if len(containers) == 0 {
+			log.Printf("[update] no containers found for app %s", app.ID)
 			results = append(results, aResult{appName: app.Name, noContainers: true, dur: time.Since(appStart)})
 			continue
 		}
 		ar := aResult{appName: app.Name}
 		for _, c := range containers {
-			// Run pull+recreate in a goroutine so we can enforce a deadline
-			// independently of the Docker client's own handling.
+			log.Printf("[update] pulling container %s for app %s (composeFile=%q)", c.Name, app.Name, s.cfg.ComposeFile)
 			type res struct{ r backup.ContainerUpdate }
 			ch := make(chan res, 1)
 			cStart := time.Now()
@@ -755,10 +763,12 @@ func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.
 			select {
 			case r := <-ch:
 				cr.res = r.r
-			case <-time.After(11 * time.Minute): // slightly > pull's own ctx timeout
+			case <-time.After(11 * time.Minute):
 				cr.timedOut = true
 			}
 			cr.dur = time.Since(cStart)
+			log.Printf("[update] container %s done in %s: err=%q restarted=%v upToDate=%v timedOut=%v",
+				c.Name, cr.dur.Round(time.Second), cr.res.Err, cr.res.Restarted, cr.res.AlreadyUpToDate, cr.timedOut)
 			ar.containers = append(ar.containers, cr)
 		}
 		ar.dur = time.Since(appStart)
@@ -785,11 +795,17 @@ func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.
 			sb.WriteString(fmt.Sprintf("*%s* _%s_\n", notify.EscapeMD(ar.appName), notify.EscapeMD(formatDuration(ar.dur))))
 		}
 		for _, cr := range ar.containers {
+			// Truncate error messages — Docker output can include long stack traces
+			// and spinner characters that trip MarkdownV2 length limits.
+			errMsg := cr.res.Err
+			if len(errMsg) > 300 {
+				errMsg = errMsg[:300] + "…"
+			}
 			switch {
 			case cr.timedOut:
 				sb.WriteString(fmt.Sprintf("  ❌ `%s` — timed out \\(pull \\>10 min\\)\n", notify.EscapeMD(cr.name)))
-			case cr.res.Err != "":
-				sb.WriteString(fmt.Sprintf("  ❌ `%s` — %s\n", notify.EscapeMD(cr.name), notify.EscapeMD(cr.res.Err)))
+			case errMsg != "":
+				sb.WriteString(fmt.Sprintf("  ❌ `%s` — %s\n", notify.EscapeMD(cr.name), notify.EscapeMD(errMsg)))
 			case cr.res.AlreadyUpToDate:
 				sb.WriteString(fmt.Sprintf("  ✔ `%s` — already up to date _%s_\n",
 					notify.EscapeMD(cr.name), notify.EscapeMD(formatDuration(cr.dur))))
@@ -800,10 +816,10 @@ func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.
 				sb.WriteString(fmt.Sprintf("  📥 `%s` — pulled, manual restart needed _%s_\n",
 					notify.EscapeMD(cr.name), notify.EscapeMD(formatDuration(cr.dur))))
 				if s.cfg.ComposeFile == "" {
-					sb.WriteString("     💡 _Add `PRESTOBACK\\_COMPOSE\\_FILE` to enable auto\\-restart — see /update help_\n")
+					sb.WriteString("     💡 _Set `PRESTOBACK\\_COMPOSE\\_FILE` — see /update help_\n")
 				}
 			}
-			if cr.res.Image != "" && !cr.res.AlreadyUpToDate {
+			if cr.res.Image != "" && !cr.res.AlreadyUpToDate && errMsg == "" {
 				sb.WriteString(fmt.Sprintf("     📦 `%s`\n", notify.EscapeMD(cr.res.Image)))
 			}
 		}
@@ -816,7 +832,33 @@ func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.
 		sb.WriteString(fmt.Sprintf("\n⏱ _%s_", notify.EscapeMD(formatDuration(totalDur))))
 	}
 
-	_ = notify.SendRaw(tgCfg, sb.String())
+	msg := sb.String()
+	if err := notify.SendRaw(tgCfg, msg); err != nil {
+		// MarkdownV2 parse failure — Docker error output can contain characters
+		// that trip Telegram even after EscapeMD (e.g. Unicode spinner frames).
+		// Fall back to a plain summary so the user always gets a response.
+		log.Printf("[update] SendRaw failed (%v) — sending plain fallback", err)
+		plain := fmt.Sprintf("Update finished in %s — full results in container logs (docker logs prestoback).", formatDuration(totalDur))
+		for _, ar := range results {
+			for _, cr := range ar.containers {
+				if cr.timedOut {
+					plain += fmt.Sprintf("\n⚠️ %s: timed out", cr.name)
+				} else if cr.res.Err != "" {
+					plain += fmt.Sprintf("\n❌ %s: failed", cr.name)
+				} else if cr.res.Restarted {
+					plain += fmt.Sprintf("\n✅ %s: updated", cr.name)
+				} else if cr.res.AlreadyUpToDate {
+					plain += fmt.Sprintf("\n✔ %s: already up to date", cr.name)
+				} else if cr.res.NeedsManual {
+					plain += fmt.Sprintf("\n📥 %s: pulled, needs manual restart", cr.name)
+				}
+			}
+		}
+		// SendRaw with no parse_mode for the fallback
+		if err2 := notify.SendRawPlain(tgCfg, plain); err2 != nil {
+			log.Printf("[update] plain fallback also failed: %v", err2)
+		}
+	}
 }
 
 func (s *Server) handleValidatePath(w http.ResponseWriter, r *http.Request) {
@@ -2424,23 +2466,24 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 				composeStatus = fmt.Sprintf("✅ `%s`", notify.EscapeMD(s.cfg.ComposeFile))
 			}
 			_ = notify.SendRaw(tgCfg, fmt.Sprintf(
-				"*\\/update — how auto\\-restart works*\n\n"+
+				"*\\/update — compose setup*\n\n"+
 					"*Current compose file:* %s\n\n"+
-					"PrestoBack runs inside Docker and cannot see your host's `~/presto/` directory\\. "+
-					"To enable automatic container recreation after a pull, mount your compose file "+
-					"into the prestoback container and set the env var:\n\n"+
+					"*Why the path matters:*\n"+
+					"Docker Compose resolves relative volume paths relative to the compose file's "+
+					"directory\\. If the file is mounted at `/presto/docker\\-compose\\.yml`, volumes "+
+					"like `\\./volumes/caddy` resolve to `/presto/volumes/caddy` — a path the Docker "+
+					"daemon looks for on the HOST, where it doesn't exist\\. "+
+					"The file must be mounted at its *exact host path*\\.\n\n"+
+					"*Correct setup \\(in your prestoback service\\):*\n"+
 					"```yaml\n"+
-					"# In your docker-compose.yml:\n"+
-					"prestoback:\n"+
-					"  environment:\n"+
-					"    - PRESTOBACK_COMPOSE_FILE=/compose/docker-compose.yml\n"+
-					"  volumes:\n"+
-					"    - ./docker-compose.yml:/compose/docker-compose.yml:ro\n"+
+					"environment:\n"+
+					"  PRESTOBACK_COMPOSE_FILE: ${PWD}/docker-compose.yml\n"+
+					"volumes:\n"+
+					"  # Mount at the SAME path as on the host:\n"+
+					"  - ${PWD}/docker-compose.yml:${PWD}/docker-compose.yml:ro\n"+
 					"```\n\n"+
-					"After adding this, `/update <name>` will:\n"+
-					"1\\. `docker pull` the latest image\n"+
-					"2\\. `docker compose -f /compose/docker-compose.yml up -d --no-deps <service>`\n\n"+
-					"Use `/selfupdate` to update PrestoBack itself\\.",
+					"`$\\{PWD\\}` expands to your presto directory \\(e\\.g\\. `/home/pi/presto`\\) "+
+					"when you run `docker compose up` from that folder\\.",
 				composeStatus,
 			))
 			return

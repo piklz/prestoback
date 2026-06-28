@@ -36,7 +36,15 @@ func main() {
 		cfg.ComposeFile = envOr("PRESTOBACK_COMPOSE_FILE", "")
 	}
 	if cfg.ComposeFile != "" {
-		log.Printf("compose file: %s (used by /update for auto-restart)", cfg.ComposeFile)
+		if _, err := os.Stat(cfg.ComposeFile); err != nil {
+			log.Printf("[warn] PRESTOBACK_COMPOSE_FILE=%q is NOT accessible inside this container: %v", cfg.ComposeFile, err)
+			log.Printf("[warn] /update will fall back to 'manual restart needed'")
+			log.Printf("[warn] Fix: mount at the exact host path, e.g.:")
+			log.Printf("[warn]   volumes: - ${PWD}/docker-compose.yml:${PWD}/docker-compose.yml:ro")
+			log.Printf("[warn]   environment: PRESTOBACK_COMPOSE_FILE: ${PWD}/docker-compose.yml")
+		} else {
+			log.Printf("[compose] file OK: %s", cfg.ComposeFile)
+		}
 	}
 
 	if err := os.MkdirAll(cfg.BackupDir(), 0755); err != nil {

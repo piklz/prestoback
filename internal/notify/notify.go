@@ -92,6 +92,20 @@ func SendRaw(cfg TelegramConfig, text string) error {
 	})
 }
 
+// SendRawPlain sends a plain text message with no parse_mode. Used as a
+// fallback when a MarkdownV2-formatted message fails to send — Docker error
+// output can contain Unicode spinner frames and other chars that trip
+// Telegram's parser even after EscapeMD.
+func SendRawPlain(cfg TelegramConfig, text string) error {
+	if cfg.Token == "" || cfg.ChatID == "" {
+		return fmt.Errorf("telegram not configured")
+	}
+	return telegramPost(cfg.Token, "sendMessage", map[string]any{
+		"chat_id": cfg.ChatID,
+		"text":    text,
+	})
+}
+
 // ── Telegram ─────────────────────────────────────────────────────────────────
 
 type TelegramConfig struct {
