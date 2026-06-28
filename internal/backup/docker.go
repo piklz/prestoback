@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -445,11 +446,20 @@ type ContainerUpdate struct {
 	Err             string // non-empty on failure
 }
 
-// stripDockerOutput removes terminal control sequences and Unicode braille
-// spinner frames (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ and similar) that docker compose writes to
-// stderr for progress display. These characters survive EscapeMD but can cause
-// Telegram's MarkdownV2 parser to reject messages in certain positions.
+// ansiEscape matches ANSI/VT100 escape sequences that docker compose writes
+// even when writing to a pipe. These are the root cause of the "--tlskey"
+// corruption: the sequences survive EscapeMD unchanged and are then
+// misinterpreted as MarkdownV2 formatting by Telegram's parser.
+var ansiEscape = regexp.MustCompile(`\x1b(?:\[[0-9;]*[a-zA-Z]|\][^\x07]*\x07|[()][AB012])`)
+
+// stripDockerOutput removes ANSI escape sequences, Unicode Braille spinner
+// frames (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏), and truncates to the last 8 lines so error strings
+// are safe to embed in Telegram MarkdownV2 messages.
 func stripDockerOutput(s string) string {
+	// Strip ANSI escape sequences — these corrupt MarkdownV2 output into
+	// garbage like "--tlskey" even after EscapeMD is applied.
+	s = ansiEscape.ReplaceAllString(s, "")
+
 	var b strings.Builder
 	for _, r := range s {
 		// Skip Braille Patterns block (U+2800–U+28FF) — used as CLI spinners
@@ -458,9 +468,8 @@ func stripDockerOutput(s string) string {
 		}
 		b.WriteRune(r)
 	}
-	// Collapse runs of whitespace/newlines left by removed chars
-	out := strings.TrimSpace(b.String())
 	// Keep only the last N lines — Docker output can be very verbose
+	out := strings.TrimSpace(b.String())
 	const maxLines = 8
 	lines := strings.Split(out, "\n")
 	if len(lines) > maxLines {
@@ -525,9 +534,16 @@ func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 	labels := inspectLabels(c.ID)
 	service := labels["com.docker.compose.service"]
 
+	// Hard deadline for compose up — prevents a stuck health-check from
+	// holding the update goroutine open indefinitely.
+	const composeUpTimeout = 5 * time.Minute
+
 	if service != "" && composeFile != "" {
-		upOut, err := exec.Command("docker", "compose",
+		upCtx, upCancel := context.WithTimeout(context.Background(), composeUpTimeout)
+		defer upCancel()
+		upOut, err := exec.CommandContext(upCtx, "docker", "compose",
 			"-f", composeFile,
+			"--progress", "plain", // disable TUI/ANSI output — plain text only
 			"up", "-d", "--no-deps", service,
 		).CombinedOutput()
 		if err != nil {
@@ -542,8 +558,11 @@ func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 	if service != "" {
 		wd := labels["com.docker.compose.project.working_dir"]
 		if wd != "" {
-			_, err := exec.Command("docker", "compose",
+			upCtx, upCancel := context.WithTimeout(context.Background(), composeUpTimeout)
+			defer upCancel()
+			_, err := exec.CommandContext(upCtx, "docker", "compose",
 				"--project-directory", wd,
+				"--progress", "plain", // disable TUI/ANSI output — plain text only
 				"up", "-d", "--no-deps", service,
 			).CombinedOutput()
 			if err == nil {
