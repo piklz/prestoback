@@ -359,6 +359,34 @@ type BotCommand struct {
 	Description string `json:"description"`
 }
 
+// ButtonAction is one inline keyboard button: a display label and callback payload.
+// Used with SendRawWithButtons for ordered, readable button menus.
+type ButtonAction struct {
+	Label string // text shown on the button
+	Data  string // callback_data sent when tapped
+}
+
+// SendRawWithButtons sends a pre-formatted MarkdownV2 message with inline buttons.
+// Each ButtonAction is placed on its own row so full names are always visible —
+// this avoids the truncation that occurs when all buttons share a single row.
+func SendRawWithButtons(cfg TelegramConfig, text string, actions []ButtonAction) error {
+	if cfg.Token == "" || cfg.ChatID == "" {
+		return fmt.Errorf("telegram not configured")
+	}
+	rows := make([][]map[string]string, len(actions))
+	for i, a := range actions {
+		rows[i] = []map[string]string{{"text": a.Label, "callback_data": a.Data}}
+	}
+	return telegramPost(cfg.Token, "sendMessage", map[string]any{
+		"chat_id":    cfg.ChatID,
+		"text":       text,
+		"parse_mode": "MarkdownV2",
+		"reply_markup": map[string]any{
+			"inline_keyboard": rows,
+		},
+	})
+}
+
 // SetMyCommands registers the bot's full command list with Telegram so the
 // "/" autocomplete picker displays all available commands with descriptions.
 // Call once on startup after confirming the token is valid.

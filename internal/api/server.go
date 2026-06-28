@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +35,17 @@ type Server struct {
 
 	sseClients map[chan backup.JobUpdate]struct{}
 	sseMu      sync.Mutex
+
+	// Disk monitoring — guards diskWarnLow and diskWarnSent.
+	// diskWarnSent is debounced: once sent, won't fire again until space recovers.
+	stateMu      sync.Mutex
+	diskWarnLow  bool
+	diskWarnSent bool
+
+	// Maintenance mode — schedules are skipped while time.Now() < maintUntil.
+	// Resets on container restart (intentional — a stuck maintenance window after
+	// a crash would be worse than a missed one).
+	maintUntil time.Time
 }
 
 func NewServer(cfg *config.Config, image, selfName string) *Server {
@@ -54,6 +66,7 @@ func NewServer(cfg *config.Config, image, selfName string) *Server {
 	s.loadSchedules()
 	go s.broadcastUpdates()
 	go s.runTelegramBot()
+	go s.diskMonitorLoop()
 	return s
 }
 
@@ -194,23 +207,39 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var diskFreeBytes, diskTotalBytes uint64
+	diskLowPct := 0 // 0 means OK; >0 means disk is below threshold (value = % free)
 	if stat, err := diskUsage(s.cfg.BackupDir()); err == nil {
 		diskFreeBytes = stat.free
 		diskTotalBytes = stat.total
+		if stat.total > 0 {
+			freePct := int(100 * stat.free / stat.total)
+			if freePct < diskWarnThresholdPct {
+				diskLowPct = freePct
+			}
+		}
 	}
 	nextRuns := s.sched.NextRuns()
+	s.stateMu.Lock()
+	maintUntil := s.maintUntil
+	s.stateMu.Unlock()
+	var maintUntilStr string
+	if !maintUntil.IsZero() && time.Now().Before(maintUntil) {
+		maintUntilStr = maintUntil.UTC().Format(time.RFC3339)
+	}
 	respond(w, 200, map[string]any{
-		"version":          config.Version,
-		"app_count":        s.cfg.AppCount(),
-		"volumes_dir":      s.cfg.VolumesDir,
-		"backup_dir":       s.cfg.BackupDir(),
-		"image":            s.image,
-		"self_name":        s.selfName,
-		"built_at":         builtAt,
-		"time":             time.Now().UTC(),
-		"disk_free_bytes":  diskFreeBytes,
-		"disk_total_bytes": diskTotalBytes,
-		"next_runs":        nextRuns,
+		"version":           config.Version,
+		"app_count":         s.cfg.AppCount(),
+		"volumes_dir":       s.cfg.VolumesDir,
+		"backup_dir":        s.cfg.BackupDir(),
+		"image":             s.image,
+		"self_name":         s.selfName,
+		"built_at":          builtAt,
+		"time":              time.Now().UTC(),
+		"disk_free_bytes":   diskFreeBytes,
+		"disk_total_bytes":  diskTotalBytes,
+		"disk_low_pct":      diskLowPct,    // non-zero = warning; value = % free
+		"maintenance_until": maintUntilStr, // RFC3339 or "" if not in maintenance
+		"next_runs":         nextRuns,
 	})
 }
 
@@ -503,6 +532,220 @@ func formatDurationMs(ms int64) string {
 		return fmt.Sprintf("%dh", h)
 	}
 	return fmt.Sprintf("%dh %dm", h, m)
+}
+
+// formatDuration formats a time.Duration as a compact human string for display.
+// e.g. 90m → "1h 30m", 25h → "1d 1h"
+func formatDuration(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		m := int(d.Minutes())
+		s := int(d.Seconds()) % 60
+		if s == 0 {
+			return fmt.Sprintf("%dm", m)
+		}
+		return fmt.Sprintf("%dm %ds", m, s)
+	}
+	if d < 24*time.Hour {
+		h := int(d.Hours())
+		m := int(d.Minutes()) % 60
+		if m == 0 {
+			return fmt.Sprintf("%dh", h)
+		}
+		return fmt.Sprintf("%dh %dm", h, m)
+	}
+	days := int(d.Hours()) / 24
+	h := int(d.Hours()) % 24
+	if h == 0 {
+		return fmt.Sprintf("%dd", days)
+	}
+	return fmt.Sprintf("%dd %dh", days, h)
+}
+
+// ── Maintenance mode ──────────────────────────────────────────────────────────
+
+const diskWarnThresholdPct = 10 // alert when backup dir has < 10% free space
+
+func (s *Server) inMaintenance() bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return !s.maintUntil.IsZero() && time.Now().Before(s.maintUntil)
+}
+
+func (s *Server) getMaintUntil() time.Time {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.maintUntil
+}
+
+// parseMaintDuration parses duration strings like "2h", "1d", "2day", "1w",
+// "1week" or the special keyword "on" (treated as ~1 year / indefinite).
+func parseMaintDuration(arg string) (time.Duration, bool) {
+	arg = strings.ToLower(strings.TrimSpace(arg))
+	if arg == "on" {
+		return 365 * 24 * time.Hour, true
+	}
+	type suffix struct {
+		s string
+		u time.Duration
+	}
+	// Longest first so "days" is tried before "d"
+	suffixes := []suffix{
+		{"weeks", 7 * 24 * time.Hour},
+		{"week", 7 * 24 * time.Hour},
+		{"days", 24 * time.Hour},
+		{"day", 24 * time.Hour},
+		{"hours", time.Hour},
+		{"hour", time.Hour},
+		{"w", 7 * 24 * time.Hour},
+		{"d", 24 * time.Hour},
+		{"h", time.Hour},
+	}
+	for _, su := range suffixes {
+		if strings.HasSuffix(arg, su.s) {
+			nStr := strings.TrimSpace(strings.TrimSuffix(arg, su.s))
+			n, err := strconv.Atoi(nStr)
+			if err == nil && n > 0 {
+				return time.Duration(n) * su.u, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// ── Disk monitoring ───────────────────────────────────────────────────────────
+
+// diskMonitorLoop checks backup disk space every 30 minutes and fires a
+// Telegram alert (with action buttons) when free space drops below the threshold.
+// The alert is debounced: once sent, it won't fire again until space recovers
+// above the threshold — preventing spam during a long fill-up.
+func (s *Server) diskMonitorLoop() {
+	time.Sleep(60 * time.Second) // let startup settle before first check
+	for {
+		s.checkDiskAndAlert()
+		time.Sleep(30 * time.Minute)
+	}
+}
+
+func (s *Server) checkDiskAndAlert() {
+	stat, err := diskUsage(s.cfg.BackupDir())
+	if err != nil || stat.total == 0 {
+		return
+	}
+	freePct := int(100 * stat.free / stat.total)
+	isLow := freePct < diskWarnThresholdPct
+
+	s.stateMu.Lock()
+	wasLow := s.diskWarnLow
+	warnSent := s.diskWarnSent
+	s.diskWarnLow = isLow
+	if !isLow {
+		s.diskWarnSent = false // reset debounce when space recovers
+	}
+	s.stateMu.Unlock()
+
+	if isLow && !warnSent {
+		s.stateMu.Lock()
+		s.diskWarnSent = true
+		s.stateMu.Unlock()
+
+		nc := s.cfg.GetNotify()
+		if !nc.TelegramEnabled || nc.TelegramToken == "" || nc.TelegramChatID == "" {
+			return
+		}
+		used := stat.total - stat.free
+		tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
+		bar := strings.Repeat("█", (100-freePct)/10) + strings.Repeat("░", freePct/10)
+		msg := fmt.Sprintf(
+			"⚠️ *Backup disk space low* — only *%d%%* free\\!\n\n"+
+				"💾 Used: `%s`\n"+
+				"🆓 Free: `%s`\n"+
+				"📦 Total: `%s`\n"+
+				"`%s`\n\n"+
+				"What would you like to do?",
+			freePct,
+			notify.EscapeMD(humanBytes(int64(used))),
+			notify.EscapeMD(humanBytes(int64(stat.free))),
+			notify.EscapeMD(humanBytes(int64(stat.total))),
+			bar,
+		)
+		btns := []notify.ButtonAction{
+			{Label: "🗑 Prune old backup archives", Data: "disk:prune"},
+			{Label: "🐳 Prune dangling Docker images", Data: "disk:docker_prune"},
+			{Label: "❌ Dismiss (re-alert if worse)", Data: "disk:dismiss"},
+		}
+		_ = notify.SendRawWithButtons(tgCfg, msg, btns)
+		log.Printf("[disk] low space alert sent (%d%% free)", freePct)
+		_ = wasLow // silence unused variable warning
+	}
+}
+
+// runPruneAll removes backups beyond each app's retain count and reports results.
+func (s *Server) runPruneAll(tgCfg notify.TelegramConfig) {
+	apps := s.cfg.ListApps()
+	sort.Slice(apps, func(i, j int) bool { return apps[i].Name < apps[j].Name })
+	var sb strings.Builder
+	sb.WriteString("*Prune Results*\n\n")
+	totalRemoved := 0
+	for _, app := range apps {
+		before, _ := s.engine.ListBackups(app.ID)
+		if err := s.engine.PruneBackups(app.ID, app.Retain); err != nil {
+			sb.WriteString(fmt.Sprintf("❌ `%s`: %s\n", notify.EscapeMD(app.Name), notify.EscapeMD(err.Error())))
+			continue
+		}
+		after, _ := s.engine.ListBackups(app.ID)
+		removed := len(before) - len(after)
+		if removed > 0 {
+			totalRemoved += removed
+			sb.WriteString(fmt.Sprintf("✅ `%s` — removed %d archive\\(s\\)\n", notify.EscapeMD(app.Name), removed))
+		}
+	}
+	if totalRemoved == 0 {
+		sb.WriteString("Nothing to prune — all apps are within their retain limits\\.")
+	} else {
+		sb.WriteString(fmt.Sprintf("\n🗑 Total: *%d* archive\\(s\\) deleted", totalRemoved))
+	}
+	_ = notify.SendRaw(tgCfg, sb.String())
+}
+
+// runContainerUpdates pulls + recreates containers for each app, then sends a summary.
+func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.AppConfig) {
+	var sb strings.Builder
+	sb.WriteString("*Container Update Results*\n\n")
+	anyResult := false
+
+	for _, app := range apps {
+		containers := backup.DedupeContainers(backup.FindContainers(app.ID))
+		if len(containers) == 0 {
+			sb.WriteString(fmt.Sprintf("⚠️ `%s` — no containers found\n\n", notify.EscapeMD(app.Name)))
+			anyResult = true
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("*%s*\n", notify.EscapeMD(app.Name)))
+		for _, c := range containers {
+			res := backup.UpdateContainer(c)
+			switch {
+			case res.Err != "":
+				sb.WriteString(fmt.Sprintf("  ❌ `%s`: %s\n", notify.EscapeMD(c.Name), notify.EscapeMD(res.Err)))
+			case res.Restarted:
+				sb.WriteString(fmt.Sprintf("  ✅ `%s` — pulled \\+ recreated\n", notify.EscapeMD(c.Name)))
+			case res.NeedsManual:
+				sb.WriteString(fmt.Sprintf("  📥 `%s` — image pulled \\(`%s`\\)\n     ⚠️ Not compose\\-managed — please recreate manually\n",
+					notify.EscapeMD(c.Name), notify.EscapeMD(res.Image)))
+			}
+			anyResult = true
+		}
+		sb.WriteString("\n")
+	}
+	if !anyResult {
+		sb.WriteString("No containers found to update\\.")
+	}
+	_ = notify.SendRaw(tgCfg, sb.String())
 }
 
 func (s *Server) handleValidatePath(w http.ResponseWriter, r *http.Request) {
@@ -1497,6 +1740,11 @@ func (s *Server) syncSchedule(app config.AppConfig) {
 		ID:       app.ID,
 		CronExpr: app.Schedule.CronExpr,
 		Fn: func() {
+			// Respect maintenance mode — skip this run silently.
+			if s.inMaintenance() {
+				log.Printf("[scheduler] skipping %s — maintenance mode active until %s", a.ID, s.getMaintUntil().Format(time.RFC3339))
+				return
+			}
 			current, ok := s.cfg.GetApp(a.ID)
 			if !ok || current.Pinned || !current.Schedule.Enabled {
 				return
@@ -1526,6 +1774,8 @@ func prestoBackBotCommands() []notify.BotCommand {
 		{Command: "next", Description: "Upcoming scheduled backup times across all apps"},
 		{Command: "pause", Description: "Disable an app schedule — /pause <name>"},
 		{Command: "resume", Description: "Re-enable an app schedule — /resume <name>"},
+		{Command: "maintenance", Description: "Freeze all schedules — /maintenance 2h / 1d / 1w / on / off"},
+		{Command: "update", Description: "Pull + recreate a container — /update <name> or /update all"},
 		{Command: "settings", Description: "Show current notification and app configuration"},
 		{Command: "selfupdate", Description: "Check for a new PrestoBack image and apply it"},
 		{Command: "help", Description: "Show all available commands"},
@@ -2008,6 +2258,108 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			notify.EscapeMD(app.Name),
 			notify.EscapeMD(scheduler.DescribeCron(app.Schedule.CronExpr))))
 
+	case "/maintenance":
+		lower := strings.ToLower(strings.TrimSpace(arg))
+		if lower == "" {
+			// Show current status
+			s.stateMu.Lock()
+			until := s.maintUntil
+			s.stateMu.Unlock()
+			if until.IsZero() || time.Now().After(until) {
+				_ = notify.SendRaw(tgCfg,
+					"🟢 *Maintenance mode off* — schedules running normally\\.\n\n"+
+						"Usage: `/maintenance 2h` `/maintenance 1d` `/maintenance 1w` `/maintenance on` `/maintenance off`")
+			} else {
+				remaining := time.Until(until)
+				_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+					"🔧 *Maintenance mode active*\n⏰ Expires: %s \\(%s remaining\\)\n\nUse `/maintenance off` to end early\\.",
+					notify.EscapeMD(until.Local().Format("02 Jan 15:04")),
+					notify.EscapeMD(formatDuration(remaining)),
+				))
+			}
+			return
+		}
+		if lower == "off" {
+			s.stateMu.Lock()
+			s.maintUntil = time.Time{}
+			s.stateMu.Unlock()
+			_ = notify.SendRaw(tgCfg, "🟢 *Maintenance mode off* — all enabled schedules will run at their next time\\.")
+			return
+		}
+		dur, ok := parseMaintDuration(lower)
+		if !ok {
+			_ = notify.SendRaw(tgCfg, "❌ Unknown duration\\. Examples:\n`/maintenance 2h` — 2 hours\n`/maintenance 1d` — 1 day\n`/maintenance 1w` — 1 week\n`/maintenance on` — indefinite\n`/maintenance off` — cancel")
+			return
+		}
+		until := time.Now().Add(dur)
+		s.stateMu.Lock()
+		s.maintUntil = until
+		s.stateMu.Unlock()
+		// Count how many scheduled apps are affected
+		affected := 0
+		for _, a := range s.cfg.ListApps() {
+			if a.Schedule.Enabled && !a.Pinned {
+				affected++
+			}
+		}
+		if lower == "on" {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+				"🔧 *Maintenance mode on* — %d scheduled app\\(s\\) paused indefinitely\\.\n\nNote: resets on container restart\\. Use `/maintenance off` to end early\\.",
+				affected,
+			))
+		} else {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+				"🔧 *Maintenance mode on*\n⏰ Auto\\-resumes at %s \\(%s\\)\n🐳 %d scheduled app\\(s\\) paused\n\nUse `/maintenance off` to end early\\.",
+				notify.EscapeMD(until.Local().Format("02 Jan 15:04")),
+				notify.EscapeMD(formatDuration(dur)),
+				affected,
+			))
+			// Goroutine fires a Telegram notification when maintenance expires.
+			go func(resumeAt time.Time) {
+				time.Sleep(time.Until(resumeAt))
+				s.stateMu.Lock()
+				stillSet := s.maintUntil.Equal(resumeAt)
+				if stillSet {
+					s.maintUntil = time.Time{}
+				}
+				s.stateMu.Unlock()
+				if !stillSet {
+					return // user changed it in the meantime
+				}
+				nc := s.cfg.GetNotify()
+				if nc.TelegramEnabled && nc.TelegramToken != "" && nc.TelegramChatID != "" {
+					cfg2 := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
+					_ = notify.SendRaw(cfg2, "🟢 *Maintenance window ended* — scheduled backups have resumed\\.")
+				}
+			}(until)
+		}
+
+	case "/update":
+		lower := strings.ToLower(strings.TrimSpace(arg))
+		if lower == "" {
+			_ = notify.SendRaw(tgCfg,
+				"Usage:\n`/update \\<name\\>` — pull \\+ recreate one app's container\\(s\\)\n`/update all` — update all registered apps' containers")
+			return
+		}
+		var targets []config.AppConfig
+		if lower == "all" {
+			targets = s.cfg.ListApps()
+			sort.Slice(targets, func(i, j int) bool { return targets[i].Name < targets[j].Name })
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+				"🔄 Pulling images for *%d* apps\\. This may take a few minutes\\.\\.\\.",
+				len(targets),
+			))
+		} else {
+			app := s.findAppByNameFragment(arg)
+			if app == nil {
+				_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ App not found: `%s`", notify.EscapeMD(arg)))
+				return
+			}
+			targets = []config.AppConfig{*app}
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("🔄 Pulling `%s`\\.\\.\\.", notify.EscapeMD(app.Name)))
+		}
+		go s.runContainerUpdates(tgCfg, targets)
+
 	case "/help":
 		help := "*PrestoBack Bot Commands*\n\n" +
 			"📊 /status — all apps with paths, cron, retain counts\n" +
@@ -2019,8 +2371,10 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			"⏰ /next — upcoming scheduled backup times\n" +
 			"⏸ /pause \\<name\\> — disable an app's automatic schedule\n" +
 			"▶ /resume \\<name\\> — re\\-enable an app's schedule\n" +
+			"🔧 /maintenance \\<2h/1d/1w/on/off\\> — freeze all schedules temporarily\n" +
+			"🔄 /update \\<name|all\\> — pull \\+ recreate container\\(s\\)\n" +
 			"⚙️ /settings — notification and app configuration\n" +
-			"🔄 /selfupdate — check for a new image and apply\n" +
+			"🔃 /selfupdate — check for a new PrestoBack image and apply\n" +
 			"❓ /help — this message"
 		if err := notify.SendRaw(tgCfg, help); err != nil {
 			log.Printf("[bot] send help: %v", err)
@@ -2057,6 +2411,36 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 		return
 	}
 	switch parts[0] {
+	case "disk":
+		if len(parts) < 2 {
+			return
+		}
+		switch parts[1] {
+		case "prune":
+			_ = notify.SendRaw(tgCfg, "🗑 Pruning old backup archives\\.\\.\\.")
+			go s.runPruneAll(tgCfg)
+		case "docker_prune":
+			go func() {
+				_ = notify.SendRaw(tgCfg, "🐳 Running `docker image prune \\-f`\\.\\.\\.")
+				out, err := exec.Command("docker", "image", "prune", "-f").CombinedOutput()
+				if err != nil {
+					_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Docker prune failed: `%s`", notify.EscapeMD(strings.TrimSpace(string(out)))))
+					return
+				}
+				result := strings.TrimSpace(string(out))
+				if result == "" {
+					result = "No dangling images to remove"
+				}
+				_ = notify.SendRaw(tgCfg, fmt.Sprintf("✅ *Docker images pruned*\n```\n%s\n```", notify.EscapeMD(result)))
+			}()
+		case "dismiss":
+			// Reset the debounce so they'll get another alert if it gets worse
+			s.stateMu.Lock()
+			s.diskWarnSent = false
+			s.stateMu.Unlock()
+			_ = notify.SendRaw(tgCfg, "OK\\. I'll re\\-alert if disk space drops further\\.")
+		}
+
 	case "backup":
 		app, ok := s.cfg.GetApp(parts[1])
 		if !ok {
@@ -2071,14 +2455,25 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 	}
 }
 
+// sendTelegramAppList sends a button menu with one app per row, sorted
+// alphabetically. Using SendRawWithButtons (one per row) instead of the old
+// map-based approach fixes the button truncation seen when all buttons were
+// crammed into a single scrollable horizontal row.
 func (s *Server) sendTelegramAppList(tgCfg notify.TelegramConfig, action string) {
 	apps := s.cfg.ListApps()
-	actions := make(map[string]string, len(apps))
-	for _, a := range apps {
-		actions[a.Name] = action + ":" + a.ID
+	if len(apps) == 0 {
+		_ = notify.SendRaw(tgCfg, "❌ No apps registered yet\\.")
+		return
 	}
-	ev := notify.Event{AppName: "PrestoBack", Detail: "Choose an app to " + action + ":"}
-	_ = notify.SendTelegramWithButtons(tgCfg, ev, actions)
+	sort.Slice(apps, func(i, j int) bool { return apps[i].Name < apps[j].Name })
+	btns := make([]notify.ButtonAction, len(apps))
+	for i, a := range apps {
+		btns[i] = notify.ButtonAction{Label: a.Name, Data: action + ":" + a.ID}
+	}
+	_ = notify.SendRawWithButtons(tgCfg,
+		fmt.Sprintf("Choose an app to *%s*:", notify.EscapeMD(action)),
+		btns,
+	)
 }
 
 func (s *Server) findAppByNameFragment(fragment string) *config.AppConfig {

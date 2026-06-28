@@ -430,3 +430,69 @@ func dedupe(ss []string) []string {
 	}
 	return out
 }
+
+// ── Container update ──────────────────────────────────────────────────────────
+
+// ContainerUpdate holds the result of pulling and recreating one container.
+type ContainerUpdate struct {
+	ContainerName string
+	Image         string
+	Pulled        bool   // image was pulled from registry
+	Restarted     bool   // container was recreated via compose up -d
+	NeedsManual   bool   // pulled OK but no compose info — user must recreate
+	Err           string // non-empty on failure
+}
+
+// UpdateContainer pulls the latest image for c and, if the container is
+// compose-managed (has com.docker.compose.project.working_dir label), recreates
+// it via "docker compose up -d --no-deps <service>".
+//
+// Important: this does NOT back up the container's data first. Callers should
+// run a backup (or accept the risk) before calling this.
+func UpdateContainer(c ContainerInfo) ContainerUpdate {
+	res := ContainerUpdate{ContainerName: c.Name}
+
+	// Resolve the image name from the live container config.
+	out, err := exec.Command("docker", "inspect", "--format={{.Config.Image}}", c.ID).Output()
+	if err != nil {
+		res.Err = "inspect failed: " + err.Error()
+		return res
+	}
+	res.Image = strings.TrimSpace(string(out))
+	if res.Image == "" {
+		res.Err = "could not determine image name"
+		return res
+	}
+
+	// Pull the latest digest for this image.
+	pullOut, err := exec.Command("docker", "pull", res.Image).CombinedOutput()
+	if err != nil {
+		res.Err = "pull failed: " + strings.TrimSpace(string(pullOut))
+		return res
+	}
+	res.Pulled = true
+
+	// Re-create via compose if we know the project working directory.
+	// Compose reads its own compose.yml / docker-compose.yml from that dir,
+	// so we don't need to guess the filename.
+	labels := inspectLabels(c.ID)
+	wd := labels["com.docker.compose.project.working_dir"]
+	service := labels["com.docker.compose.service"]
+	if wd != "" && service != "" {
+		upOut, err := exec.Command("docker", "compose",
+			"--project-directory", wd,
+			"up", "-d", "--no-deps", service,
+		).CombinedOutput()
+		if err != nil {
+			res.Err = "compose up failed: " + strings.TrimSpace(string(upOut))
+			return res
+		}
+		res.Restarted = true
+		return res
+	}
+
+	// No compose metadata — we pulled the image but cannot auto-recreate.
+	// The user must stop + rm + docker run (or docker compose up) themselves.
+	res.NeedsManual = true
+	return res
+}
