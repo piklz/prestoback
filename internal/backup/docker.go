@@ -736,7 +736,7 @@ func buildCreateArgs(name string, insp fullInspect, newImage string) []string {
 // renames the backup back and restarts the original — full rollback.
 //
 // This requires no compose file — only the Docker socket.
-func standaloneRecreate(c ContainerInfo, newImage string) (rolled bool, err error) {
+func standaloneRecreate(c ContainerInfo, newImage string, emit func(string)) (rolled bool, err error) {
 	// Full inspect of the running container
 	raw, inspErr := exec.Command("docker", "inspect", c.ID).Output()
 	if inspErr != nil {
@@ -754,13 +754,13 @@ func standaloneRecreate(c ContainerInfo, newImage string) (rolled bool, err erro
 	_ = exec.Command("docker", "rm", "-f", bakName).Run()
 
 	// Stop the current container gracefully
-	log.Printf("[recreate] stopping %s", name)
+	emit(fmt.Sprintf("Stopping %s…", name))
 	if out, stopErr := exec.Command("docker", "stop", "-t", "30", c.ID).CombinedOutput(); stopErr != nil {
 		return false, fmt.Errorf("stop failed: %s", stripDockerOutput(string(out)))
 	}
+	emit(fmt.Sprintf("Stopped %s ✓", name))
 
 	// Rename old container so we can reclaim the name
-	log.Printf("[recreate] renaming %s → %s", name, bakName)
 	if out, renErr := exec.Command("docker", "rename", c.ID, bakName).CombinedOutput(); renErr != nil {
 		_ = exec.Command("docker", "start", c.ID).Run() // restore original
 		return false, fmt.Errorf("rename failed: %s", stripDockerOutput(string(out)))
@@ -768,17 +768,20 @@ func standaloneRecreate(c ContainerInfo, newImage string) (rolled bool, err erro
 
 	// rollback restores the old container on any subsequent failure
 	rollback := func(reason error) (bool, error) {
-		log.Printf("[recreate] rollback %s: %v", name, reason)
+		emit(fmt.Sprintf("⚠  Health check failed — rolling back %s…", name))
 		_ = exec.Command("docker", "rename", bakName, name).Run()
 		if startErr := exec.Command("docker", "start", c.ID).Run(); startErr != nil {
 			log.Printf("[recreate] WARNING: rollback start failed for %s: %v", name, startErr)
+			emit(fmt.Sprintf("✗ Rollback start failed for %s — check manually", name))
+		} else {
+			emit(fmt.Sprintf("↩  %s rolled back to previous image", name))
 		}
 		return true, fmt.Errorf("%w", reason)
 	}
 
 	// Create new container from identical HostConfig + new image
+	emit(fmt.Sprintf("Creating %s with new image…", name))
 	createArgs := buildCreateArgs(name, insp, newImage)
-	log.Printf("[recreate] docker create %s (image: %s)", name, newImage)
 	createOut, createErr := exec.Command("docker", createArgs...).CombinedOutput()
 	if createErr != nil {
 		return rollback(fmt.Errorf("create failed: %s", stripDockerOutput(string(createOut))))
@@ -794,42 +797,39 @@ func standaloneRecreate(c ContainerInfo, newImage string) (rolled bool, err erro
 		if netName == primaryNet {
 			continue
 		}
-		// Skip built-in Docker networks already handled by --network
 		if netName == "bridge" || netName == "host" || netName == "none" {
 			continue
 		}
-		log.Printf("[recreate] connecting %s to network %s", name, netName)
+		emit(fmt.Sprintf("Connecting %s to network %s…", name, netName))
 		connectArgs := []string{"network", "connect"}
 		for _, alias := range netInfo.Aliases {
 			connectArgs = append(connectArgs, "--alias", alias)
 		}
 		connectArgs = append(connectArgs, netName, newID)
 		if out, connErr := exec.Command("docker", connectArgs...).CombinedOutput(); connErr != nil {
-			log.Printf("[recreate] warning: could not connect %s to %s: %s", name, netName, stripDockerOutput(string(out)))
+			emit(fmt.Sprintf("⚠  Could not connect to %s: %s", netName, stripDockerOutput(string(out))))
 		}
 	}
 
 	// Start the new container
-	log.Printf("[recreate] starting %s (new id: %.12s)", name, newID)
+	emit(fmt.Sprintf("Starting %s…", name))
 	if out, startErr := exec.Command("docker", "start", newID).CombinedOutput(); startErr != nil {
 		_ = exec.Command("docker", "rm", newID).Run()
 		return rollback(fmt.Errorf("start failed: %s", stripDockerOutput(string(out))))
 	}
 
 	// Wait up to 30s for the container to reach running state
-	if waitErr := waitRunning(newID, name, 30*time.Second, func(s string) {
-		log.Printf("[recreate] %s", s)
-	}); waitErr != nil {
+	if waitErr := waitRunning(newID, name, 30*time.Second, emit); waitErr != nil {
 		_ = exec.Command("docker", "stop", newID).Run()
 		_ = exec.Command("docker", "rm", newID).Run()
 		return rollback(fmt.Errorf("health check: %v", waitErr))
 	}
 
+	emit(fmt.Sprintf("Container %s is running ✓", name))
+
 	// Success — clean up backup
-	log.Printf("[recreate] %s updated OK — removing old container %s", name, bakName)
 	if out, rmErr := exec.Command("docker", "rm", bakName).CombinedOutput(); rmErr != nil {
-		// Not fatal — old container is stopped, new one is running
-		log.Printf("[recreate] warning: could not remove backup %s: %s", bakName, stripDockerOutput(string(out)))
+		emit(fmt.Sprintf("⚠  Could not remove old container %s: %s", bakName, stripDockerOutput(string(out))))
 	}
 	return false, nil
 }
@@ -913,7 +913,7 @@ const pullTimeout = 10 * time.Minute
 //     all containers, no compose file needed. Includes automatic rollback if
 //     the new container fails its health check.
 //  3. NeedsManual — only if both strategies fail unexpectedly.
-func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
+func UpdateContainer(c ContainerInfo, composeFile string, emit func(string)) ContainerUpdate {
 	res := ContainerUpdate{ContainerName: c.Name}
 
 	// ── Step 1: resolve the current image name ────────────────────────────────
@@ -929,6 +929,7 @@ func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 	}
 
 	// ── Step 2: pull latest image ─────────────────────────────────────────────
+	emit(fmt.Sprintf("Pulling %s…", res.Image))
 	ctx, cancel := context.WithTimeout(context.Background(), pullTimeout)
 	defer cancel()
 	pullOut, err := exec.CommandContext(ctx, "docker", "pull", res.Image).CombinedOutput()
@@ -954,20 +955,20 @@ func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 
 	if service != "" && composeFile != "" {
 		if _, statErr := os.Stat(composeFile); statErr == nil {
+			emit(fmt.Sprintf("Recreating %s via compose…", c.Name))
 			upCtx, upCancel := context.WithTimeout(context.Background(), composeUpTimeout)
 			defer upCancel()
 			fileArgs := []string{"-f", composeFile}
 			envFile := filepath.Join(filepath.Dir(composeFile), ".env")
 			if _, envErr := os.Stat(envFile); envErr == nil {
 				fileArgs = append(fileArgs, "--env-file", envFile)
-				log.Printf("[docker] compose up: using env-file %s", envFile)
 			}
 			upOut, upErr := composeCmd(upCtx, fileArgs, "up", "-d", "--no-deps", service).CombinedOutput()
 			if upErr == nil {
 				res.Restarted = true
 				return res
 			}
-			// Compose failed — log and fall through to standalone recreate
+			emit(fmt.Sprintf("Compose failed — falling back to standalone recreate: %s", stripDockerOutput(string(upOut))))
 			log.Printf("[docker] compose up failed for %s (%s): %s — falling back to standalone recreate",
 				c.Name, service, stripDockerOutput(string(upOut)))
 		} else {
@@ -976,7 +977,7 @@ func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 	}
 
 	// ── Step 3b: standalone HostConfig-based recreate (always available) ──────
-	rolled, recreateErr := standaloneRecreate(c, res.Image)
+	rolled, recreateErr := standaloneRecreate(c, res.Image, emit)
 	if recreateErr != nil {
 		res.Err = recreateErr.Error()
 		res.Rolled = rolled

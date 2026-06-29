@@ -737,6 +737,33 @@ func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.
 		containers   []cResult
 		dur          time.Duration
 	}
+	allRestarted := func(ar aResult) bool {
+		if len(ar.containers) == 0 {
+			return false
+		}
+		for _, cr := range ar.containers {
+			if !cr.res.Restarted {
+				return false
+			}
+		}
+		return true
+	}
+	anyRolled := func(ar aResult) bool {
+		for _, cr := range ar.containers {
+			if cr.res.Rolled {
+				return true
+			}
+		}
+		return false
+	}
+	anyErr := func(ar aResult) bool {
+		for _, cr := range ar.containers {
+			if cr.res.Err != "" || cr.timedOut {
+				return true
+			}
+		}
+		return false
+	}
 
 	overallStart := time.Now()
 	results := make([]aResult, 0, len(apps))
@@ -744,19 +771,32 @@ func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.
 	for _, app := range apps {
 		log.Printf("[update] processing app %s (id: %s)", app.Name, app.ID)
 		appStart := time.Now()
+
+		// emit streams each step to SSE so the browser live-log panel shows
+		// progress exactly like a backup job does.
+		appID := app.ID
+		appName := app.Name
+		emit := func(msg string) {
+			log.Printf("[update:%s] %s", appName, msg)
+			s.engine.EmitLog(appID, msg)
+		}
+		emit(fmt.Sprintf("━━━ Update started: %s ━━━", appName))
+
 		containers := backup.DedupeContainers(backup.FindContainers(app.ID))
 		if len(containers) == 0 {
 			log.Printf("[update] no containers found for app %s", app.ID)
+			emit(fmt.Sprintf("⚠  No containers found for %s", appName))
 			results = append(results, aResult{appName: app.Name, noContainers: true, dur: time.Since(appStart)})
 			continue
 		}
 		ar := aResult{appName: app.Name}
 		for _, c := range containers {
-			log.Printf("[update] pulling container %s for app %s (composeFile=%q)", c.Name, app.Name, s.cfg.ComposeFile)
 			type res struct{ r backup.ContainerUpdate }
 			ch := make(chan res, 1)
 			cStart := time.Now()
-			go func(ci backup.ContainerInfo) { ch <- res{r: backup.UpdateContainer(ci, s.cfg.ComposeFile)} }(c)
+			go func(ci backup.ContainerInfo) {
+				ch <- res{r: backup.UpdateContainer(ci, s.cfg.ComposeFile, emit)}
+			}(c)
 
 			var cr cResult
 			cr.name = c.Name
@@ -765,6 +805,7 @@ func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.
 				cr.res = r.r
 			case <-time.After(11 * time.Minute):
 				cr.timedOut = true
+				emit(fmt.Sprintf("✗ %s timed out (pull >10 min)", c.Name))
 			}
 			cr.dur = time.Since(cStart)
 			log.Printf("[update] container %s done in %s: err=%q restarted=%v upToDate=%v timedOut=%v",
@@ -772,6 +813,19 @@ func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.
 			ar.containers = append(ar.containers, cr)
 		}
 		ar.dur = time.Since(appStart)
+
+		// Emit SSE footer for this app
+		switch {
+		case allRestarted(ar):
+			emit(fmt.Sprintf("━━━ Update complete: %s (%s) ━━━", appName, formatDuration(ar.dur)))
+		case anyRolled(ar):
+			emit(fmt.Sprintf("━━━ Update rolled back: %s (%s) ━━━", appName, formatDuration(ar.dur)))
+		case anyErr(ar):
+			emit(fmt.Sprintf("━━━ Update failed: %s (%s) ━━━", appName, formatDuration(ar.dur)))
+		default:
+			emit(fmt.Sprintf("━━━ Update finished: %s (%s) ━━━", appName, formatDuration(ar.dur)))
+		}
+
 		results = append(results, ar)
 	}
 
