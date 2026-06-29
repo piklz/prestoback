@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -618,10 +620,16 @@ func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 	if service != "" && composeFile != "" {
 		upCtx, upCancel := context.WithTimeout(context.Background(), composeUpTimeout)
 		defer upCancel()
-		upOut, err := composeCmd(upCtx,
-			[]string{"-f", composeFile},
-			"up", "-d", "--no-deps", service,
-		).CombinedOutput()
+		// Pass --env-file so compose can resolve all ${VAR} substitutions in the
+		// file (other services' vars like UPLOAD_LOCATION, DB_PASSWORD, etc.).
+		// The .env lives alongside docker-compose.yml in the presto project dir.
+		fileArgs := []string{"-f", composeFile}
+		envFile := filepath.Join(filepath.Dir(composeFile), ".env")
+		if _, err := os.Stat(envFile); err == nil {
+			fileArgs = append(fileArgs, "--env-file", envFile)
+			log.Printf("[docker] compose up: using env-file %s", envFile)
+		}
+		upOut, err := composeCmd(upCtx, fileArgs, "up", "-d", "--no-deps", service).CombinedOutput()
 		if err != nil {
 			res.Err = fmt.Sprintf("compose up failed (file: %s, service: %s): %s",
 				composeFile, service, stripDockerOutput(string(upOut)))
@@ -636,10 +644,13 @@ func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 		if wd != "" {
 			upCtx, upCancel := context.WithTimeout(context.Background(), composeUpTimeout)
 			defer upCancel()
-			_, err := composeCmd(upCtx,
-				[]string{"--project-directory", wd},
-				"up", "-d", "--no-deps", service,
-			).CombinedOutput()
+			fileArgs := []string{"--project-directory", wd}
+			envFile := filepath.Join(wd, ".env")
+			if _, err := os.Stat(envFile); err == nil {
+				fileArgs = append(fileArgs, "--env-file", envFile)
+				log.Printf("[docker] compose up (working_dir): using env-file %s", envFile)
+			}
+			_, err := composeCmd(upCtx, fileArgs, "up", "-d", "--no-deps", service).CombinedOutput()
 			if err == nil {
 				res.Restarted = true
 				return res
