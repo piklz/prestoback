@@ -22,7 +22,7 @@ RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build \
 FROM alpine:3.19
 
 # rsync + ssh for remote push; docker CLI for container stop/start + self-update
-RUN apk add --no-cache rsync openssh-client ca-certificates tzdata docker-cli
+RUN apk add --no-cache rsync openssh-client ca-certificates tzdata docker-cli docker-cli-compose
 
 WORKDIR /app
 COPY --from=builder /prestoback .
