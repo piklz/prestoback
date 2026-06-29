@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -478,6 +479,82 @@ func stripDockerOutput(s string) string {
 	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
+// ── Compose binary detection ──────────────────────────────────────────────────
+//
+// prestoback containers ship with the Docker CLI but may not have the
+// 'docker compose' V2 plugin installed. We detect once at first use:
+//
+//   1. docker compose (V2 plugin)  — preferred; supports --progress plain
+//   2. docker-compose (V1 binary)  — fallback; same CLI surface, no --progress
+//
+// The detection is done by running 'docker compose version' and checking
+// whether the output looks like compose (not the Docker CLI's global help).
+// Docker's global help appears — containing "--tlskey", "--tlsverify", etc. —
+// when the compose subcommand is not recognized by the CLI.
+
+var (
+	composeOnce sync.Once
+	composeBin  []string // ["docker","compose"] or ["docker-compose"]
+	composeIsV2 bool     // true = supports --progress plain
+)
+
+func initCompose() {
+	composeOnce.Do(func() {
+		out, err := exec.Command("docker", "compose", "version").CombinedOutput()
+		s := string(out)
+		// Detect V2 by absence of Docker's own global help flags in the output.
+		// When the compose plugin is missing, Docker prints its full --help
+		// including --tlskey, --tlsverify, etc. rather than compose version info.
+		if err == nil &&
+			!strings.Contains(s, "--tlskey") &&
+			!strings.Contains(s, "Usage:  docker") {
+			composeBin = []string{"docker", "compose"}
+			composeIsV2 = true
+			log.Printf("[docker] compose: using 'docker compose' V2 — %s", strings.TrimSpace(s))
+			return
+		}
+		// Log why V2 failed so it's visible in docker logs prestoback.
+		log.Printf("[docker] compose: 'docker compose' V2 not available (err=%v output=%q) — trying docker-compose V1", err, strings.TrimSpace(s))
+
+		out2, err2 := exec.Command("docker-compose", "--version").CombinedOutput()
+		if err2 == nil {
+			composeBin = []string{"docker-compose"}
+			composeIsV2 = false
+			log.Printf("[docker] compose: using 'docker-compose' V1 — %s", strings.TrimSpace(string(out2)))
+			return
+		}
+		// Last resort — caller will see an instructive error.
+		composeBin = []string{"docker", "compose"}
+		composeIsV2 = false
+		log.Printf("[docker] compose: WARNING — neither 'docker compose' V2 nor 'docker-compose' V1 found in PATH; install docker-compose-plugin or docker-compose")
+	})
+}
+
+// composeCmd builds an exec.Cmd for a compose operation using whichever
+// compose tool was auto-detected. fileArgs are the file/project flags
+// (e.g. ["-f", "/path/to/compose.yml"]) and subcmd is the subcommand and
+// its arguments (e.g. "up", "-d", "--no-deps", "caddy").
+//
+// --progress plain is added automatically for V2 to suppress ANSI/TUI output
+// that would corrupt Telegram messages. V1 does not support this flag.
+func composeCmd(ctx context.Context, fileArgs []string, subcmd ...string) *exec.Cmd {
+	initCompose()
+	bin := composeBin[0]
+	var args []string
+	if len(composeBin) > 1 {
+		args = append(args, composeBin[1:]...) // "compose" for the V2 two-word form
+	}
+	args = append(args, fileArgs...)
+	if composeIsV2 {
+		// --progress plain: disable TUI/ANSI progress bars — plain text only.
+		// This prevents the Braille spinners and escape sequences that survive
+		// EscapeMD and corrupt Telegram messages.
+		args = append(args, "--progress", "plain")
+	}
+	args = append(args, subcmd...)
+	return exec.CommandContext(ctx, bin, args...)
+}
+
 const pullTimeout = 10 * time.Minute
 
 // UpdateContainer pulls the latest image for c and attempts to recreate it
@@ -541,9 +618,8 @@ func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 	if service != "" && composeFile != "" {
 		upCtx, upCancel := context.WithTimeout(context.Background(), composeUpTimeout)
 		defer upCancel()
-		upOut, err := exec.CommandContext(upCtx, "docker", "compose",
-			"-f", composeFile,
-			"--progress", "plain", // disable TUI/ANSI output — plain text only
+		upOut, err := composeCmd(upCtx,
+			[]string{"-f", composeFile},
 			"up", "-d", "--no-deps", service,
 		).CombinedOutput()
 		if err != nil {
@@ -560,9 +636,8 @@ func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 		if wd != "" {
 			upCtx, upCancel := context.WithTimeout(context.Background(), composeUpTimeout)
 			defer upCancel()
-			_, err := exec.CommandContext(upCtx, "docker", "compose",
-				"--project-directory", wd,
-				"--progress", "plain", // disable TUI/ANSI output — plain text only
+			_, err := composeCmd(upCtx,
+				[]string{"--project-directory", wd},
 				"up", "-d", "--no-deps", service,
 			).CombinedOutput()
 			if err == nil {
