@@ -437,6 +437,17 @@ func dedupe(ss []string) []string {
 }
 
 // ── Container update ──────────────────────────────────────────────────────────
+//
+// Strategy: read the full HostConfig from the running container via the Docker
+// socket and recreate the container directly — no compose file needed.
+//
+// This is the same approach as Docksentry: inspect → pull → stop → rename →
+// create (with identical HostConfig + new image) → start → verify → rm old.
+// Compose is tried first if configured (PRESTOBACK_COMPOSE_FILE), but the
+// standalone recreate is the reliable fallback that always works.
+//
+// Rollback: if the new container fails to reach "running" within 30s, the
+// old container is renamed back and restarted automatically.
 
 // ContainerUpdate holds the result of pulling and recreating one container.
 type ContainerUpdate struct {
@@ -444,34 +455,401 @@ type ContainerUpdate struct {
 	Image           string
 	Pulled          bool   // image was pulled from registry
 	AlreadyUpToDate bool   // pull succeeded but image was already current
-	Restarted       bool   // container was recreated via compose up -d
-	NeedsManual     bool   // pulled OK but no compose info — user must recreate
+	Restarted       bool   // container recreated successfully
+	Rolled          bool   // new container failed health check — rolled back to previous
+	NeedsManual     bool   // pulled OK but socket operations failed unexpectedly
 	Err             string // non-empty on failure
 }
 
-// ansiEscape matches ANSI/VT100 escape sequences that docker compose writes
-// even when writing to a pipe. These are the root cause of the "--tlskey"
-// corruption: the sequences survive EscapeMD unchanged and are then
-// misinterpreted as MarkdownV2 formatting by Telegram's parser.
+// fullInspect holds the container configuration needed to recreate a container.
+// Fields not present in older Docker versions default to zero values and are
+// handled gracefully in buildCreateArgs.
+type fullInspect struct {
+	ID     string `json:"Id"`
+	Name   string `json:"Name"`
+	Config struct {
+		Image      string            `json:"Image"`
+		Env        []string          `json:"Env"`
+		Cmd        []string          `json:"Cmd"`
+		Entrypoint []string          `json:"Entrypoint"`
+		Labels     map[string]string `json:"Labels"`
+		User       string            `json:"User"`
+		WorkingDir string            `json:"WorkingDir"`
+	} `json:"Config"`
+	HostConfig struct {
+		Binds         []string `json:"Binds"`
+		NetworkMode   string   `json:"NetworkMode"`
+		RestartPolicy struct {
+			Name              string `json:"Name"`
+			MaximumRetryCount int    `json:"MaximumRetryCount"`
+		} `json:"RestartPolicy"`
+		PortBindings map[string][]struct {
+			HostIP   string `json:"HostIp"`
+			HostPort string `json:"HostPort"`
+		} `json:"PortBindings"`
+		Privileged bool     `json:"Privileged"`
+		CapAdd     []string `json:"CapAdd"`
+		CapDrop    []string `json:"CapDrop"`
+		ExtraHosts []string `json:"ExtraHosts"`
+		Dns        []string `json:"Dns"`
+		GroupAdd   []string `json:"GroupAdd"`
+		IpcMode    string   `json:"IpcMode"`
+		PidMode    string   `json:"PidMode"`
+		ShmSize    int64    `json:"ShmSize"`
+		Runtime    string   `json:"Runtime"`
+		Devices    []struct {
+			PathOnHost        string `json:"PathOnHost"`
+			PathInContainer   string `json:"PathInContainer"`
+			CgroupPermissions string `json:"CgroupPermissions"`
+		} `json:"Devices"`
+		Sysctls map[string]string `json:"Sysctls"`
+		Ulimits []struct {
+			Name string `json:"Name"`
+			Soft int64  `json:"Soft"`
+			Hard int64  `json:"Hard"`
+		} `json:"Ulimits"`
+		VolumesFrom []string          `json:"VolumesFrom"`
+		Tmpfs       map[string]string `json:"Tmpfs"`
+		LogConfig   struct {
+			Type   string            `json:"Type"`
+			Config map[string]string `json:"Config"`
+		} `json:"LogConfig"`
+	} `json:"HostConfig"`
+	NetworkSettings struct {
+		Networks map[string]struct {
+			NetworkID string   `json:"NetworkID"`
+			Aliases   []string `json:"Aliases"`
+		} `json:"Networks"`
+	} `json:"NetworkSettings"`
+	Mounts []struct {
+		Type        string `json:"Type"`
+		Name        string `json:"Name"`   // non-empty for named volumes
+		Source      string `json:"Source"` // host path (bind) or volume name
+		Destination string `json:"Destination"`
+		Mode        string `json:"Mode"`
+		RW          bool   `json:"RW"`
+	} `json:"Mounts"`
+}
+
+// buildCreateArgs converts a fullInspect into a "docker create" argument list.
+// The new image is substituted for the old one; everything else is preserved.
+func buildCreateArgs(name string, insp fullInspect, newImage string) []string {
+	var args []string
+	args = append(args, "create", "--name", name)
+
+	// Restart policy
+	switch rp := insp.HostConfig.RestartPolicy; rp.Name {
+	case "always", "unless-stopped":
+		args = append(args, "--restart", rp.Name)
+	case "on-failure":
+		if rp.MaximumRetryCount > 0 {
+			args = append(args, "--restart", fmt.Sprintf("on-failure:%d", rp.MaximumRetryCount))
+		} else {
+			args = append(args, "--restart", "on-failure")
+		}
+	}
+
+	// Environment variables
+	for _, e := range insp.Config.Env {
+		args = append(args, "-e", e)
+	}
+
+	// Labels — preserve all (including compose labels so compose still recognises the container)
+	for k, v := range insp.Config.Labels {
+		args = append(args, "--label", k+"="+v)
+	}
+
+	// Mounts: bind mounts + named volumes (from Mounts, which is more reliable
+	// than HostConfig.Binds for named volumes)
+	for _, m := range insp.Mounts {
+		switch m.Type {
+		case "bind":
+			mode := m.Mode
+			if mode == "" {
+				if m.RW {
+					mode = "rw"
+				} else {
+					mode = "ro"
+				}
+			}
+			args = append(args, "-v", m.Source+":"+m.Destination+":"+mode)
+		case "volume":
+			ref := m.Source
+			if m.Name != "" {
+				ref = m.Name
+			}
+			mode := m.Mode
+			if mode == "" {
+				if m.RW {
+					mode = "rw"
+				} else {
+					mode = "ro"
+				}
+			}
+			args = append(args, "-v", ref+":"+m.Destination+":"+mode)
+		}
+	}
+
+	// Tmpfs
+	for target, opts := range insp.HostConfig.Tmpfs {
+		if opts != "" {
+			args = append(args, "--tmpfs", target+":"+opts)
+		} else {
+			args = append(args, "--tmpfs", target)
+		}
+	}
+
+	// Port bindings
+	for containerPort, bindings := range insp.HostConfig.PortBindings {
+		for _, hb := range bindings {
+			switch {
+			case hb.HostIP != "" && hb.HostIP != "0.0.0.0":
+				args = append(args, "-p", hb.HostIP+":"+hb.HostPort+":"+containerPort)
+			case hb.HostPort != "":
+				args = append(args, "-p", hb.HostPort+":"+containerPort)
+			default:
+				args = append(args, "-p", containerPort)
+			}
+		}
+	}
+
+	// Primary network — additional networks are connected after create
+	nm := insp.HostConfig.NetworkMode
+	if nm == "" || nm == "default" {
+		nm = "bridge"
+	}
+	args = append(args, "--network", nm)
+
+	// Privileged
+	if insp.HostConfig.Privileged {
+		args = append(args, "--privileged")
+	}
+
+	// User
+	if insp.Config.User != "" {
+		args = append(args, "--user", insp.Config.User)
+	}
+
+	// Working directory
+	if insp.Config.WorkingDir != "" {
+		args = append(args, "--workdir", insp.Config.WorkingDir)
+	}
+
+	// IPC mode (skip Docker defaults)
+	if ipc := insp.HostConfig.IpcMode; ipc != "" && ipc != "private" && ipc != "shareable" {
+		args = append(args, "--ipc", ipc)
+	}
+
+	// PID mode
+	if pid := insp.HostConfig.PidMode; pid != "" && pid != "private" {
+		args = append(args, "--pid", pid)
+	}
+
+	// SHM size (skip default 64 MiB)
+	const defaultShmSize = 67108864
+	if insp.HostConfig.ShmSize > 0 && insp.HostConfig.ShmSize != defaultShmSize {
+		args = append(args, fmt.Sprintf("--shm-size=%d", insp.HostConfig.ShmSize))
+	}
+
+	// Extra hosts
+	for _, h := range insp.HostConfig.ExtraHosts {
+		args = append(args, "--add-host", h)
+	}
+
+	// DNS
+	for _, d := range insp.HostConfig.Dns {
+		args = append(args, "--dns", d)
+	}
+
+	// Supplemental groups
+	for _, g := range insp.HostConfig.GroupAdd {
+		args = append(args, "--group-add", g)
+	}
+
+	// Capabilities
+	for _, cap := range insp.HostConfig.CapAdd {
+		args = append(args, "--cap-add", cap)
+	}
+	for _, cap := range insp.HostConfig.CapDrop {
+		args = append(args, "--cap-drop", cap)
+	}
+
+	// Devices
+	for _, dev := range insp.HostConfig.Devices {
+		arg := dev.PathOnHost + ":" + dev.PathInContainer
+		if dev.CgroupPermissions != "" && dev.CgroupPermissions != "rwm" {
+			arg += ":" + dev.CgroupPermissions
+		}
+		args = append(args, "--device", arg)
+	}
+
+	// Sysctls
+	for k, v := range insp.HostConfig.Sysctls {
+		args = append(args, "--sysctl", k+"="+v)
+	}
+
+	// Ulimits
+	for _, ul := range insp.HostConfig.Ulimits {
+		args = append(args, "--ulimit", fmt.Sprintf("%s=%d:%d", ul.Name, ul.Soft, ul.Hard))
+	}
+
+	// Volumes from other containers
+	for _, vf := range insp.HostConfig.VolumesFrom {
+		args = append(args, "--volumes-from", vf)
+	}
+
+	// Log driver (only if non-default)
+	if lc := insp.HostConfig.LogConfig; lc.Type != "" && lc.Type != "json-file" {
+		args = append(args, "--log-driver", lc.Type)
+		for k, v := range lc.Config {
+			args = append(args, "--log-opt", k+"="+v)
+		}
+	}
+
+	// Runtime (only if non-default)
+	if rt := insp.HostConfig.Runtime; rt != "" && rt != "runc" {
+		args = append(args, "--runtime", rt)
+	}
+
+	// Entrypoint (first element only — --entrypoint takes a single string)
+	if len(insp.Config.Entrypoint) > 0 {
+		args = append(args, "--entrypoint", insp.Config.Entrypoint[0])
+	}
+
+	// Image (the new one)
+	args = append(args, newImage)
+
+	// Cmd: if entrypoint has extra elements, they become the first cmd args
+	if len(insp.Config.Entrypoint) > 1 {
+		args = append(args, insp.Config.Entrypoint[1:]...)
+	}
+	args = append(args, insp.Config.Cmd...)
+
+	return args
+}
+
+// standaloneRecreate stops the container, renames it to a _prestoback_bak
+// backup, creates a new container from the same HostConfig + new image,
+// starts it, verifies it reaches "running", then removes the old one.
+//
+// If the new container fails the health check within 30s it automatically
+// renames the backup back and restarts the original — full rollback.
+//
+// This requires no compose file — only the Docker socket.
+func standaloneRecreate(c ContainerInfo, newImage string) (rolled bool, err error) {
+	// Full inspect of the running container
+	raw, inspErr := exec.Command("docker", "inspect", c.ID).Output()
+	if inspErr != nil {
+		return false, fmt.Errorf("inspect failed: %w", inspErr)
+	}
+	var inspects []fullInspect
+	if jsonErr := json.Unmarshal(raw, &inspects); jsonErr != nil || len(inspects) == 0 {
+		return false, fmt.Errorf("inspect parse failed: %w", jsonErr)
+	}
+	insp := inspects[0]
+	name := strings.TrimPrefix(insp.Name, "/")
+	bakName := name + "_prestoback_bak"
+
+	// Remove any leftover backup container from a previous failed update
+	_ = exec.Command("docker", "rm", "-f", bakName).Run()
+
+	// Stop the current container gracefully
+	log.Printf("[recreate] stopping %s", name)
+	if out, stopErr := exec.Command("docker", "stop", "-t", "30", c.ID).CombinedOutput(); stopErr != nil {
+		return false, fmt.Errorf("stop failed: %s", stripDockerOutput(string(out)))
+	}
+
+	// Rename old container so we can reclaim the name
+	log.Printf("[recreate] renaming %s → %s", name, bakName)
+	if out, renErr := exec.Command("docker", "rename", c.ID, bakName).CombinedOutput(); renErr != nil {
+		_ = exec.Command("docker", "start", c.ID).Run() // restore original
+		return false, fmt.Errorf("rename failed: %s", stripDockerOutput(string(out)))
+	}
+
+	// rollback restores the old container on any subsequent failure
+	rollback := func(reason error) (bool, error) {
+		log.Printf("[recreate] rollback %s: %v", name, reason)
+		_ = exec.Command("docker", "rename", bakName, name).Run()
+		if startErr := exec.Command("docker", "start", c.ID).Run(); startErr != nil {
+			log.Printf("[recreate] WARNING: rollback start failed for %s: %v", name, startErr)
+		}
+		return true, fmt.Errorf("%w", reason)
+	}
+
+	// Create new container from identical HostConfig + new image
+	createArgs := buildCreateArgs(name, insp, newImage)
+	log.Printf("[recreate] docker create %s (image: %s)", name, newImage)
+	createOut, createErr := exec.Command("docker", createArgs...).CombinedOutput()
+	if createErr != nil {
+		return rollback(fmt.Errorf("create failed: %s", stripDockerOutput(string(createOut))))
+	}
+	newID := strings.TrimSpace(string(createOut))
+
+	// Connect to additional networks (compose projects often have several)
+	primaryNet := insp.HostConfig.NetworkMode
+	if primaryNet == "" || primaryNet == "default" {
+		primaryNet = "bridge"
+	}
+	for netName, netInfo := range insp.NetworkSettings.Networks {
+		if netName == primaryNet {
+			continue
+		}
+		// Skip built-in Docker networks already handled by --network
+		if netName == "bridge" || netName == "host" || netName == "none" {
+			continue
+		}
+		log.Printf("[recreate] connecting %s to network %s", name, netName)
+		connectArgs := []string{"network", "connect"}
+		for _, alias := range netInfo.Aliases {
+			connectArgs = append(connectArgs, "--alias", alias)
+		}
+		connectArgs = append(connectArgs, netName, newID)
+		if out, connErr := exec.Command("docker", connectArgs...).CombinedOutput(); connErr != nil {
+			log.Printf("[recreate] warning: could not connect %s to %s: %s", name, netName, stripDockerOutput(string(out)))
+		}
+	}
+
+	// Start the new container
+	log.Printf("[recreate] starting %s (new id: %.12s)", name, newID)
+	if out, startErr := exec.Command("docker", "start", newID).CombinedOutput(); startErr != nil {
+		_ = exec.Command("docker", "rm", newID).Run()
+		return rollback(fmt.Errorf("start failed: %s", stripDockerOutput(string(out))))
+	}
+
+	// Wait up to 30s for the container to reach running state
+	if waitErr := waitRunning(newID, name, 30*time.Second, func(s string) {
+		log.Printf("[recreate] %s", s)
+	}); waitErr != nil {
+		_ = exec.Command("docker", "stop", newID).Run()
+		_ = exec.Command("docker", "rm", newID).Run()
+		return rollback(fmt.Errorf("health check: %v", waitErr))
+	}
+
+	// Success — clean up backup
+	log.Printf("[recreate] %s updated OK — removing old container %s", name, bakName)
+	if out, rmErr := exec.Command("docker", "rm", bakName).CombinedOutput(); rmErr != nil {
+		// Not fatal — old container is stopped, new one is running
+		log.Printf("[recreate] warning: could not remove backup %s: %s", bakName, stripDockerOutput(string(out)))
+	}
+	return false, nil
+}
+
+// ansiEscape matches ANSI/VT100 terminal escape sequences that docker CLI
+// writes to output even when stdout is a pipe. These corrupt MarkdownV2.
 var ansiEscape = regexp.MustCompile(`\x1b(?:\[[0-9;]*[a-zA-Z]|\][^\x07]*\x07|[()][AB012])`)
 
 // stripDockerOutput removes ANSI escape sequences, Unicode Braille spinner
-// frames (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏), and truncates to the last 8 lines so error strings
-// are safe to embed in Telegram MarkdownV2 messages.
+// frames (U+2800–U+28FF), and keeps only the last 8 lines — making Docker
+// output safe to embed verbatim in Telegram MarkdownV2 messages.
 func stripDockerOutput(s string) string {
-	// Strip ANSI escape sequences — these corrupt MarkdownV2 output into
-	// garbage like "--tlskey" even after EscapeMD is applied.
 	s = ansiEscape.ReplaceAllString(s, "")
-
 	var b strings.Builder
 	for _, r := range s {
-		// Skip Braille Patterns block (U+2800–U+28FF) — used as CLI spinners
-		if r >= 0x2800 && r <= 0x28FF {
+		if r >= 0x2800 && r <= 0x28FF { // Braille block — CLI spinners
 			continue
 		}
 		b.WriteRune(r)
 	}
-	// Keep only the last N lines — Docker output can be very verbose
 	out := strings.TrimSpace(b.String())
 	const maxLines = 8
 	lines := strings.Split(out, "\n")
@@ -481,76 +859,44 @@ func stripDockerOutput(s string) string {
 	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
-// ── Compose binary detection ──────────────────────────────────────────────────
-//
-// prestoback containers ship with the Docker CLI but may not have the
-// 'docker compose' V2 plugin installed. We detect once at first use:
-//
-//   1. docker compose (V2 plugin)  — preferred; supports --progress plain
-//   2. docker-compose (V1 binary)  — fallback; same CLI surface, no --progress
-//
-// The detection is done by running 'docker compose version' and checking
-// whether the output looks like compose (not the Docker CLI's global help).
-// Docker's global help appears — containing "--tlskey", "--tlsverify", etc. —
-// when the compose subcommand is not recognized by the CLI.
-
+// initCompose / composeCmd: used by the optional compose Strategy 3a.
+// Detects V2 plugin vs V1 binary once at first call.
 var (
 	composeOnce sync.Once
-	composeBin  []string // ["docker","compose"] or ["docker-compose"]
-	composeIsV2 bool     // true = supports --progress plain
+	composeBin  []string
+	composeIsV2 bool
 )
 
 func initCompose() {
 	composeOnce.Do(func() {
 		out, err := exec.Command("docker", "compose", "version").CombinedOutput()
 		s := string(out)
-		// Detect V2 by absence of Docker's own global help flags in the output.
-		// When the compose plugin is missing, Docker prints its full --help
-		// including --tlskey, --tlsverify, etc. rather than compose version info.
-		if err == nil &&
-			!strings.Contains(s, "--tlskey") &&
-			!strings.Contains(s, "Usage:  docker") {
+		if err == nil && !strings.Contains(s, "--tlskey") && !strings.Contains(s, "Usage:  docker") {
 			composeBin = []string{"docker", "compose"}
 			composeIsV2 = true
-			log.Printf("[docker] compose: using 'docker compose' V2 — %s", strings.TrimSpace(s))
+			log.Printf("[docker] compose: V2 detected — %s", strings.TrimSpace(s))
 			return
 		}
-		// Log why V2 failed so it's visible in docker logs prestoback.
-		log.Printf("[docker] compose: 'docker compose' V2 not available (err=%v output=%q) — trying docker-compose V1", err, strings.TrimSpace(s))
-
-		out2, err2 := exec.Command("docker-compose", "--version").CombinedOutput()
-		if err2 == nil {
+		log.Printf("[docker] compose: V2 not available (%v) — trying docker-compose V1", err)
+		if out2, err2 := exec.Command("docker-compose", "--version").CombinedOutput(); err2 == nil {
 			composeBin = []string{"docker-compose"}
-			composeIsV2 = false
-			log.Printf("[docker] compose: using 'docker-compose' V1 — %s", strings.TrimSpace(string(out2)))
+			log.Printf("[docker] compose: V1 detected — %s", strings.TrimSpace(string(out2)))
 			return
 		}
-		// Last resort — caller will see an instructive error.
-		composeBin = []string{"docker", "compose"}
-		composeIsV2 = false
-		log.Printf("[docker] compose: WARNING — neither 'docker compose' V2 nor 'docker-compose' V1 found in PATH; install docker-compose-plugin or docker-compose")
+		composeBin = []string{"docker", "compose"} // last resort; caller sees error
+		log.Printf("[docker] compose: WARNING — no compose binary found in PATH")
 	})
 }
 
-// composeCmd builds an exec.Cmd for a compose operation using whichever
-// compose tool was auto-detected. fileArgs are the file/project flags
-// (e.g. ["-f", "/path/to/compose.yml"]) and subcmd is the subcommand and
-// its arguments (e.g. "up", "-d", "--no-deps", "caddy").
-//
-// --progress plain is added automatically for V2 to suppress ANSI/TUI output
-// that would corrupt Telegram messages. V1 does not support this flag.
 func composeCmd(ctx context.Context, fileArgs []string, subcmd ...string) *exec.Cmd {
 	initCompose()
 	bin := composeBin[0]
 	var args []string
 	if len(composeBin) > 1 {
-		args = append(args, composeBin[1:]...) // "compose" for the V2 two-word form
+		args = append(args, composeBin[1:]...)
 	}
 	args = append(args, fileArgs...)
 	if composeIsV2 {
-		// --progress plain: disable TUI/ANSI progress bars — plain text only.
-		// This prevents the Braille spinners and escape sequences that survive
-		// EscapeMD and corrupt Telegram messages.
 		args = append(args, "--progress", "plain")
 	}
 	args = append(args, subcmd...)
@@ -559,30 +905,18 @@ func composeCmd(ctx context.Context, fileArgs []string, subcmd ...string) *exec.
 
 const pullTimeout = 10 * time.Minute
 
-// UpdateContainer pulls the latest image for c and attempts to recreate it
-// via Docker Compose. The recreation strategy is tried in this order:
+// UpdateContainer pulls the latest image for c and recreates the container.
 //
-//  1. composeFile (non-empty): docker compose -f <file> up -d --no-deps <service>
-//     Use this when the host's compose file is mounted into the prestoback
-//     container (e.g. - ./docker-compose.yml:/compose/docker-compose.yml:ro)
-//     and PRESTOBACK_COMPOSE_FILE=/compose/docker-compose.yml is set.
-//
-//  2. working_dir label fallback: docker compose --project-directory <wd> …
-//     Only works if the host's project directory is ALSO mounted inside the
-//     prestoback container at the same path — uncommon, but supported.
-//
-//  3. NeedsManual: image was pulled but we cannot recreate automatically.
-//     The user must restart the container themselves (docker compose up -d).
-//
-// docker pull carries a 10-minute timeout to prevent indefinite hangs on a
-// slow connection or a stalled registry.
-//
-// This does NOT back up the container's data. Run a backup first if the app
-// stores state — /update is for stateless or low-risk image refreshes.
+// Recreation strategy (in order):
+//  1. docker compose (if PRESTOBACK_COMPOSE_FILE is set and the file exists)
+//  2. Standalone recreate via HostConfig read from Docker socket — works for
+//     all containers, no compose file needed. Includes automatic rollback if
+//     the new container fails its health check.
+//  3. NeedsManual — only if both strategies fail unexpectedly.
 func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 	res := ContainerUpdate{ContainerName: c.Name}
 
-	// Step 1: resolve image name.
+	// ── Step 1: resolve the current image name ────────────────────────────────
 	out, err := exec.Command("docker", "inspect", "--format={{.Config.Image}}", c.ID).Output()
 	if err != nil {
 		res.Err = "inspect failed: " + err.Error()
@@ -594,7 +928,7 @@ func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 		return res
 	}
 
-	// Step 2: pull latest — with a hard deadline.
+	// ── Step 2: pull latest image ─────────────────────────────────────────────
 	ctx, cancel := context.WithTimeout(context.Background(), pullTimeout)
 	defer cancel()
 	pullOut, err := exec.CommandContext(ctx, "docker", "pull", res.Image).CombinedOutput()
@@ -608,58 +942,46 @@ func UpdateContainer(c ContainerInfo, composeFile string) ContainerUpdate {
 	}
 	res.Pulled = true
 	res.AlreadyUpToDate = strings.Contains(string(pullOut), "up to date")
-
-	// Step 3: recreate via compose.
-	labels := inspectLabels(c.ID)
-	service := labels["com.docker.compose.service"]
-
-	// Hard deadline for compose up — prevents a stuck health-check from
-	// holding the update goroutine open indefinitely.
-	const composeUpTimeout = 5 * time.Minute
-
-	if service != "" && composeFile != "" {
-		upCtx, upCancel := context.WithTimeout(context.Background(), composeUpTimeout)
-		defer upCancel()
-		// Pass --env-file so compose can resolve all ${VAR} substitutions in the
-		// file (other services' vars like UPLOAD_LOCATION, DB_PASSWORD, etc.).
-		// The .env lives alongside docker-compose.yml in the presto project dir.
-		fileArgs := []string{"-f", composeFile}
-		envFile := filepath.Join(filepath.Dir(composeFile), ".env")
-		if _, err := os.Stat(envFile); err == nil {
-			fileArgs = append(fileArgs, "--env-file", envFile)
-			log.Printf("[docker] compose up: using env-file %s", envFile)
-		}
-		upOut, err := composeCmd(upCtx, fileArgs, "up", "-d", "--no-deps", service).CombinedOutput()
-		if err != nil {
-			res.Err = fmt.Sprintf("compose up failed (file: %s, service: %s): %s",
-				composeFile, service, stripDockerOutput(string(upOut)))
-			return res
-		}
-		res.Restarted = true
+	if res.AlreadyUpToDate {
+		// Image unchanged — no need to recreate the container.
 		return res
 	}
 
-	if service != "" {
-		wd := labels["com.docker.compose.project.working_dir"]
-		if wd != "" {
+	// ── Step 3a: compose recreation (optional, if file is configured) ─────────
+	labels := inspectLabels(c.ID)
+	service := labels["com.docker.compose.service"]
+	const composeUpTimeout = 5 * time.Minute
+
+	if service != "" && composeFile != "" {
+		if _, statErr := os.Stat(composeFile); statErr == nil {
 			upCtx, upCancel := context.WithTimeout(context.Background(), composeUpTimeout)
 			defer upCancel()
-			fileArgs := []string{"--project-directory", wd}
-			envFile := filepath.Join(wd, ".env")
-			if _, err := os.Stat(envFile); err == nil {
+			fileArgs := []string{"-f", composeFile}
+			envFile := filepath.Join(filepath.Dir(composeFile), ".env")
+			if _, envErr := os.Stat(envFile); envErr == nil {
 				fileArgs = append(fileArgs, "--env-file", envFile)
-				log.Printf("[docker] compose up (working_dir): using env-file %s", envFile)
+				log.Printf("[docker] compose up: using env-file %s", envFile)
 			}
-			_, err := composeCmd(upCtx, fileArgs, "up", "-d", "--no-deps", service).CombinedOutput()
-			if err == nil {
+			upOut, upErr := composeCmd(upCtx, fileArgs, "up", "-d", "--no-deps", service).CombinedOutput()
+			if upErr == nil {
 				res.Restarted = true
 				return res
 			}
-			log.Printf("[docker] compose up via working_dir %q not accessible inside container, falling back to manual: %v", wd, err)
+			// Compose failed — log and fall through to standalone recreate
+			log.Printf("[docker] compose up failed for %s (%s): %s — falling back to standalone recreate",
+				c.Name, service, stripDockerOutput(string(upOut)))
+		} else {
+			log.Printf("[docker] composeFile %q not accessible inside container — using standalone recreate", composeFile)
 		}
 	}
 
-	// Strategy C: image pulled but container recreation requires user action.
-	res.NeedsManual = true
+	// ── Step 3b: standalone HostConfig-based recreate (always available) ──────
+	rolled, recreateErr := standaloneRecreate(c, res.Image)
+	if recreateErr != nil {
+		res.Err = recreateErr.Error()
+		res.Rolled = rolled
+		return res
+	}
+	res.Restarted = true
 	return res
 }

@@ -804,6 +804,12 @@ func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.
 			switch {
 			case cr.timedOut:
 				sb.WriteString(fmt.Sprintf("  ❌ `%s` — timed out \\(pull \\>10 min\\)\n", notify.EscapeMD(cr.name)))
+			case cr.res.Rolled:
+				sb.WriteString(fmt.Sprintf("  ⚠️ `%s` — new container failed health check, rolled back _%s_\n",
+					notify.EscapeMD(cr.name), notify.EscapeMD(formatDuration(cr.dur))))
+				if errMsg != "" {
+					sb.WriteString(fmt.Sprintf("     `%s`\n", notify.EscapeMD(errMsg)))
+				}
 			case errMsg != "":
 				sb.WriteString(fmt.Sprintf("  ❌ `%s` — %s\n", notify.EscapeMD(cr.name), notify.EscapeMD(errMsg)))
 			case cr.res.AlreadyUpToDate:
@@ -812,14 +818,10 @@ func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.
 			case cr.res.Restarted:
 				sb.WriteString(fmt.Sprintf("  ✅ `%s` — pulled \\+ recreated _%s_\n",
 					notify.EscapeMD(cr.name), notify.EscapeMD(formatDuration(cr.dur))))
-			case cr.res.NeedsManual:
-				sb.WriteString(fmt.Sprintf("  📥 `%s` — pulled, manual restart needed _%s_\n",
-					notify.EscapeMD(cr.name), notify.EscapeMD(formatDuration(cr.dur))))
-				if s.cfg.ComposeFile == "" {
-					sb.WriteString("     💡 _Set `PRESTOBACK\\_COMPOSE\\_FILE` — see /update help_\n")
-				}
+			default:
+				sb.WriteString(fmt.Sprintf("  ❓ `%s` — unknown result\n", notify.EscapeMD(cr.name)))
 			}
-			if cr.res.Image != "" && !cr.res.AlreadyUpToDate && errMsg == "" {
+			if cr.res.Image != "" && !cr.res.AlreadyUpToDate && errMsg == "" && !cr.res.Rolled {
 				sb.WriteString(fmt.Sprintf("     📦 `%s`\n", notify.EscapeMD(cr.res.Image)))
 			}
 		}
@@ -843,14 +845,14 @@ func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.
 			for _, cr := range ar.containers {
 				if cr.timedOut {
 					plain += fmt.Sprintf("\n⚠️ %s: timed out", cr.name)
+				} else if cr.res.Rolled {
+					plain += fmt.Sprintf("\n⚠️ %s: health check failed, rolled back", cr.name)
 				} else if cr.res.Err != "" {
 					plain += fmt.Sprintf("\n❌ %s: failed", cr.name)
 				} else if cr.res.Restarted {
 					plain += fmt.Sprintf("\n✅ %s: updated", cr.name)
 				} else if cr.res.AlreadyUpToDate {
 					plain += fmt.Sprintf("\n✔ %s: already up to date", cr.name)
-				} else if cr.res.NeedsManual {
-					plain += fmt.Sprintf("\n📥 %s: pulled, needs manual restart", cr.name)
 				}
 			}
 		}
@@ -2461,29 +2463,29 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			return
 		}
 		if lower == "help" {
-			composeStatus := "❌ not configured"
+			composeStatus := "not set \\(standalone recreate active\\)"
 			if s.cfg.ComposeFile != "" {
 				composeStatus = fmt.Sprintf("✅ `%s`", notify.EscapeMD(s.cfg.ComposeFile))
 			}
 			_ = notify.SendRaw(tgCfg, fmt.Sprintf(
-				"*\\/update — compose setup*\n\n"+
-					"*Current compose file:* %s\n\n"+
-					"*Why the path matters:*\n"+
-					"Docker Compose resolves relative volume paths relative to the compose file's "+
-					"directory\\. If the file is mounted at `/presto/docker\\-compose\\.yml`, volumes "+
-					"like `\\./volumes/caddy` resolve to `/presto/volumes/caddy` — a path the Docker "+
-					"daemon looks for on the HOST, where it doesn't exist\\. "+
-					"The file must be mounted at its *exact host path*\\.\n\n"+
-					"*Correct setup \\(in your prestoback service\\):*\n"+
+				"*\\/update — how it works*\n\n"+
+					"*Compose file:* %s\n\n"+
+					"*Default \\(no compose file needed\\):*\n"+
+					"PrestoBack reads the full container config from the Docker socket, "+
+					"pulls the new image, stops the old container, and recreates it with "+
+					"identical volumes, ports, networks, env vars, and restart policy\\. "+
+					"If the new container fails its health check within 30s, the old one "+
+					"is automatically restarted \\(rollback\\)\\.\n\n"+
+					"*Optional — compose file \\(takes priority\\):*\n"+
+					"Set `PRESTOBACK\\_COMPOSE\\_FILE` if you prefer compose to manage recreation\\. "+
+					"The path must be the exact host path, mounted at the same path inside this container:\n"+
 					"```yaml\n"+
 					"environment:\n"+
 					"  PRESTOBACK_COMPOSE_FILE: ${PWD}/docker-compose.yml\n"+
 					"volumes:\n"+
-					"  # Mount at the SAME path as on the host:\n"+
 					"  - ${PWD}/docker-compose.yml:${PWD}/docker-compose.yml:ro\n"+
-					"```\n\n"+
-					"`$\\{PWD\\}` expands to your presto directory \\(e\\.g\\. `/home/pi/presto`\\) "+
-					"when you run `docker compose up` from that folder\\.",
+					"```\n"+
+					"Use `/selfupdate` to update PrestoBack itself\\.",
 				composeStatus,
 			))
 			return
