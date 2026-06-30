@@ -3095,7 +3095,7 @@ func (s *Server) handleStackCommand(tgCfg notify.TelegramConfig, sub string) {
 				"volumes:\n"+
 				"  - ${PWD}:${PWD}:ro\n"+
 				"```\n\n"+
-				"_Note: `/update` does NOT need this — it works without a compose file via standalone container recreate\\. Only `/stack` commands require it\\._")
+				"_Note: compose\\-managed containers also need this for `/update` — only fully standalone, non\\-compose containers can update without it\\._")
 		return
 	}
 	if _, statErr := os.Stat(composeFile); statErr != nil {
@@ -3108,21 +3108,17 @@ func (s *Server) handleStackCommand(tgCfg notify.TelegramConfig, sub string) {
 				"```yaml\n"+
 				"volumes:\n"+
 				"  - %s:%s:ro\n"+
-				"```\n\n"+
-				"_Note: `/update` does NOT need this — it works without a compose file via standalone container recreate\\. Only `/stack` commands require it\\._",
+				"```",
 			notify.EscapeMD(composeFile), projectDir, projectDir,
 		))
 		return
 	}
-	// Soft warning (not a hard stop): if only the single compose file is
-	// mounted rather than the whole project directory, .env and per-service
-	// env_file: references will be invisible to Compose running in this
-	// container. Variables silently resolve to empty strings, which can
-	// corrupt volume specs like "${VAR}:/data" into invalid empty-section
-	// binds ("invalid spec: :/data: empty section between colons").
-	envFile := filepath.Join(projectDir, ".env")
-	if _, envErr := os.Stat(envFile); envErr != nil {
-		log.Printf("[stack] warning: %s not found — if your stack uses .env or env_file: references, mount the whole project directory, not just docker-compose.yml", envFile)
+	// Soft warning (not a hard stop): catches the case where only
+	// docker-compose.yml (+ maybe top-level .env) is mounted, but the
+	// services/<app>/<app>.env tree referenced by env_file: entries isn't.
+	// See backup.ProjectDirIssue for the full layout assumption this checks.
+	if issue := backup.ProjectDirIssue(composeFile); issue != "" {
+		log.Printf("[stack] warning: %s", issue)
 	}
 
 	switch sub {

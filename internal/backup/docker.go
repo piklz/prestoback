@@ -1049,7 +1049,9 @@ func UpdateContainer(c ContainerInfo, composeFile string, emit func(string)) Con
 	//     automatic rollback. Safe because compose doesn't own these containers.
 	labels := inspectLabels(c.ID)
 	service := labels["com.docker.compose.service"]
-	const composeUpTimeout = 5 * time.Minute
+	// 10 minutes — long enough for a single heavy service (e.g. immich_server)
+	// to pull-recreate without our own timeout killing compose mid-sequence.
+	const composeUpTimeout = 10 * time.Minute
 
 	if service != "" {
 		// This is a compose-managed container. Only compose may recreate it.
@@ -1066,6 +1068,13 @@ func UpdateContainer(c ContainerInfo, composeFile string, emit func(string)) Con
 					"mount the project directory at the same host path so /update can reach it",
 				composeFile)
 			return res
+		}
+		// Soft pre-flight: warn (don't block) if only the compose file is mounted
+		// rather than the whole presto project directory — see ProjectDirIssue.
+		// This turns a cryptic "empty section between colons" compose failure
+		// into a clear, actionable message before we even try.
+		if issue := ProjectDirIssue(composeFile); issue != "" {
+			log.Printf("[docker] update %s: %s", c.Name, issue)
 		}
 		emit(fmt.Sprintf("Recreating %s via compose (service: %s)…", c.Name, service))
 		upCtx, upCancel := context.WithTimeout(context.Background(), composeUpTimeout)
@@ -1208,8 +1217,17 @@ func StackUp(composeFile string, emit func(string)) error {
 	if _, err := os.Stat(composeFile); err != nil {
 		return fmt.Errorf("compose file not accessible inside this container: %w", err)
 	}
+	// Self-heal: clean up any containers stranded by a previous interrupted
+	// recreate before starting a new one — see cleanupStaleRenames doc comment.
+	cleanupStaleRenames(emit)
 	emit("Running: docker compose up -d…")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// 20 minutes — a multi-service stack (esp. with immich-sized images) can
+	// legitimately take this long to recreate everything. The old 5-minute
+	// timeout was firing mid-recreate and killing compose between its
+	// internal rename-old/create-new/remove-old steps, which is what produced
+	// the {id}_{name} orphans in the first place — killing compose too early
+	// is worse than waiting longer.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 	// --remove-orphans: removes containers for services that are no longer in
 	// the compose file. Without this, removed or renamed services leave
@@ -1277,6 +1295,8 @@ func StackPull(composeFile string, emit func(string)) error {
 	if _, err := os.Stat(composeFile); err != nil {
 		return fmt.Errorf("compose file not accessible inside this container: %w", err)
 	}
+	// Self-heal before doing anything — see cleanupStaleRenames doc comment.
+	cleanupStaleRenames(emit)
 	fileArgs := stackFileArgs(composeFile)
 
 	emit("Pulling latest images for all services…")
@@ -1288,7 +1308,9 @@ func StackPull(composeFile string, emit func(string)) error {
 	}
 	emit("Pull complete — recreating changed containers…")
 
-	upCtx, upCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// 20 minutes for the same reason as StackUp: killing compose mid-recreate
+	// is what produces {id}_{name} orphans, so it's better to wait it out.
+	upCtx, upCancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer upCancel()
 	upOut, upErr := composeCmd(upCtx, fileArgs, "up", "-d", "--remove-orphans").CombinedOutput()
 	if upErr != nil {
@@ -1299,19 +1321,18 @@ func StackPull(composeFile string, emit func(string)) error {
 }
 
 // stackFileArgs builds the -f / --env-file args shared by all stack operations.
-// stackFileArgs builds the -f / --env-file args shared by all stack operations.
 //
 // IMPORTANT: this only finds the top-level .env next to docker-compose.yml.
 // If your stack uses per-service env_file: references (e.g.
-// "./services/motioneye/motioneye.env"), Docker Compose resolves those
-// relative to the project directory AT PARSE TIME, from inside this
-// container. If only docker-compose.yml itself is mounted, those nested
-// .env files don't exist inside the container, every variable they'd
-// provide silently becomes an empty string, and any volume spec built from
-// one of those vars (e.g. "${DB_DATA_LOCATION}:/data") becomes invalid
-// (":/data" — empty section between colons). The only robust fix is
-// mounting the WHOLE project directory at the same host path, not just the
-// single compose file — see handleStackCommand's pre-flight error message.
+// "./services/caddy/caddy.env"), Docker Compose resolves those relative to
+// the project directory AT PARSE TIME, from inside this container. If only
+// docker-compose.yml itself is mounted, those nested .env files don't exist
+// inside the container, every variable they'd provide silently becomes an
+// empty string, and any volume spec built from one of those vars (e.g.
+// "${DB_DATA_LOCATION}:/data") becomes invalid (":/data" — empty section
+// between colons). The only robust fix is mounting the WHOLE project
+// directory at the same host path, not just the single compose file — see
+// ProjectDirIssue for the pre-flight check that catches this early.
 func stackFileArgs(composeFile string) []string {
 	args := []string{"-f", composeFile}
 	envFile := filepath.Join(filepath.Dir(composeFile), ".env")
@@ -1319,6 +1340,149 @@ func stackFileArgs(composeFile string) []string {
 		args = append(args, "--env-file", envFile)
 	}
 	return args
+}
+
+// cleanupStaleRenames finds and removes containers left over from a
+// docker compose recreate sequence that was interrupted mid-flight (e.g. by
+// a timeout firing while compose was between its internal "rename old
+// container out of the way" and "remove old container" steps).
+//
+// Compose's own recreate sequence is: rename old container to
+// "{old_container_id}_{service_name}" -> create new container with the
+// proper name -> start it -> remove the old renamed one. That rename is
+// normally invisible — it exists for a fraction of a second. If our process
+// is killed (e.g. our own timeout enforcement) at exactly the wrong moment,
+// the renamed-but-never-removed old container is left behind permanently,
+// with a name like "a68df191956f_homebox".
+//
+// This is safe to run automatically before every stack up/pull: a container
+// is only removed if (a) its name matches the {hex12}_{anything} pattern AND
+// (b) a different, properly-named, RUNNING container already exists for the
+// same compose project+service labels — i.e. the recreate actually
+// succeeded and this is provably the abandoned leftover, not a container
+// that's still mid-recreate.
+func cleanupStaleRenames(emit func(string)) {
+	out, err := exec.Command("docker", "ps", "-a",
+		"--format", `{"id":"{{.ID}}","name":"{{.Names}}","labels":"{{.Labels}}"}`,
+	).Output()
+	if err != nil {
+		return
+	}
+
+	type psEntry struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Labels string `json:"labels"`
+	}
+	var all []psEntry
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var e psEntry
+		if json.Unmarshal([]byte(line), &e) == nil {
+			all = append(all, e)
+		}
+	}
+
+	// Build a set of (project, service) pairs that have a normally-named,
+	// currently-running container — i.e. a confirmed-successful recreate.
+	healthyServices := map[string]bool{}
+	for _, e := range all {
+		if staleRenamePattern.MatchString(e.Name) {
+			continue // this one IS a candidate orphan, not a healthy reference
+		}
+		project := labelValue(e.Labels, "com.docker.compose.project")
+		service := labelValue(e.Labels, "com.docker.compose.service")
+		if project != "" && service != "" {
+			healthyServices[project+"/"+service] = true
+		}
+	}
+
+	for _, e := range all {
+		if !staleRenamePattern.MatchString(e.Name) {
+			continue
+		}
+		project := labelValue(e.Labels, "com.docker.compose.project")
+		service := labelValue(e.Labels, "com.docker.compose.service")
+		if project == "" || service == "" {
+			continue // not a compose container — leave it alone, not ours to touch
+		}
+		if !healthyServices[project+"/"+service] {
+			// No confirmed-healthy replacement exists yet — this might still be
+			// mid-recreate. Don't touch it; a future cleanup pass will catch it
+			// once the replacement is confirmed running.
+			continue
+		}
+		if emit != nil {
+			emit(fmt.Sprintf("Removing stale interrupted-recreate container %s…", e.Name))
+		}
+		log.Printf("[docker] cleanupStaleRenames: removing %s (%s) — confirmed replaced by a running container for %s/%s",
+			e.Name, e.ID, project, service)
+		_ = exec.Command("docker", "rm", "-f", e.ID).Run()
+	}
+}
+
+// staleRenamePattern matches container names left behind by an interrupted
+// compose recreate: a 12-character hex container ID followed by an
+// underscore and the original name, e.g. "a68df191956f_homebox".
+var staleRenamePattern = regexp.MustCompile(`^[a-f0-9]{12}_`)
+
+// labelValue extracts a single label's value from Docker CLI's
+// comma-separated "--format {{.Labels}}" output (e.g. "a=1,b=2,c=3").
+func labelValue(labels, key string) string {
+	for _, kv := range strings.Split(labels, ",") {
+		if idx := strings.Index(kv, "="); idx > 0 && kv[:idx] == key {
+			return kv[idx+1:]
+		}
+	}
+	return ""
+}
+
+// ProjectDirIssue checks whether the presto project directory is fully
+// reachable inside this container — not just docker-compose.yml itself.
+//
+// Expected layout (the assumption this whole update system is built on):
+//
+//	~/presto/docker-compose.yml
+//	~/presto/.env                          (top-level vars)
+//	~/presto/volumes/<app>/...             (app data/config)
+//	~/presto/services/<app>/<app>.env      (per-service env_file: refs)
+//
+// Compose resolves every env_file: path in the YAML relative to the project
+// directory AT PARSE TIME, from inside whichever container runs the compose
+// CLI. If only docker-compose.yml (and maybe the top .env) are mounted —
+// not the services/ subtree — those per-service env files silently don't
+// exist, their variables resolve to empty strings, and compose fails with
+// a confusing "empty section between colons" or similar deep in a volume
+// spec, with no indication the real cause is an incomplete mount.
+//
+// Returns "" if everything looks reachable, otherwise a human-readable
+// explanation suitable for sending straight to Telegram/SSE.
+func ProjectDirIssue(composeFile string) string {
+	if composeFile == "" {
+		return "no compose file configured (PRESTOBACK_COMPOSE_FILE)"
+	}
+	if _, err := os.Stat(composeFile); err != nil {
+		return fmt.Sprintf("compose file %q is not accessible inside this container — mount the project directory at the same host path", composeFile)
+	}
+	projectDir := filepath.Dir(composeFile)
+
+	// services/ subtree is the layout-specific check: if docker-compose.yml
+	// references ./services/<app>/<app>.env via env_file: and that directory
+	// isn't reachable, every such service will fail to recreate with an
+	// opaque compose error. Only warn (don't hard-fail) since not every stack
+	// uses per-service env files — but the message is actionable either way.
+	servicesDir := filepath.Join(projectDir, "services")
+	if _, err := os.Stat(servicesDir); err != nil {
+		return fmt.Sprintf(
+			"only %s is mounted, not the whole project directory — if any service uses "+
+				"env_file: ./services/<app>/<app>.env, those variables will silently resolve "+
+				"empty and compose will fail. Mount the whole %s directory at the same host path, not just docker-compose.yml.",
+			composeFile, projectDir)
+	}
+	return ""
 }
 
 // ── Update availability checking ──────────────────────────────────────────────
