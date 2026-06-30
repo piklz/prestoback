@@ -46,6 +46,11 @@ type Server struct {
 	// Resets on container restart (intentional — a stuck maintenance window after
 	// a crash would be worse than a missed one).
 	maintUntil time.Time
+
+	// Pending update tracking — populated by updateCheckLoop, read by the UI
+	// (/api/status) and the Telegram notifier. Guarded by stateMu.
+	pendingUpdates  []string        // app names with an image update available
+	updateAlertSent map[string]bool // debounce: app name -> already alerted
 }
 
 func NewServer(cfg *config.Config, image, selfName string) *Server {
@@ -53,20 +58,22 @@ func NewServer(cfg *config.Config, image, selfName string) *Server {
 	sched := scheduler.New()
 
 	s := &Server{
-		cfg:        cfg,
-		engine:     backup.NewEngine(cfg.BackupDir()),
-		hist:       hist,
-		sched:      sched,
-		mux:        http.NewServeMux(),
-		image:      image,
-		selfName:   selfName,
-		sseClients: make(map[chan backup.JobUpdate]struct{}),
+		cfg:             cfg,
+		engine:          backup.NewEngine(cfg.BackupDir()),
+		hist:            hist,
+		sched:           sched,
+		mux:             http.NewServeMux(),
+		image:           image,
+		selfName:        selfName,
+		sseClients:      make(map[chan backup.JobUpdate]struct{}),
+		updateAlertSent: make(map[string]bool),
 	}
 	s.routes()
 	s.loadSchedules()
 	go s.broadcastUpdates()
 	go s.runTelegramBot()
 	go s.diskMonitorLoop()
+	go s.updateCheckLoop()
 	return s
 }
 
@@ -221,6 +228,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	nextRuns := s.sched.NextRuns()
 	s.stateMu.Lock()
 	maintUntil := s.maintUntil
+	pendingUpdates := append([]string{}, s.pendingUpdates...) // copy under lock
 	s.stateMu.Unlock()
 	var maintUntilStr string
 	if !maintUntil.IsZero() && time.Now().Before(maintUntil) {
@@ -240,6 +248,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"disk_low_pct":      diskLowPct,        // non-zero = warning; value = % free
 		"maintenance_until": maintUntilStr,     // RFC3339 or "" if not in maintenance
 		"compose_file":      s.cfg.ComposeFile, // "" if /update auto-restart not configured
+		"pending_updates":   pendingUpdates,    // app names with an image update available
 		"next_runs":         nextRuns,
 	})
 }
@@ -619,7 +628,108 @@ func parseMaintDuration(arg string) (time.Duration, bool) {
 	return 0, false
 }
 
-// ── Disk monitoring ───────────────────────────────────────────────────────────
+// ── Update availability checking ──────────────────────────────────────────────
+//
+// Checks every running app's container(s) against their registries every 6
+// hours, WITHOUT pulling images (uses "docker manifest inspect" — metadata
+// only). Notifies via Telegram with a one-tap Update button the first time an
+// app is found to have a pending update; debounced per-app so it won't repeat
+// until either the update is applied or the container restarts.
+
+const updateCheckInterval = 6 * time.Hour
+
+func (s *Server) updateCheckLoop() {
+	time.Sleep(2 * time.Minute) // let startup settle, avoid racing the disk/SSE goroutines
+	for {
+		s.checkForUpdates()
+		time.Sleep(updateCheckInterval)
+	}
+}
+
+func (s *Server) checkForUpdates() {
+	apps := s.cfg.ListApps()
+	var pending []string
+
+	for _, app := range apps {
+		containers := backup.DedupeContainers(backup.FindContainers(app.ID))
+		appHasUpdate := false
+		for _, c := range containers {
+			if c.Status != "running" {
+				continue // can't usefully compare a stopped container's image
+			}
+			status := backup.CheckImageUpdate(c)
+			if status.Err != "" {
+				log.Printf("[updatecheck] %s/%s: %s", app.Name, c.Name, status.Err)
+				continue
+			}
+			if status.UpdateAvailable {
+				appHasUpdate = true
+			}
+		}
+		if appHasUpdate {
+			pending = append(pending, app.Name)
+		}
+	}
+
+	sort.Strings(pending)
+
+	s.stateMu.Lock()
+	s.pendingUpdates = pending
+	pendingSet := map[string]bool{}
+	for _, n := range pending {
+		pendingSet[n] = true
+	}
+	// Clear debounce for apps that no longer have a pending update (e.g. user
+	// already ran /update) so a future re-appearance alerts again.
+	for name := range s.updateAlertSent {
+		if !pendingSet[name] {
+			delete(s.updateAlertSent, name)
+		}
+	}
+	var toAlert []string
+	for _, name := range pending {
+		if !s.updateAlertSent[name] {
+			s.updateAlertSent[name] = true
+			toAlert = append(toAlert, name)
+		}
+	}
+	s.stateMu.Unlock()
+
+	if len(toAlert) == 0 {
+		return
+	}
+
+	nc := s.cfg.GetNotify()
+	if !nc.TelegramEnabled || nc.TelegramToken == "" || nc.TelegramChatID == "" {
+		log.Printf("[updatecheck] %d app(s) have updates available but Telegram is not configured: %v", len(toAlert), toAlert)
+		return
+	}
+	tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
+
+	var sb strings.Builder
+	if len(toAlert) == 1 {
+		sb.WriteString(fmt.Sprintf("⬆️ *Update available* — `%s`\n\nTap below to pull \\+ recreate\\.", notify.EscapeMD(toAlert[0])))
+	} else {
+		sb.WriteString(fmt.Sprintf("⬆️ *%d updates available*\n\n", len(toAlert)))
+		for _, name := range toAlert {
+			sb.WriteString(fmt.Sprintf("• `%s`\n", notify.EscapeMD(name)))
+		}
+	}
+
+	var btns []notify.ButtonAction
+	if len(toAlert) == 1 {
+		if app := s.findAppByNameFragment(toAlert[0]); app != nil {
+			btns = append(btns, notify.ButtonAction{Label: "🔄 Update now", Data: "update:" + app.ID})
+		}
+	} else {
+		btns = append(btns, notify.ButtonAction{Label: fmt.Sprintf("🔄 Update all %d", len(toAlert)), Data: "update:all"})
+	}
+	btns = append(btns, notify.ButtonAction{Label: "👀 Remind me later", Data: "updatecheck:dismiss"})
+
+	if err := notify.SendRawWithButtons(tgCfg, sb.String(), btns); err != nil {
+		log.Printf("[updatecheck] notify failed: %v", err)
+	}
+}
 
 // diskMonitorLoop checks backup disk space every 30 minutes and fires a
 // Telegram alert (with action buttons) when free space drops below the threshold.
@@ -1941,8 +2051,14 @@ func prestoBackBotCommands() []notify.BotCommand {
 		{Command: "logs", Description: "Detailed recent backups for one app — /logs <name>"},
 		{Command: "disk", Description: "Backup directory disk usage (free / used / total)"},
 		{Command: "next", Description: "Upcoming scheduled backup times across all apps"},
-		{Command: "pause", Description: "Disable an app schedule — /pause <name>"},
-		{Command: "resume", Description: "Re-enable an app schedule — /resume <name>"},
+		{Command: "start", Description: "Start a stopped container — /start <name>"},
+		{Command: "stop", Description: "Stop a running container — /stop <name>"},
+		{Command: "restart", Description: "Restart a container — /restart <name>"},
+		{Command: "pause", Description: "Freeze a container (SIGSTOP) — /pause <name>"},
+		{Command: "unpause", Description: "Resume a frozen container — /unpause <name>"},
+		{Command: "stack", Description: "Whole-stack control — /stack up|down|restart|pull|ps"},
+		{Command: "schedpause", Description: "Disable an app's backup schedule — /schedpause <name>"},
+		{Command: "schedresume", Description: "Re-enable a backup schedule — /schedresume <name>"},
 		{Command: "maintenance", Description: "Freeze all schedules — /maintenance 2h / 1d / 1w / on / off"},
 		{Command: "update", Description: "Pull + recreate a container — /update <name> or /update all"},
 		{Command: "settings", Description: "Show current notification and app configuration"},
@@ -2379,9 +2495,9 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			log.Printf("[bot] send logs: %v", err)
 		}
 
-	case "/pause":
+	case "/schedpause":
 		if arg == "" {
-			_ = notify.SendRaw(tgCfg, "Usage: `/pause \\<app name\\>`")
+			_ = notify.SendRaw(tgCfg, "Usage: `/schedpause \\<app name\\>`")
 			return
 		}
 		app := s.findAppByNameFragment(arg)
@@ -2400,12 +2516,12 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 		}
 		_ = s.cfg.Save()
 		s.syncSchedule(*app) // removes the job from the scheduler
-		_ = notify.SendRaw(tgCfg, fmt.Sprintf("⏸ *%s* — schedule paused\nUse /resume %s to re\\-enable\\.",
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf("⏸ *%s* — schedule paused\nUse /schedresume %s to re\\-enable\\.",
 			notify.EscapeMD(app.Name), notify.EscapeMD(app.Name)))
 
-	case "/resume":
+	case "/schedresume":
 		if arg == "" {
-			_ = notify.SendRaw(tgCfg, "Usage: `/resume \\<app name\\>`")
+			_ = notify.SendRaw(tgCfg, "Usage: `/schedresume \\<app name\\>`")
 			return
 		}
 		app := s.findAppByNameFragment(arg)
@@ -2432,6 +2548,24 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 		_ = notify.SendRaw(tgCfg, fmt.Sprintf("▶ *%s* — schedule resumed\n🗓 %s",
 			notify.EscapeMD(app.Name),
 			notify.EscapeMD(scheduler.DescribeCron(app.Schedule.CronExpr))))
+
+	case "/start":
+		s.handleContainerLifecycle(tgCfg, arg, "start")
+
+	case "/stop":
+		s.handleContainerLifecycle(tgCfg, arg, "stop")
+
+	case "/restart":
+		s.handleContainerLifecycle(tgCfg, arg, "restart")
+
+	case "/pause":
+		s.handleContainerLifecycle(tgCfg, arg, "pause")
+
+	case "/unpause":
+		s.handleContainerLifecycle(tgCfg, arg, "unpause")
+
+	case "/stack":
+		s.handleStackCommand(tgCfg, strings.ToLower(strings.TrimSpace(arg)))
 
 	case "/maintenance":
 		lower := strings.ToLower(strings.TrimSpace(arg))
@@ -2574,6 +2708,7 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 		// Reserved chars: _ * [ ] ( ) ~ ` > # + - = | { } . !
 		// The | in <name|all> and () throughout are the most common sources of 400 errors.
 		help := "*PrestoBack Bot Commands*\n\n" +
+			"*Backups*\n" +
 			"📊 /status — all apps with paths, cron, retain counts\n" +
 			"📱 /apps — compact overview with readable schedules\n" +
 			"▶ /backup \\<name\\> — trigger a backup \\(or pick from list\\)\n" +
@@ -2581,10 +2716,23 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			"🔍 /logs \\<name\\> — detailed recent backups for one app\n" +
 			"💾 /disk — backup directory disk usage\n" +
 			"⏰ /next — upcoming scheduled backup times\n" +
-			"⏸ /pause \\<name\\> — disable an app's automatic schedule\n" +
-			"▶ /resume \\<name\\> — re\\-enable an app's schedule\n" +
-			"🔧 /maintenance \\<2h/1d/1w/on/off\\> — freeze all schedules temporarily\n" +
-			"🔄 /update \\<name\\|all\\> — pull \\+ recreate container\\(s\\)\n" +
+			"⏸ /schedpause \\<name\\> — disable an app's backup schedule\n" +
+			"▶ /schedresume \\<name\\> — re\\-enable an app's backup schedule\n" +
+			"🔧 /maintenance \\<2h/1d/1w/on/off\\> — freeze all schedules temporarily\n\n" +
+			"*Containers*\n" +
+			"🟢 /start \\<name\\> — start a stopped container\n" +
+			"🔴 /stop \\<name\\> — stop a running container\n" +
+			"🔁 /restart \\<name\\> — restart a container\n" +
+			"⏸ /pause \\<name\\> — freeze a container \\(SIGSTOP\\)\n" +
+			"▶ /unpause \\<name\\> — resume a frozen container\n" +
+			"🔄 /update \\<name\\|all\\> — pull \\+ recreate container\\(s\\)\n\n" +
+			"*Stack*\n" +
+			"📚 /stack up — start all stack services\n" +
+			"📚 /stack down — stop \\+ remove all \\(volumes kept\\)\n" +
+			"📚 /stack restart — restart all running services\n" +
+			"📚 /stack pull — update the whole stack at once\n" +
+			"📚 /stack ps — show status of every service\n\n" +
+			"*System*\n" +
 			"⚙️ /settings — notification and app configuration\n" +
 			"🔃 /selfupdate — check for a new PrestoBack image and apply\n" +
 			"❓ /help — this message"
@@ -2682,7 +2830,228 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 			_ = notify.SendRaw(tgCfg, fmt.Sprintf("🔄 Pulling `%s`\\.\\.\\.", notify.EscapeMD(app.Name)))
 			go s.runContainerUpdates(tgCfg, []config.AppConfig{app})
 		}
+
+	case "start", "stop", "restart", "pause", "unpause":
+		app, ok := s.cfg.GetApp(parts[1])
+		if !ok {
+			return
+		}
+		s.runContainerLifecycle(tgCfg, app, parts[0])
+
+	case "stackdown":
+		if len(parts) < 2 {
+			return
+		}
+		switch parts[1] {
+		case "confirm":
+			_ = notify.SendRaw(tgCfg, "📚 Taking the stack down\\.\\.\\.")
+			go s.runStackOp(tgCfg, s.cfg.ComposeFile, "down")
+		case "cancel":
+			_ = notify.SendRaw(tgCfg, "Cancelled \\— stack left running\\.")
+		}
+
+	case "updatecheck":
+		if len(parts) >= 2 && parts[1] == "dismiss" {
+			_ = notify.SendRaw(tgCfg, "OK — I'll remind you again if it's still pending at the next check\\.")
+		}
 	}
+}
+
+// handleContainerLifecycle implements /start, /stop, /restart, /pause, /unpause.
+// No-arg shows an app picker for that action; with an arg, finds the app's
+// containers and runs the operation, streaming progress to SSE + Telegram.
+func (s *Server) handleContainerLifecycle(tgCfg notify.TelegramConfig, arg, action string) {
+	if strings.TrimSpace(arg) == "" {
+		s.sendTelegramAppList(tgCfg, action)
+		return
+	}
+	app := s.findAppByNameFragment(arg)
+	if app == nil {
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+			"❌ App not found: `%s`\nUse /%s with no args to pick from list\\.",
+			notify.EscapeMD(arg), action,
+		))
+		return
+	}
+	s.runContainerLifecycle(tgCfg, *app, action)
+}
+
+// runContainerLifecycle does the actual work for a resolved app — shared by
+// both the slash-command path and the inline-button callback path.
+func (s *Server) runContainerLifecycle(tgCfg notify.TelegramConfig, app config.AppConfig, action string) {
+	verbs := map[string]string{
+		"start": "Starting", "stop": "Stopping", "restart": "Restarting",
+		"pause": "Pausing", "unpause": "Unpausing",
+	}
+	verb := verbs[action]
+	if verb == "" {
+		verb = "Processing"
+	}
+	_ = notify.SendRaw(tgCfg, fmt.Sprintf("%s `%s`\\.\\.\\.", verb, notify.EscapeMD(app.Name)))
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[lifecycle] PANIC in runContainerLifecycle: %v", r)
+				_ = notify.SendRaw(tgCfg, "❌ Internal error — check container logs\\.")
+			}
+		}()
+
+		emit := func(msg string) {
+			log.Printf("[lifecycle:%s] %s", app.Name, msg)
+			s.engine.EmitLog(app.ID, msg)
+		}
+
+		containers := backup.DedupeContainers(backup.FindContainers(app.ID))
+		if len(containers) == 0 {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("⚠️ No containers found for `%s`", notify.EscapeMD(app.Name)))
+			return
+		}
+
+		emit(fmt.Sprintf("━━━ %s: %s ━━━", verb, app.Name))
+		start := time.Now()
+		var failed []string
+		for _, c := range containers {
+			var err error
+			switch action {
+			case "start":
+				if c.Status == "running" {
+					emit(fmt.Sprintf("%s already running — skipping", c.Name))
+					continue
+				}
+				err = backup.StartOneContainer(c, emit)
+			case "stop":
+				if c.Status != "running" {
+					emit(fmt.Sprintf("%s already %s — skipping", c.Name, c.Status))
+					continue
+				}
+				err = backup.StopOneContainer(c, emit)
+			case "restart":
+				err = backup.RestartOneContainer(c, emit)
+			case "pause":
+				if c.Status != "running" {
+					emit(fmt.Sprintf("%s is %s, not running — cannot pause", c.Name, c.Status))
+					continue
+				}
+				err = backup.PauseOneContainer(c, emit)
+			case "unpause":
+				err = backup.UnpauseOneContainer(c, emit)
+			}
+			if err != nil {
+				failed = append(failed, fmt.Sprintf("%s: %v", c.Name, err))
+				emit(fmt.Sprintf("✗ %s failed: %v", c.Name, err))
+			}
+		}
+		dur := time.Since(start)
+
+		if len(failed) == 0 {
+			emit(fmt.Sprintf("━━━ %s complete: %s (%s) ━━━", verb, app.Name, formatDuration(dur)))
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("✅ *%s* — %s complete _%s_",
+				notify.EscapeMD(app.Name), strings.ToLower(verb), notify.EscapeMD(formatDuration(dur))))
+		} else {
+			emit(fmt.Sprintf("━━━ %s failed: %s (%s) ━━━", verb, app.Name, formatDuration(dur)))
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("❌ *%s* — %s failed\n", notify.EscapeMD(app.Name), strings.ToLower(verb)))
+			for _, f := range failed {
+				sb.WriteString(fmt.Sprintf("  `%s`\n", notify.EscapeMD(f)))
+			}
+			_ = notify.SendRaw(tgCfg, sb.String())
+		}
+	}()
+}
+
+// handleStackCommand implements /stack up|down|restart|pull|ps.
+func (s *Server) handleStackCommand(tgCfg notify.TelegramConfig, sub string) {
+	composeFile := s.cfg.ComposeFile
+	if composeFile == "" {
+		_ = notify.SendRaw(tgCfg,
+			"❌ No compose file configured\\.\nSet `PRESTOBACK\\_COMPOSE\\_FILE` to use stack commands — see /update help for setup\\.")
+		return
+	}
+
+	switch sub {
+	case "", "help":
+		_ = notify.SendRaw(tgCfg,
+			"*\\/stack — whole\\-stack control*\n\n"+
+				"📚 `/stack up` — start all stack services\n"+
+				"📚 `/stack down` — stop \\+ remove all \\(volumes kept\\)\n"+
+				"📚 `/stack restart` — restart all running services\n"+
+				"📚 `/stack pull` — pull \\+ recreate the entire stack\n"+
+				"📚 `/stack ps` — show status of every service")
+		return
+
+	case "ps":
+		out, err := backup.StackPs(composeFile)
+		if err != nil {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ `%s`", notify.EscapeMD(err.Error())))
+			return
+		}
+		trimmed := strings.TrimSpace(out)
+		if len(trimmed) > 3500 {
+			trimmed = trimmed[:3500] + "\n…"
+		}
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf("*Stack Status*\n```\n%s\n```", notify.EscapeMD(trimmed)))
+		return
+
+	case "up", "down", "restart", "pull":
+		// destructive-ish ops get a confirm step via callback for "down"
+		if sub == "down" {
+			_ = notify.SendRawWithButtons(tgCfg,
+				"⚠️ *Stack Down*\nThis stops and removes ALL containers in the stack \\(named volumes are preserved\\)\\. Continue?",
+				[]notify.ButtonAction{
+					{Label: "✅ Yes, take the stack down", Data: "stackdown:confirm"},
+					{Label: "❌ Cancel", Data: "stackdown:cancel"},
+				})
+			return
+		}
+
+		verbMap := map[string]string{"up": "Starting", "restart": "Restarting", "pull": "Updating"}
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf("📚 %s the stack\\.\\.\\.", verbMap[sub]))
+		go s.runStackOp(tgCfg, composeFile, sub)
+		return
+
+	default:
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+			"❌ Unknown subcommand: `%s`\nUse `/stack` with no args for usage\\.", notify.EscapeMD(sub)))
+	}
+}
+
+// runStackOp executes one stack-level compose operation, streaming progress
+// to SSE under the synthetic "_stack" app ID and reporting the result to Telegram.
+func (s *Server) runStackOp(tgCfg notify.TelegramConfig, composeFile, op string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[stack] PANIC in runStackOp(%s): %v", op, r)
+			_ = notify.SendRaw(tgCfg, "❌ Internal error during stack operation — check container logs\\.")
+		}
+	}()
+
+	emit := func(msg string) {
+		log.Printf("[stack:%s] %s", op, msg)
+		s.engine.EmitLog("_stack", msg)
+	}
+
+	start := time.Now()
+	var err error
+	switch op {
+	case "up":
+		err = backup.StackUp(composeFile, emit)
+	case "down":
+		err = backup.StackDown(composeFile, emit)
+	case "restart":
+		err = backup.StackRestart(composeFile, emit)
+	case "pull":
+		err = backup.StackPull(composeFile, emit)
+	}
+	dur := time.Since(start)
+
+	if err != nil {
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ *Stack %s failed* _%s_\n`%s`",
+			notify.EscapeMD(op), notify.EscapeMD(formatDuration(dur)), notify.EscapeMD(err.Error())))
+		return
+	}
+	_ = notify.SendRaw(tgCfg, fmt.Sprintf("✅ *Stack %s complete* _%s_",
+		notify.EscapeMD(op), notify.EscapeMD(formatDuration(dur))))
 }
 
 // sendTelegramAppList sends a button menu with one app per row, sorted

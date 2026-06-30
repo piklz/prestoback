@@ -986,3 +986,289 @@ func UpdateContainer(c ContainerInfo, composeFile string, emit func(string)) Con
 	res.Restarted = true
 	return res
 }
+
+// ── Single-container lifecycle (Docksentry-style) ─────────────────────────────
+//
+// These are simple, direct wrappers — no recreate, no rollback — used by
+// /start, /stop, /restart, /pause, /unpause. UpdateContainer (above) is the
+// only operation that recreates a container; these just change run state.
+
+// StopOneContainer stops a single running container with a 30s graceful timeout.
+func StopOneContainer(c ContainerInfo, emit func(string)) error {
+	emit(fmt.Sprintf("Stopping %s…", c.Name))
+	out, err := exec.Command("docker", "stop", "-t", "30", c.ID).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", stripDockerOutput(string(out)))
+	}
+	emit(fmt.Sprintf("Container %s stopped ✓", c.Name))
+	return nil
+}
+
+// StartOneContainer starts a single stopped container and waits for it to
+// reach "running" (15s timeout), reusing the same health-check used by updates.
+func StartOneContainer(c ContainerInfo, emit func(string)) error {
+	emit(fmt.Sprintf("Starting %s…", c.Name))
+	out, err := exec.Command("docker", "start", c.ID).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", stripDockerOutput(string(out)))
+	}
+	if err := waitRunning(c.ID, c.Name, 15*time.Second, emit); err != nil {
+		return err
+	}
+	emit(fmt.Sprintf("Container %s is running ✓", c.Name))
+	return nil
+}
+
+// RestartOneContainer stops then starts a single container.
+func RestartOneContainer(c ContainerInfo, emit func(string)) error {
+	if c.Status == "running" {
+		if err := StopOneContainer(c, emit); err != nil {
+			return fmt.Errorf("stop: %w", err)
+		}
+	}
+	if err := StartOneContainer(c, emit); err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+	return nil
+}
+
+// PauseOneContainer freezes a container via SIGSTOP (docker pause). The
+// filesystem/process state is frozen exactly where it stood — crash-consistent
+// but not clean-shutdown-consistent. See PauseContainers doc comment for the
+// same caveat (fine for SQLite/Postgres/MySQL, risky for raw unjournaled state).
+func PauseOneContainer(c ContainerInfo, emit func(string)) error {
+	emit(fmt.Sprintf("Pausing %s…", c.Name))
+	out, err := exec.Command("docker", "pause", c.ID).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", stripDockerOutput(string(out)))
+	}
+	emit(fmt.Sprintf("Container %s paused ✓", c.Name))
+	return nil
+}
+
+// UnpauseOneContainer resumes a container frozen by PauseOneContainer.
+func UnpauseOneContainer(c ContainerInfo, emit func(string)) error {
+	emit(fmt.Sprintf("Unpausing %s…", c.Name))
+	out, err := exec.Command("docker", "unpause", c.ID).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", stripDockerOutput(string(out)))
+	}
+	emit(fmt.Sprintf("Container %s resumed ✓", c.Name))
+	return nil
+}
+
+// ── Whole-stack operations ──────────────────────────────────────────────────
+//
+// Operates on the entire docker-compose.yml at once via PRESTOBACK_COMPOSE_FILE.
+// Unlike UpdateContainer's per-container standalone recreate, these genuinely
+// require the compose file — there's no HostConfig equivalent for "the whole
+// stack" since compose itself owns project-level concerns (network creation,
+// service dependency order, etc.).
+
+// StackPs returns "docker compose ps" output for the configured stack.
+func StackPs(composeFile string) (string, error) {
+	if composeFile == "" {
+		return "", fmt.Errorf("no compose file configured (PRESTOBACK_COMPOSE_FILE)")
+	}
+	if _, err := os.Stat(composeFile); err != nil {
+		return "", fmt.Errorf("compose file not accessible: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := composeCmd(ctx, stackFileArgs(composeFile), "ps", "-a").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%s", stripDockerOutput(string(out)))
+	}
+	return string(out), nil
+}
+
+// StackUp runs "docker compose up -d" for the whole stack — creates/starts
+// any service that isn't running, leaves running services untouched.
+func StackUp(composeFile string, emit func(string)) error {
+	if composeFile == "" {
+		return fmt.Errorf("no compose file configured (PRESTOBACK_COMPOSE_FILE)")
+	}
+	if _, err := os.Stat(composeFile); err != nil {
+		return fmt.Errorf("compose file not accessible inside this container: %w", err)
+	}
+	emit("Running: docker compose up -d…")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	out, err := composeCmd(ctx, stackFileArgs(composeFile), "up", "-d").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", stripDockerOutput(string(out)))
+	}
+	emit("Stack up ✓")
+	return nil
+}
+
+// StackDown runs "docker compose down" — stops and removes all stack
+// containers (and the project's default network). Named volumes are NOT
+// removed (compose down does not remove volumes unless -v is passed, and we
+// deliberately never pass -v here — that would be data loss).
+func StackDown(composeFile string, emit func(string)) error {
+	if composeFile == "" {
+		return fmt.Errorf("no compose file configured (PRESTOBACK_COMPOSE_FILE)")
+	}
+	if _, err := os.Stat(composeFile); err != nil {
+		return fmt.Errorf("compose file not accessible inside this container: %w", err)
+	}
+	emit("Running: docker compose down…")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	out, err := composeCmd(ctx, stackFileArgs(composeFile), "down").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", stripDockerOutput(string(out)))
+	}
+	emit("Stack down ✓ — all containers stopped and removed (volumes preserved)")
+	return nil
+}
+
+// StackRestart runs "docker compose restart" — restarts every running
+// service in place without recreating containers.
+func StackRestart(composeFile string, emit func(string)) error {
+	if composeFile == "" {
+		return fmt.Errorf("no compose file configured (PRESTOBACK_COMPOSE_FILE)")
+	}
+	if _, err := os.Stat(composeFile); err != nil {
+		return fmt.Errorf("compose file not accessible inside this container: %w", err)
+	}
+	emit("Running: docker compose restart…")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	out, err := composeCmd(ctx, stackFileArgs(composeFile), "restart").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", stripDockerOutput(string(out)))
+	}
+	emit("Stack restart ✓")
+	return nil
+}
+
+// StackPull runs "docker compose pull" for every service in the stack, then
+// "docker compose up -d" to recreate any containers whose image changed.
+// This is the compose-native equivalent of /update all, and is tried as a
+// single atomic operation rather than looping UpdateContainer per-service —
+// faster for stacks with many services since compose pulls in parallel.
+func StackPull(composeFile string, emit func(string)) error {
+	if composeFile == "" {
+		return fmt.Errorf("no compose file configured (PRESTOBACK_COMPOSE_FILE)")
+	}
+	if _, err := os.Stat(composeFile); err != nil {
+		return fmt.Errorf("compose file not accessible inside this container: %w", err)
+	}
+	fileArgs := stackFileArgs(composeFile)
+
+	emit("Pulling latest images for all services…")
+	pullCtx, pullCancel := context.WithTimeout(context.Background(), pullTimeout)
+	defer pullCancel()
+	pullOut, pullErr := composeCmd(pullCtx, fileArgs, "pull").CombinedOutput()
+	if pullErr != nil {
+		return fmt.Errorf("pull failed: %s", stripDockerOutput(string(pullOut)))
+	}
+	emit("Pull complete — recreating changed containers…")
+
+	upCtx, upCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer upCancel()
+	upOut, upErr := composeCmd(upCtx, fileArgs, "up", "-d").CombinedOutput()
+	if upErr != nil {
+		return fmt.Errorf("up failed: %s", stripDockerOutput(string(upOut)))
+	}
+	emit("Stack updated ✓")
+	return nil
+}
+
+// stackFileArgs builds the -f / --env-file args shared by all stack operations.
+func stackFileArgs(composeFile string) []string {
+	args := []string{"-f", composeFile}
+	envFile := filepath.Join(filepath.Dir(composeFile), ".env")
+	if _, err := os.Stat(envFile); err == nil {
+		args = append(args, "--env-file", envFile)
+	}
+	return args
+}
+
+// ── Update availability checking ──────────────────────────────────────────────
+//
+// Compares each running container's local image digest against the digest
+// currently published in its registry, WITHOUT pulling the image. Used by
+// the background checker to notify "update available" before the user runs
+// /update — avoids surprising multi-hundred-MB downloads from a routine check.
+
+// ImageUpdateStatus describes whether a running container's image has a
+// newer version available in its registry.
+type ImageUpdateStatus struct {
+	ContainerName   string
+	Image           string
+	UpdateAvailable bool
+	Err             string // non-empty if the check itself failed (e.g. registry unreachable)
+}
+
+// CheckImageUpdate compares the locally cached image's digest (from "docker
+// image inspect") against the remote registry's digest (from "docker manifest
+// inspect", which does NOT pull the image — only fetches manifest metadata).
+//
+// "docker manifest inspect" requires no special permissions for public images
+// but DOES require credentials for private registries (use "docker login" on
+// the host — credentials are read from the daemon, not from inside this
+// container, since manifest inspect goes through the daemon's auth config).
+func CheckImageUpdate(c ContainerInfo) ImageUpdateStatus {
+	res := ImageUpdateStatus{ContainerName: c.Name}
+
+	out, err := exec.Command("docker", "inspect", "--format={{.Config.Image}}", c.ID).Output()
+	if err != nil {
+		res.Err = "inspect failed: " + err.Error()
+		return res
+	}
+	res.Image = strings.TrimSpace(string(out))
+	if res.Image == "" {
+		res.Err = "could not determine image name"
+		return res
+	}
+
+	// Local digest: the RepoDigest of the currently-running image.
+	localOut, localErr := exec.Command("docker", "image", "inspect",
+		"--format={{range .RepoDigests}}{{.}}\n{{end}}", res.Image).Output()
+	if localErr != nil {
+		res.Err = "local image inspect failed: " + localErr.Error()
+		return res
+	}
+	localDigests := strings.Fields(string(localOut))
+	if len(localDigests) == 0 {
+		// No RepoDigest — image was likely built locally rather than pulled.
+		// Can't compare against a registry; treat as "no update info available".
+		return res
+	}
+
+	// Remote digest: query the registry manifest without pulling.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	remoteOut, remoteErr := exec.CommandContext(ctx, "docker", "manifest", "inspect",
+		"--verbose", res.Image).CombinedOutput()
+	if remoteErr != nil {
+		// Common and not fatal — many images/registries don't support manifest
+		// inspect without auth, or docker manifest is experimental/unavailable.
+		res.Err = "manifest inspect unavailable: " + stripDockerOutput(string(remoteOut))
+		return res
+	}
+
+	// docker manifest inspect --verbose includes "Descriptor":{"digest":"sha256:..."}
+	// for the resolved platform manifest. We just check whether any locally
+	// cached digest's hash substring appears in the remote output — if not,
+	// a different digest is published than what we have locally.
+	remoteStr := string(remoteOut)
+	matched := false
+	for _, ld := range localDigests {
+		// ld looks like "image@sha256:abcdef..." — extract just the hash.
+		atIdx := strings.LastIndex(ld, "@")
+		if atIdx == -1 {
+			continue
+		}
+		hash := ld[atIdx+1:]
+		if strings.Contains(remoteStr, hash) {
+			matched = true
+			break
+		}
+	}
+	res.UpdateAvailable = !matched
+	return res
+}
