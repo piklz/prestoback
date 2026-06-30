@@ -736,6 +736,53 @@ func buildCreateArgs(name string, insp fullInspect, newImage string) []string {
 // renames the backup back and restarts the original — full rollback.
 //
 // This requires no compose file — only the Docker socket.
+// disconnectAllNetworks explicitly disconnects a container from every
+// network it's attached to, ignoring errors for networks it's already off.
+// This is defense-in-depth against Docker's known stale-endpoint behavior:
+// "docker rm" is supposed to clean up network endpoints automatically, but
+// if rm fails or races another operation, the endpoint can be left behind —
+// visible later as a ghost "<shortID>_<name>" entry in
+// "docker network inspect <network>" even though the container itself is
+// long gone from "docker ps -a". Calling this before removal guarantees
+// clean endpoint teardown regardless of what state rm leaves things in.
+func disconnectAllNetworks(containerID string) {
+	out, err := exec.Command("docker", "inspect",
+		"--format={{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}", containerID).Output()
+	if err != nil {
+		return // container may already be gone — nothing to disconnect
+	}
+	for _, netName := range strings.Fields(string(out)) {
+		_ = exec.Command("docker", "network", "disconnect", "-f", netName, containerID).Run()
+	}
+}
+
+// safeRemove stops (if running) then removes a container WITHOUT using
+// "docker rm -f" on a potentially-running container — force-removing a
+// running container is a documented source of stale network endpoints in
+// Docker's bridge driver. Disconnects all networks explicitly first as
+// defense-in-depth. Retries the final rm once after a short delay since
+// network teardown can occasionally lag the stop by a few hundred ms.
+func safeRemove(containerID string) error {
+	state, err := exec.Command("docker", "inspect", "--format={{.State.Status}}", containerID).Output()
+	if err != nil {
+		return nil // container doesn't exist — nothing to do
+	}
+	if strings.TrimSpace(string(state)) == "running" {
+		_ = exec.Command("docker", "stop", "-t", "10", containerID).Run()
+	}
+	disconnectAllNetworks(containerID)
+
+	if out, rmErr := exec.Command("docker", "rm", containerID).CombinedOutput(); rmErr != nil {
+		log.Printf("[recreate] rm %s failed (%s), retrying once after backoff", containerID, stripDockerOutput(string(out)))
+		time.Sleep(1 * time.Second)
+		disconnectAllNetworks(containerID) // in case the first attempt raced teardown
+		if out2, rmErr2 := exec.Command("docker", "rm", containerID).CombinedOutput(); rmErr2 != nil {
+			return fmt.Errorf("%s", stripDockerOutput(string(out2)))
+		}
+	}
+	return nil
+}
+
 func standaloneRecreate(c ContainerInfo, newImage string, emit func(string)) (rolled bool, err error) {
 	// Full inspect of the running container
 	raw, inspErr := exec.Command("docker", "inspect", c.ID).Output()
@@ -750,8 +797,15 @@ func standaloneRecreate(c ContainerInfo, newImage string, emit func(string)) (ro
 	name := strings.TrimPrefix(insp.Name, "/")
 	bakName := name + "_prestoback_bak"
 
-	// Remove any leftover backup container from a previous failed update
-	_ = exec.Command("docker", "rm", "-f", bakName).Run()
+	// Remove any leftover backup container from a previous failed update.
+	// Resolved by name first (not blindly force-removed) so we never force-kill
+	// a container that turns out to still be running — see safeRemove's doc
+	// comment for why "rm -f" on a running container is unsafe here.
+	if bakID, lookupErr := exec.Command("docker", "inspect", "--format={{.Id}}", bakName).Output(); lookupErr == nil {
+		if rmErr := safeRemove(strings.TrimSpace(string(bakID))); rmErr != nil {
+			log.Printf("[recreate] warning: could not clean up leftover %s: %v", bakName, rmErr)
+		}
+	}
 
 	// Stop the current container gracefully
 	emit(fmt.Sprintf("Stopping %s…", name))
@@ -814,22 +868,28 @@ func standaloneRecreate(c ContainerInfo, newImage string, emit func(string)) (ro
 	// Start the new container
 	emit(fmt.Sprintf("Starting %s…", name))
 	if out, startErr := exec.Command("docker", "start", newID).CombinedOutput(); startErr != nil {
-		_ = exec.Command("docker", "rm", newID).Run()
+		if rmErr := safeRemove(newID); rmErr != nil {
+			log.Printf("[recreate] warning: could not clean up failed-start container %s: %v", newID, rmErr)
+		}
 		return rollback(fmt.Errorf("start failed: %s", stripDockerOutput(string(out))))
 	}
 
 	// Wait up to 30s for the container to reach running state
 	if waitErr := waitRunning(newID, name, 30*time.Second, emit); waitErr != nil {
-		_ = exec.Command("docker", "stop", newID).Run()
-		_ = exec.Command("docker", "rm", newID).Run()
+		if rmErr := safeRemove(newID); rmErr != nil {
+			log.Printf("[recreate] warning: could not clean up unhealthy container %s: %v", newID, rmErr)
+		}
 		return rollback(fmt.Errorf("health check: %v", waitErr))
 	}
 
 	emit(fmt.Sprintf("Container %s is running ✓", name))
 
-	// Success — clean up backup
-	if out, rmErr := exec.Command("docker", "rm", bakName).CombinedOutput(); rmErr != nil {
-		emit(fmt.Sprintf("⚠  Could not remove old container %s: %s", bakName, stripDockerOutput(string(out))))
+	// Success — clean up backup. safeRemove handles the case where this
+	// container ended up running for any reason (it shouldn't, but defense
+	// in depth costs nothing) and guarantees network endpoints are released.
+	if rmErr := safeRemove(bakName); rmErr != nil {
+		emit(fmt.Sprintf("⚠  Could not remove old container %s: %v", bakName, rmErr))
+		log.Printf("[recreate] warning: could not remove backup %s after retries: %v", bakName, rmErr)
 	}
 	return false, nil
 }

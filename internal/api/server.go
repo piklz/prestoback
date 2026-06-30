@@ -51,6 +51,21 @@ type Server struct {
 	// (/api/status) and the Telegram notifier. Guarded by stateMu.
 	pendingUpdates  []string        // app names with an image update available
 	updateAlertSent map[string]bool // debounce: app name -> already alerted
+
+	// updateMu serializes ALL container recreate operations (UpdateContainer /
+	// standaloneRecreate, via /update, /update all, the update-check button,
+	// and /stack pull). Without this, two overlapping update runs can race
+	// the same container through docker stop/rename/create — the loser's
+	// "docker rename" fails, it falls back to restarting the OLD container,
+	// and the winner's later "docker rm <bak>" then fails too (target is
+	// running, no -f used) — leaving the old container orphaned and still
+	// attached to its original network endpoint under its old short ID
+	// (visible as "<shortID>_<name>" in "docker network inspect"). This is
+	// a hard global lock, not per-app: a stack-wide /stack pull and a
+	// single-app /update must never overlap either, since FindContainers can
+	// resolve the same container from two different app entries.
+	updateMu      sync.Mutex
+	updateRunning bool
 }
 
 func NewServer(cfg *config.Config, image, selfName string) *Server {
@@ -835,13 +850,42 @@ func (s *Server) runPruneAll(tgCfg notify.TelegramConfig) {
 	_ = notify.SendRaw(tgCfg, sb.String())
 }
 
-// runContainerUpdates pulls + recreates containers for each app, streaming a
-// timed summary back to Telegram when all work is done.
+// runContainerUpdates is the public entry point for all update operations
+// (/update, /update all, the update-check notification button). It acquires
+// the global updateMu lock so overlapping update runs can never race the
+// same container through recreate — see the updateMu doc comment on the
+// Server struct for exactly what goes wrong if they do. If an update is
+// already in progress, this sends a friendly "already running" message and
+// returns immediately rather than queuing or racing.
 func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.AppConfig) {
+	s.stateMu.Lock()
+	if s.updateRunning {
+		s.stateMu.Unlock()
+		_ = notify.SendRaw(tgCfg, "⏳ An update is already in progress — please wait for it to finish before starting another\\.")
+		return
+	}
+	s.updateRunning = true
+	s.stateMu.Unlock()
+
+	s.updateMu.Lock()
+	defer func() {
+		s.updateMu.Unlock()
+		s.stateMu.Lock()
+		s.updateRunning = false
+		s.stateMu.Unlock()
+	}()
+
+	s.runContainerUpdatesLocked(tgCfg, apps)
+}
+
+// runContainerUpdatesLocked pulls + recreates containers for each app,
+// streaming a timed summary back to Telegram when all work is done.
+// Must only be called while holding s.updateMu — use runContainerUpdates.
+func (s *Server) runContainerUpdatesLocked(tgCfg notify.TelegramConfig, apps []config.AppConfig) {
 	// Belt-and-suspenders: a panic in a goroutine would crash the bot loop.
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[update] PANIC in runContainerUpdates: %v", r)
+			log.Printf("[update] PANIC in runContainerUpdatesLocked: %v", r)
 			_ = notify.SendRaw(tgCfg, "❌ Internal error during update — check container logs\\.")
 		}
 	}()
@@ -1365,6 +1409,21 @@ func (s *Server) handleTriggerBackup(w http.ResponseWriter, r *http.Request, app
 }
 
 func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
+	// Refuse to run alongside an update/stack operation — QuiesceContainers
+	// (stop/pause) racing standaloneRecreate's stop→rename→create→start
+	// sequence on the same container is the same class of bug that produces
+	// orphaned containers with stale network endpoints. A skipped scheduled
+	// backup will simply run at its next scheduled time; a manual backup
+	// can be retried once the update finishes.
+	s.stateMu.Lock()
+	busy := s.updateRunning
+	s.stateMu.Unlock()
+	if busy {
+		s.engine.EmitLog(app.ID, "⏳ Skipped — an update or stack operation is currently in progress")
+		log.Printf("[backup] skipping %s — update/stack operation in progress", app.ID)
+		return
+	}
+
 	start := time.Now()
 	emit := func(msg string) { s.engine.EmitLog(app.ID, msg) }
 
@@ -2925,6 +2984,18 @@ func (s *Server) handleContainerLifecycle(tgCfg notify.TelegramConfig, arg, acti
 // runContainerLifecycle does the actual work for a resolved app — shared by
 // both the slash-command path and the inline-button callback path.
 func (s *Server) runContainerLifecycle(tgCfg notify.TelegramConfig, app config.AppConfig, action string) {
+	// Refuse to run alongside an update/stack operation — a manual stop/start/
+	// restart racing the stop→rename→create→start sequence inside
+	// standaloneRecreate is the same class of bug that produces orphaned
+	// containers with stale network endpoints. See updateMu's doc comment.
+	s.stateMu.Lock()
+	busy := s.updateRunning
+	s.stateMu.Unlock()
+	if busy {
+		_ = notify.SendRaw(tgCfg, "⏳ An update or stack operation is in progress — please wait for it to finish first\\.")
+		return
+	}
+
 	verbs := map[string]string{
 		"start": "Starting", "stop": "Stopping", "restart": "Restarting",
 		"pause": "Pausing", "unpause": "Unpausing",
@@ -3101,12 +3172,41 @@ func (s *Server) handleStackCommand(tgCfg notify.TelegramConfig, sub string) {
 	}
 }
 
-// runStackOp executes one stack-level compose operation, streaming progress
-// to SSE under the synthetic "_stack" app ID and reporting the result to Telegram.
+// runStackOp is the public entry point for all stack-mutating operations
+// (/stack up, down, restart, pull). It shares the SAME global updateMu lock
+// as runContainerUpdates — a per-app /update racing a /stack down (or
+// another /stack op) against the same container is exactly the class of bug
+// that produces orphaned containers with stale network endpoints. See the
+// updateMu doc comment on the Server struct for the full mechanism.
 func (s *Server) runStackOp(tgCfg notify.TelegramConfig, composeFile, op string) {
+	s.stateMu.Lock()
+	if s.updateRunning {
+		s.stateMu.Unlock()
+		_ = notify.SendRaw(tgCfg, "⏳ An update or stack operation is already in progress — please wait for it to finish\\.")
+		return
+	}
+	s.updateRunning = true
+	s.stateMu.Unlock()
+
+	s.updateMu.Lock()
+	defer func() {
+		s.updateMu.Unlock()
+		s.stateMu.Lock()
+		s.updateRunning = false
+		s.stateMu.Unlock()
+	}()
+
+	s.runStackOpLocked(tgCfg, composeFile, op)
+}
+
+// runStackOpLocked executes one stack-level compose operation, streaming
+// progress to SSE under the synthetic "_stack" app ID and reporting the
+// result to Telegram. Must only be called while holding s.updateMu — use
+// runStackOp.
+func (s *Server) runStackOpLocked(tgCfg notify.TelegramConfig, composeFile, op string) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[stack] PANIC in runStackOp(%s): %v", op, r)
+			log.Printf("[stack] PANIC in runStackOpLocked(%s): %v", op, r)
 			_ = notify.SendRaw(tgCfg, "❌ Internal error during stack operation — check container logs\\.")
 		}
 	}()
