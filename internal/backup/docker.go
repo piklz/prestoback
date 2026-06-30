@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -948,6 +949,21 @@ func initCompose() {
 	})
 }
 
+// composeCmd builds an exec.Cmd for a compose operation.
+//
+// PROCESS GROUP KILL — why this is necessary:
+// exec.CommandContext sends SIGKILL only to the direct child when ctx fires.
+// Both docker-compose V1 and docker compose V2 fork/exec helper processes
+// internally. Those grandchildren inherit the stdout/stderr pipes, so
+// Cmd.Wait() blocks even after the deadline fires because the pipes stay
+// open. This was the root cause of /stack commands hanging forever in
+// Telegram: the Go timeout was reached, the direct child was killed, but
+// compose-spawned helpers kept running and the .CombinedOutput() call
+// never returned.
+//
+// Fix: start the child in its own process group (Setpgid) and register a
+// Cancel hook that sends SIGKILL to the WHOLE group (negative PID). This
+// guarantees the configured timeout is actually enforced end-to-end.
 func composeCmd(ctx context.Context, fileArgs []string, subcmd ...string) *exec.Cmd {
 	initCompose()
 	bin := composeBin[0]
@@ -957,10 +973,23 @@ func composeCmd(ctx context.Context, fileArgs []string, subcmd ...string) *exec.
 	}
 	args = append(args, fileArgs...)
 	if composeIsV2 {
+		// --progress plain: suppress ANSI/TUI output that corrupts Telegram messages.
 		args = append(args, "--progress", "plain")
 	}
 	args = append(args, subcmd...)
-	return exec.CommandContext(ctx, bin, args...)
+
+	cmd := exec.CommandContext(ctx, bin, args...)
+	// Place the child (and any helpers it spawns) in its own process group
+	// so our Cancel hook can kill them all together.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		// Negative PID = kill the whole process group, not just the direct child.
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	return cmd
 }
 
 const pullTimeout = 10 * time.Minute
@@ -1154,7 +1183,14 @@ func StackUp(composeFile string, emit func(string)) error {
 	emit("Running: docker compose up -d…")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	out, err := composeCmd(ctx, stackFileArgs(composeFile), "up", "-d").CombinedOutput()
+	// --remove-orphans removes containers for services that no longer exist in
+	// the compose file. Without this, renaming or removing a service in
+	// docker-compose.yml leaves the old container running as an orphan — it
+	// shows up in `docker ps` with a hash-prefixed name (e.g.
+	// ae5f67985bd9_immich_postgres) and causes confusing double-entries in
+	// PrestoBack's container list. Compose itself warns about orphans on every
+	// `up` without this flag; with it, they are cleanly removed.
+	out, err := composeCmd(ctx, stackFileArgs(composeFile), "up", "-d", "--remove-orphans").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s", stripDockerOutput(string(out)))
 	}
@@ -1176,7 +1212,9 @@ func StackDown(composeFile string, emit func(string)) error {
 	emit("Running: docker compose down…")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	out, err := composeCmd(ctx, stackFileArgs(composeFile), "down").CombinedOutput()
+	// --remove-orphans cleans up any containers from previous compose
+	// configurations that are no longer defined in the current file.
+	out, err := composeCmd(ctx, stackFileArgs(composeFile), "down", "--remove-orphans").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s", stripDockerOutput(string(out)))
 	}
@@ -1229,7 +1267,7 @@ func StackPull(composeFile string, emit func(string)) error {
 
 	upCtx, upCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer upCancel()
-	upOut, upErr := composeCmd(upCtx, fileArgs, "up", "-d").CombinedOutput()
+	upOut, upErr := composeCmd(upCtx, fileArgs, "up", "-d", "--remove-orphans").CombinedOutput()
 	if upErr != nil {
 		return fmt.Errorf("up failed: %s", stripDockerOutput(string(upOut)))
 	}

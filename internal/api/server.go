@@ -3162,6 +3162,10 @@ func (s *Server) handleStackCommand(tgCfg notify.TelegramConfig, sub string) {
 		}
 
 		verbMap := map[string]string{"up": "Starting", "restart": "Restarting", "pull": "Updating"}
+		// Send the acknowledgement BEFORE launching the goroutine so Telegram
+		// always shows an immediate reply — avoids the "stuck / no response"
+		// appearance when Docker is slow to respond or the compose project lock
+		// is briefly held by a concurrent operation.
 		_ = notify.SendRaw(tgCfg, fmt.Sprintf("📚 %s the stack\\.\\.\\.", verbMap[sub]))
 		go s.runStackOp(tgCfg, composeFile, sub)
 		return
@@ -3240,18 +3244,55 @@ func (s *Server) runStackOpLocked(tgCfg notify.TelegramConfig, composeFile, op s
 }
 
 // sendTelegramAppList sends a button menu with one app per row, sorted
-// alphabetically. Using SendRawWithButtons (one per row) instead of the old
-// map-based approach fixes the button truncation seen when all buttons were
-// crammed into a single scrollable horizontal row.
+// alphabetically.
 //
-// For the "update" action an extra "Update ALL" button is prepended so the
-// user can trigger a bulk update without typing /update all.
+// Container-lifecycle actions (start/stop/restart/pause/unpause) are filtered
+// to only show apps whose container Docker actually knows about. Apps that are
+// registered in PrestoBack but have no corresponding Docker container (e.g.
+// a backup-only app with no running service, or a stale registration) are
+// silently excluded from those menus — showing them would produce the
+// confusing "No containers found for X" error on every button tap.
+//
+// Backup and update actions always show all registered apps regardless of
+// container status, since both can meaningfully operate on stopped services.
 func (s *Server) sendTelegramAppList(tgCfg notify.TelegramConfig, action string) {
-	apps := s.cfg.ListApps()
-	if len(apps) == 0 {
+	allApps := s.cfg.ListApps()
+	if len(allApps) == 0 {
 		_ = notify.SendRaw(tgCfg, "❌ No apps registered yet\\.")
 		return
 	}
+
+	// Actions that require a real running/stopped container in Docker.
+	// For these we filter out apps with no discoverable container.
+	containerActions := map[string]bool{
+		"start": true, "stop": true, "restart": true,
+		"pause": true, "unpause": true,
+	}
+
+	var apps []config.AppConfig
+	if containerActions[action] {
+		for _, a := range allApps {
+			// Check if Docker knows any container for this app.
+			// FindContainers uses docker ps -a so it catches stopped containers too.
+			containers := backup.FindContainers(a.ID)
+			// Also check ContainerName if set explicitly.
+			if len(containers) == 0 && a.ContainerName != "" {
+				containers = backup.ContainersByName([]string{a.ContainerName})
+			}
+			if len(containers) > 0 {
+				apps = append(apps, a)
+			}
+		}
+		if len(apps) == 0 {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+				"❌ No containers found for any registered app\\. Use `/stack up` to start the stack\\.",
+			))
+			return
+		}
+	} else {
+		apps = allApps
+	}
+
 	sort.Slice(apps, func(i, j int) bool { return apps[i].Name < apps[j].Name })
 
 	var btns []notify.ButtonAction
