@@ -630,34 +630,44 @@ func parseMaintDuration(arg string) (time.Duration, bool) {
 
 // ── Update availability checking ──────────────────────────────────────────────
 //
-// Checks every running app's container(s) against their registries every 6
-// hours, WITHOUT pulling images (uses "docker manifest inspect" — metadata
-// only). Notifies via Telegram with a one-tap Update button the first time an
-// app is found to have a pending update; debounced per-app so it won't repeat
-// until either the update is applied or the container restarts.
+// Checks every running app's container(s) against their registries via an
+// actual "docker pull" per unique image (see CheckImageUpdate doc comment for
+// why manifest-digest comparison was abandoned — it produced false positives
+// on every multi-arch image). A pull costs a small registry round-trip even
+// when nothing changed, and real bandwidth only when a layer actually changed
+// — this is why the interval defaults to 24h rather than something tighter.
+// Use /check at any time to trigger an immediate on-demand check.
+//
+// Notifies via Telegram with a one-tap Update button the first time an app is
+// found to have a pending update; debounced per-app so it won't repeat until
+// either the update is applied or the set of pending apps changes.
 
-const updateCheckInterval = 6 * time.Hour
+const updateCheckInterval = 24 * time.Hour
 
 func (s *Server) updateCheckLoop() {
 	time.Sleep(2 * time.Minute) // let startup settle, avoid racing the disk/SSE goroutines
 	for {
-		s.checkForUpdates()
+		s.checkForUpdates(true)
 		time.Sleep(updateCheckInterval)
 	}
 }
 
-func (s *Server) checkForUpdates() {
+// checkForUpdates pulls every unique image in use once, dedupes via pullCache,
+// and updates s.pendingUpdates. If notify is true, sends a Telegram alert for
+// any newly-pending app (subject to the per-app debounce in updateAlertSent).
+func (s *Server) checkForUpdates(notifyUser bool) []string {
 	apps := s.cfg.ListApps()
 	var pending []string
+	pullCache := map[string]backup.ImageUpdateStatus{}
 
 	for _, app := range apps {
 		containers := backup.DedupeContainers(backup.FindContainers(app.ID))
 		appHasUpdate := false
 		for _, c := range containers {
 			if c.Status != "running" {
-				continue // can't usefully compare a stopped container's image
+				continue // can't usefully check a stopped container's image
 			}
-			status := backup.CheckImageUpdate(c)
+			status := backup.CheckImageUpdate(c, pullCache)
 			if status.Err != "" {
 				log.Printf("[updatecheck] %s/%s: %s", app.Name, c.Name, status.Err)
 				continue
@@ -695,14 +705,14 @@ func (s *Server) checkForUpdates() {
 	}
 	s.stateMu.Unlock()
 
-	if len(toAlert) == 0 {
-		return
+	if !notifyUser || len(toAlert) == 0 {
+		return pending
 	}
 
 	nc := s.cfg.GetNotify()
 	if !nc.TelegramEnabled || nc.TelegramToken == "" || nc.TelegramChatID == "" {
 		log.Printf("[updatecheck] %d app(s) have updates available but Telegram is not configured: %v", len(toAlert), toAlert)
-		return
+		return pending
 	}
 	tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
 
@@ -729,6 +739,7 @@ func (s *Server) checkForUpdates() {
 	if err := notify.SendRawWithButtons(tgCfg, sb.String(), btns); err != nil {
 		log.Printf("[updatecheck] notify failed: %v", err)
 	}
+	return pending
 }
 
 // diskMonitorLoop checks backup disk space every 30 minutes and fires a
@@ -2051,6 +2062,7 @@ func prestoBackBotCommands() []notify.BotCommand {
 		{Command: "logs", Description: "Detailed recent backups for one app — /logs <name>"},
 		{Command: "disk", Description: "Backup directory disk usage (free / used / total)"},
 		{Command: "next", Description: "Upcoming scheduled backup times across all apps"},
+		{Command: "check", Description: "Check for image updates now (pulls each image)"},
 		{Command: "start", Description: "Start a stopped container — /start <name>"},
 		{Command: "stop", Description: "Stop a running container — /stop <name>"},
 		{Command: "restart", Description: "Restart a container — /restart <name>"},
@@ -2448,6 +2460,35 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			log.Printf("[bot] send next: %v", err)
 		}
 
+	case "/check":
+		_ = notify.SendRaw(tgCfg, "🔍 Checking for image updates \\(pulls each image — may take a minute\\)\\.\\.\\.")
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[bot] PANIC in /check: %v", r)
+				}
+			}()
+			pending := s.checkForUpdates(false) // false: we send our own message below, not the debounced alert
+			if len(pending) == 0 {
+				_ = notify.SendRaw(tgCfg, "✅ Everything is up to date\\.")
+				return
+			}
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("⬆️ *%d update\\(s\\) available*\n\n", len(pending)))
+			for _, name := range pending {
+				sb.WriteString(fmt.Sprintf("• `%s`\n", notify.EscapeMD(name)))
+			}
+			var btns []notify.ButtonAction
+			if len(pending) == 1 {
+				if app := s.findAppByNameFragment(pending[0]); app != nil {
+					btns = append(btns, notify.ButtonAction{Label: "🔄 Update now", Data: "update:" + app.ID})
+				}
+			} else {
+				btns = append(btns, notify.ButtonAction{Label: fmt.Sprintf("🔄 Update all %d", len(pending)), Data: "update:all"})
+			}
+			_ = notify.SendRawWithButtons(tgCfg, sb.String(), btns)
+		}()
+
 	case "/logs":
 		if arg == "" {
 			_ = notify.SendRaw(tgCfg, "Usage: `/logs \\<app name\\>`")
@@ -2664,14 +2705,18 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 					"identical volumes, ports, networks, env vars, and restart policy\\. "+
 					"If the new container fails its health check within 30s, the old one "+
 					"is automatically restarted \\(rollback\\)\\.\n\n"+
-					"*Optional — compose file \\(takes priority\\):*\n"+
-					"Set `PRESTOBACK\\_COMPOSE\\_FILE` if you prefer compose to manage recreation\\. "+
-					"The path must be the exact host path, mounted at the same path inside this container:\n"+
+					"*Optional — compose file \\(tried first, falls back automatically\\):*\n"+
+					"If `PRESTOBACK\\_COMPOSE\\_FILE` is set, `/update` tries compose first and "+
+					"silently falls back to standalone recreate on any failure \\(including a "+
+					"partially\\-mounted project directory\\) — so it's safe to set even if your "+
+					"mount isn't complete\\. `/stack` commands have no such fallback and require the "+
+					"*entire* project directory mounted \\(not just the compose file\\) so `\\.env` and "+
+					"per\\-service `env\\_file:` references resolve correctly:\n"+
 					"```yaml\n"+
 					"environment:\n"+
 					"  PRESTOBACK_COMPOSE_FILE: ${PWD}/docker-compose.yml\n"+
 					"volumes:\n"+
-					"  - ${PWD}/docker-compose.yml:${PWD}/docker-compose.yml:ro\n"+
+					"  - ${PWD}:${PWD}:ro\n"+
 					"```\n"+
 					"Use `/selfupdate` to update PrestoBack itself\\.",
 				composeStatus,
@@ -2716,6 +2761,7 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			"🔍 /logs \\<name\\> — detailed recent backups for one app\n" +
 			"💾 /disk — backup directory disk usage\n" +
 			"⏰ /next — upcoming scheduled backup times\n" +
+			"🔍 /check — check for image updates now \\(pulls each image\\)\n" +
 			"⏸ /schedpause \\<name\\> — disable an app's backup schedule\n" +
 			"▶ /schedresume \\<name\\> — re\\-enable an app's backup schedule\n" +
 			"🔧 /maintenance \\<2h/1d/1w/on/off\\> — freeze all schedules temporarily\n\n" +
@@ -2963,10 +3009,49 @@ func (s *Server) runContainerLifecycle(tgCfg notify.TelegramConfig, app config.A
 // handleStackCommand implements /stack up|down|restart|pull|ps.
 func (s *Server) handleStackCommand(tgCfg notify.TelegramConfig, sub string) {
 	composeFile := s.cfg.ComposeFile
+	projectDir := filepath.Dir(composeFile)
+
 	if composeFile == "" {
 		_ = notify.SendRaw(tgCfg,
-			"❌ No compose file configured\\.\nSet `PRESTOBACK\\_COMPOSE\\_FILE` to use stack commands — see /update help for setup\\.")
+			"❌ *No compose file configured*\n\n"+
+				"`/stack` commands operate on your whole docker\\-compose\\.yml \\(and everything it "+
+				"references — `\\.env`, per\\-service `env\\_file:` entries, etc\\.\\), so PrestoBack "+
+				"needs the *entire project directory* mounted, not just the one file\\. Add to your "+
+				"prestoback service:\n\n"+
+				"```yaml\n"+
+				"environment:\n"+
+				"  PRESTOBACK_COMPOSE_FILE: ${PWD}/docker-compose.yml\n"+
+				"volumes:\n"+
+				"  - ${PWD}:${PWD}:ro\n"+
+				"```\n\n"+
+				"_Note: `/update` does NOT need this — it works without a compose file via standalone container recreate\\. Only `/stack` commands require it\\._")
 		return
+	}
+	if _, statErr := os.Stat(composeFile); statErr != nil {
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+			"❌ *Compose file not accessible*\n\n"+
+				"`PRESTOBACK_COMPOSE_FILE` is set to `%s` but that path doesn't exist *inside this container*\\.\n\n"+
+				"Mount the *entire project directory* \\(not just the one file\\) — your stack likely "+
+				"references `\\.env` and per\\-service `env\\_file:` paths that also need to resolve "+
+				"correctly inside this container:\n\n"+
+				"```yaml\n"+
+				"volumes:\n"+
+				"  - %s:%s:ro\n"+
+				"```\n\n"+
+				"_Note: `/update` does NOT need this — it works without a compose file via standalone container recreate\\. Only `/stack` commands require it\\._",
+			notify.EscapeMD(composeFile), projectDir, projectDir,
+		))
+		return
+	}
+	// Soft warning (not a hard stop): if only the single compose file is
+	// mounted rather than the whole project directory, .env and per-service
+	// env_file: references will be invisible to Compose running in this
+	// container. Variables silently resolve to empty strings, which can
+	// corrupt volume specs like "${VAR}:/data" into invalid empty-section
+	// binds ("invalid spec: :/data: empty section between colons").
+	envFile := filepath.Join(projectDir, ".env")
+	if _, envErr := os.Stat(envFile); envErr != nil {
+		log.Printf("[stack] warning: %s not found — if your stack uses .env or env_file: references, mount the whole project directory, not just docker-compose.yml", envFile)
 	}
 
 	switch sub {

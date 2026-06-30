@@ -1178,6 +1178,19 @@ func StackPull(composeFile string, emit func(string)) error {
 }
 
 // stackFileArgs builds the -f / --env-file args shared by all stack operations.
+// stackFileArgs builds the -f / --env-file args shared by all stack operations.
+//
+// IMPORTANT: this only finds the top-level .env next to docker-compose.yml.
+// If your stack uses per-service env_file: references (e.g.
+// "./services/motioneye/motioneye.env"), Docker Compose resolves those
+// relative to the project directory AT PARSE TIME, from inside this
+// container. If only docker-compose.yml itself is mounted, those nested
+// .env files don't exist inside the container, every variable they'd
+// provide silently becomes an empty string, and any volume spec built from
+// one of those vars (e.g. "${DB_DATA_LOCATION}:/data") becomes invalid
+// (":/data" — empty section between colons). The only robust fix is
+// mounting the WHOLE project directory at the same host path, not just the
+// single compose file — see handleStackCommand's pre-flight error message.
 func stackFileArgs(composeFile string) []string {
 	args := []string{"-f", composeFile}
 	envFile := filepath.Join(filepath.Dir(composeFile), ".env")
@@ -1189,10 +1202,21 @@ func stackFileArgs(composeFile string) []string {
 
 // ── Update availability checking ──────────────────────────────────────────────
 //
-// Compares each running container's local image digest against the digest
-// currently published in its registry, WITHOUT pulling the image. Used by
-// the background checker to notify "update available" before the user runs
-// /update — avoids surprising multi-hundred-MB downloads from a routine check.
+// IMPORTANT — why this pulls the image rather than comparing manifests:
+//
+// An earlier version compared "docker manifest inspect" (the registry's
+// multi-arch MANIFEST LIST digest) against the locally stored RepoDigest
+// (the PLATFORM-SPECIFIC image digest — e.g. arm64 on a Raspberry Pi).
+// These are structurally different digests for any multi-arch image and
+// will essentially never match, causing false-positive "update available"
+// alerts on nearly every image, every check. That approach is removed.
+//
+// The reliable method — and what tools like Watchtower actually do — is to
+// run "docker pull" and read whether it reports "Image is up to date" or
+// downloaded new layers. This costs a small registry round-trip (a few KB
+// for the manifest) even when nothing changed; it only transfers real data
+// when a layer has actually changed. This is why the background check
+// interval defaults to 24h rather than something more frequent.
 
 // ImageUpdateStatus describes whether a running container's image has a
 // newer version available in its registry.
@@ -1203,72 +1227,46 @@ type ImageUpdateStatus struct {
 	Err             string // non-empty if the check itself failed (e.g. registry unreachable)
 }
 
-// CheckImageUpdate compares the locally cached image's digest (from "docker
-// image inspect") against the remote registry's digest (from "docker manifest
-// inspect", which does NOT pull the image — only fetches manifest metadata).
-//
-// "docker manifest inspect" requires no special permissions for public images
-// but DOES require credentials for private registries (use "docker login" on
-// the host — credentials are read from the daemon, not from inside this
-// container, since manifest inspect goes through the daemon's auth config).
-func CheckImageUpdate(c ContainerInfo) ImageUpdateStatus {
-	res := ImageUpdateStatus{ContainerName: c.Name}
+const imageCheckTimeout = 2 * time.Minute
 
+// CheckImageUpdate pulls c's image and reports whether the pull resulted in
+// new layers (i.e. an update was available and has now been cached locally
+// — NOT applied to any running container; the container itself is untouched).
+//
+// pullCache deduplicates repeated checks of the same image within one check
+// cycle — e.g. a stack with several services sharing 2-3 base images only
+// needs each unique image pulled once, not once per container.
+func CheckImageUpdate(c ContainerInfo, pullCache map[string]ImageUpdateStatus) ImageUpdateStatus {
 	out, err := exec.Command("docker", "inspect", "--format={{.Config.Image}}", c.ID).Output()
 	if err != nil {
-		res.Err = "inspect failed: " + err.Error()
-		return res
+		return ImageUpdateStatus{ContainerName: c.Name, Err: "inspect failed: " + err.Error()}
 	}
-	res.Image = strings.TrimSpace(string(out))
-	if res.Image == "" {
-		res.Err = "could not determine image name"
-		return res
+	image := strings.TrimSpace(string(out))
+	if image == "" {
+		return ImageUpdateStatus{ContainerName: c.Name, Err: "could not determine image name"}
 	}
 
-	// Local digest: the RepoDigest of the currently-running image.
-	localOut, localErr := exec.Command("docker", "image", "inspect",
-		"--format={{range .RepoDigests}}{{.}}\n{{end}}", res.Image).Output()
-	if localErr != nil {
-		res.Err = "local image inspect failed: " + localErr.Error()
-		return res
-	}
-	localDigests := strings.Fields(string(localOut))
-	if len(localDigests) == 0 {
-		// No RepoDigest — image was likely built locally rather than pulled.
-		// Can't compare against a registry; treat as "no update info available".
-		return res
+	if cached, ok := pullCache[image]; ok {
+		cached.ContainerName = c.Name // keep per-container name, reuse the pull result
+		return cached
 	}
 
-	// Remote digest: query the registry manifest without pulling.
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), imageCheckTimeout)
 	defer cancel()
-	remoteOut, remoteErr := exec.CommandContext(ctx, "docker", "manifest", "inspect",
-		"--verbose", res.Image).CombinedOutput()
-	if remoteErr != nil {
-		// Common and not fatal — many images/registries don't support manifest
-		// inspect without auth, or docker manifest is experimental/unavailable.
-		res.Err = "manifest inspect unavailable: " + stripDockerOutput(string(remoteOut))
+	pullOut, pullErr := exec.CommandContext(ctx, "docker", "pull", image).CombinedOutput()
+
+	res := ImageUpdateStatus{ContainerName: c.Name, Image: image}
+	if pullErr != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			res.Err = fmt.Sprintf("pull timed out after %s", imageCheckTimeout)
+		} else {
+			res.Err = "pull failed: " + stripDockerOutput(string(pullOut))
+		}
+		pullCache[image] = res
 		return res
 	}
-
-	// docker manifest inspect --verbose includes "Descriptor":{"digest":"sha256:..."}
-	// for the resolved platform manifest. We just check whether any locally
-	// cached digest's hash substring appears in the remote output — if not,
-	// a different digest is published than what we have locally.
-	remoteStr := string(remoteOut)
-	matched := false
-	for _, ld := range localDigests {
-		// ld looks like "image@sha256:abcdef..." — extract just the hash.
-		atIdx := strings.LastIndex(ld, "@")
-		if atIdx == -1 {
-			continue
-		}
-		hash := ld[atIdx+1:]
-		if strings.Contains(remoteStr, hash) {
-			matched = true
-			break
-		}
-	}
-	res.UpdateAvailable = !matched
+	// Same detection string used by UpdateContainer's AlreadyUpToDate field.
+	res.UpdateAvailable = !strings.Contains(string(pullOut), "up to date")
+	pullCache[image] = res
 	return res
 }
