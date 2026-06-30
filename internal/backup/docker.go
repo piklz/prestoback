@@ -951,19 +951,16 @@ func initCompose() {
 
 // composeCmd builds an exec.Cmd for a compose operation.
 //
-// PROCESS GROUP KILL — why this is necessary:
-// exec.CommandContext sends SIGKILL only to the direct child when ctx fires.
-// Both docker-compose V1 and docker compose V2 fork/exec helper processes
-// internally. Those grandchildren inherit the stdout/stderr pipes, so
-// Cmd.Wait() blocks even after the deadline fires because the pipes stay
-// open. This was the root cause of /stack commands hanging forever in
-// Telegram: the Go timeout was reached, the direct child was killed, but
-// compose-spawned helpers kept running and the .CombinedOutput() call
-// never returned.
+// PROCESS GROUP KILL:
+// exec.CommandContext sends SIGKILL only to the direct child on ctx cancel.
+// docker compose V2 (and docker-compose V1) internally exec helper processes
+// that inherit the stdout/stderr pipes — those grandchildren are NOT killed,
+// so CombinedOutput() blocks indefinitely even after the context deadline.
+// This caused /stack commands to hang forever with no Telegram response.
 //
-// Fix: start the child in its own process group (Setpgid) and register a
-// Cancel hook that sends SIGKILL to the WHOLE group (negative PID). This
-// guarantees the configured timeout is actually enforced end-to-end.
+// Fix: Setpgid puts the child in its own process group; the Cancel hook
+// sends SIGKILL to the whole group (negative PID) so every descended
+// process is killed and pipes are closed when the deadline fires.
 func composeCmd(ctx context.Context, fileArgs []string, subcmd ...string) *exec.Cmd {
 	initCompose()
 	bin := composeBin[0]
@@ -977,16 +974,12 @@ func composeCmd(ctx context.Context, fileArgs []string, subcmd ...string) *exec.
 		args = append(args, "--progress", "plain")
 	}
 	args = append(args, subcmd...)
-
 	cmd := exec.CommandContext(ctx, bin, args...)
-	// Place the child (and any helpers it spawns) in its own process group
-	// so our Cancel hook can kill them all together.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
 		}
-		// Negative PID = kill the whole process group, not just the direct child.
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
 	return cmd
@@ -1037,35 +1030,70 @@ func UpdateContainer(c ContainerInfo, composeFile string, emit func(string)) Con
 		return res
 	}
 
-	// ── Step 3a: compose recreation (optional, if file is configured) ─────────
+	// ── Step 3: recreate the container ───────────────────────────────────────
+	//
+	// Strategy depends on whether this container is compose-managed:
+	//
+	//   Compose-managed (com.docker.compose.service label is set):
+	//     ALWAYS use "docker compose up -d --no-deps <service>".
+	//     NEVER fall through to standaloneRecreate — doing so renames the old
+	//     container to "{id}_{name}" and creates a new one outside compose's
+	//     project tracking. Compose then sees TWO containers for the same
+	//     service on the next "up" and renames the one it didn't create to a
+	//     hash-prefixed orphan name. This is the root cause of the
+	//     "ae5f67985bd9_immich_postgres" orphan storm seen after mixed updates.
+	//
+	//   Not compose-managed (no service label, or no compose file configured):
+	//     Use standaloneRecreate which reads HostConfig from the Docker socket
+	//     and does a stop → rename → create → start → health-check cycle with
+	//     automatic rollback. Safe because compose doesn't own these containers.
 	labels := inspectLabels(c.ID)
 	service := labels["com.docker.compose.service"]
 	const composeUpTimeout = 5 * time.Minute
 
-	if service != "" && composeFile != "" {
-		if _, statErr := os.Stat(composeFile); statErr == nil {
-			emit(fmt.Sprintf("Recreating %s via compose…", c.Name))
-			upCtx, upCancel := context.WithTimeout(context.Background(), composeUpTimeout)
-			defer upCancel()
-			fileArgs := []string{"-f", composeFile}
-			envFile := filepath.Join(filepath.Dir(composeFile), ".env")
-			if _, envErr := os.Stat(envFile); envErr == nil {
-				fileArgs = append(fileArgs, "--env-file", envFile)
-			}
-			upOut, upErr := composeCmd(upCtx, fileArgs, "up", "-d", "--no-deps", service).CombinedOutput()
-			if upErr == nil {
-				res.Restarted = true
-				return res
-			}
-			emit(fmt.Sprintf("Compose failed — falling back to standalone recreate: %s", stripDockerOutput(string(upOut))))
-			log.Printf("[docker] compose up failed for %s (%s): %s — falling back to standalone recreate",
-				c.Name, service, stripDockerOutput(string(upOut)))
-		} else {
-			log.Printf("[docker] composeFile %q not accessible inside container — using standalone recreate", composeFile)
+	if service != "" {
+		// This is a compose-managed container. Only compose may recreate it.
+		if composeFile == "" {
+			res.Err = fmt.Sprintf(
+				"container %s is managed by compose (service=%s) but PRESTOBACK_COMPOSE_FILE is not set — "+
+					"set it to your docker-compose.yml path so /update can recreate this container correctly",
+				c.Name, service)
+			return res
 		}
+		if _, statErr := os.Stat(composeFile); statErr != nil {
+			res.Err = fmt.Sprintf(
+				"compose file %q is not accessible inside this container — "+
+					"mount the project directory at the same host path so /update can reach it",
+				composeFile)
+			return res
+		}
+		emit(fmt.Sprintf("Recreating %s via compose (service: %s)…", c.Name, service))
+		upCtx, upCancel := context.WithTimeout(context.Background(), composeUpTimeout)
+		defer upCancel()
+		fileArgs := []string{"-f", composeFile}
+		envFile := filepath.Join(filepath.Dir(composeFile), ".env")
+		if _, envErr := os.Stat(envFile); envErr == nil {
+			fileArgs = append(fileArgs, "--env-file", envFile)
+			log.Printf("[docker] using env-file: %s", envFile)
+		}
+		// --force-recreate: recreate even if config hash looks unchanged — after
+		// a pull the image digest changed but compose's config hash may not have,
+		// causing it to leave the old container running. Docksentry uses this too.
+		// --no-deps: only recreate THIS service, not its dependencies.
+		upOut, upErr := composeCmd(upCtx, fileArgs,
+			"up", "-d", "--no-deps", "--force-recreate", service,
+		).CombinedOutput()
+		if upErr != nil {
+			res.Err = fmt.Sprintf("compose up failed for %s: %s", service, stripDockerOutput(string(upOut)))
+			return res
+		}
+		res.Restarted = true
+		return res
 	}
 
-	// ── Step 3b: standalone HostConfig-based recreate (always available) ──────
+	// Not compose-managed: use standalone HostConfig-based recreate.
+	// Safe to use here because compose doesn't track this container and won't
+	// produce orphan conflicts from it.
 	rolled, recreateErr := standaloneRecreate(c, res.Image, emit)
 	if recreateErr != nil {
 		res.Err = recreateErr.Error()
@@ -1183,13 +1211,10 @@ func StackUp(composeFile string, emit func(string)) error {
 	emit("Running: docker compose up -d…")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	// --remove-orphans removes containers for services that no longer exist in
-	// the compose file. Without this, renaming or removing a service in
-	// docker-compose.yml leaves the old container running as an orphan — it
-	// shows up in `docker ps` with a hash-prefixed name (e.g.
-	// ae5f67985bd9_immich_postgres) and causes confusing double-entries in
-	// PrestoBack's container list. Compose itself warns about orphans on every
-	// `up` without this flag; with it, they are cleanly removed.
+	// --remove-orphans: removes containers for services that are no longer in
+	// the compose file. Without this, removed or renamed services leave
+	// running containers that show up with hash-prefixed names like
+	// "ae5f67985bd9_immich_postgres" and pollute `docker ps` output.
 	out, err := composeCmd(ctx, stackFileArgs(composeFile), "up", "-d", "--remove-orphans").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s", stripDockerOutput(string(out)))
@@ -1212,8 +1237,6 @@ func StackDown(composeFile string, emit func(string)) error {
 	emit("Running: docker compose down…")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	// --remove-orphans cleans up any containers from previous compose
-	// configurations that are no longer defined in the current file.
 	out, err := composeCmd(ctx, stackFileArgs(composeFile), "down", "--remove-orphans").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s", stripDockerOutput(string(out)))
