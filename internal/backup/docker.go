@@ -1351,11 +1351,119 @@ func stackFileArgs(composeFile string) []string {
 	if project := detectProjectName(composeFile); project != "" {
 		args = append([]string{"-p", project}, args...)
 	}
-	envFile := filepath.Join(filepath.Dir(composeFile), ".env")
-	if _, err := os.Stat(envFile); err == nil {
-		args = append(args, "--env-file", envFile)
+	if merged := mergeAllEnvFiles(composeFile); merged != "" {
+		args = append(args, "--env-file", merged)
 	}
 	return args
+}
+
+// mergeAllEnvFiles combines the top-level .env with every per-service
+// services/<app>/<app>.env file into a single file at a fixed path, and
+// returns that path (or "" if there's nothing to merge).
+//
+// WHY THIS IS NECESSARY:
+// docker compose's ${VAR} substitution is a PARSE-TIME text operation done
+// by the compose CLI itself, using only the OS environment or --env-file —
+// it never reads a service's own env_file: entries, because those are
+// loaded by the CONTAINER at runtime, well after substitution already
+// happened. In this project's layout
+// (~/presto/.env + ~/presto/services/<app>/<app>.env), a variable shared
+// between two services — e.g. DB_PASSWORD needed by both immich_postgres
+// and immich_server — only works if it lives in the TOP-LEVEL .env. If it
+// was instead only placed in one service's own .env, every OTHER service
+// referencing that same "${VAR}" sees an empty string. Compose only WARNS
+// about this ("variable is not set — defaulting to a blank string") and
+// keeps going — it does not abort — so the empty string then flows into
+// whatever it was used for (commonly a volume path like
+// "${UPLOAD_LOCATION}:/data"), producing an invalid bind spec ("empty
+// section between colons") that fails at container CREATE time. Compose's
+// own recreate procedure has already renamed the old container out of the
+// way by that point, the create then fails, and the old container is left
+// stranded with no replacement — which is exactly the selective
+// "some services orphaned with no clean replacement" pattern observed.
+//
+// Merging every known env file together (top-level .env takes priority on
+// key collisions, since shared/canonical values conventionally live there)
+// means every "${VAR}" in the compose file resolves to its real value
+// regardless of which specific file it happens to be defined in.
+func mergeAllEnvFiles(composeFile string) string {
+	projectDir := filepath.Dir(composeFile)
+	var files []string
+
+	if top := filepath.Join(projectDir, ".env"); fileExists(top) {
+		files = append(files, top)
+	}
+
+	servicesDir := filepath.Join(projectDir, "services")
+	if entries, err := os.ReadDir(servicesDir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			// Expected: services/<app>/<app>.env
+			candidate := filepath.Join(servicesDir, e.Name(), e.Name()+".env")
+			if fileExists(candidate) {
+				files = append(files, candidate)
+				continue
+			}
+			// Fallback: any single *.env file directly inside the app's dir,
+			// in case naming doesn't exactly match the directory name.
+			if subEntries, err2 := os.ReadDir(filepath.Join(servicesDir, e.Name())); err2 == nil {
+				for _, se := range subEntries {
+					if strings.HasSuffix(se.Name(), ".env") {
+						files = append(files, filepath.Join(servicesDir, e.Name(), se.Name()))
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if len(files) == 0 {
+		return ""
+	}
+
+	// Fixed path — overwritten on every call, so nothing accumulates in /tmp.
+	const mergedPath = "/tmp/prestoback-merged.env"
+	f, err := os.Create(mergedPath)
+	if err != nil {
+		log.Printf("[docker] mergeAllEnvFiles: could not create %s: %v", mergedPath, err)
+		return ""
+	}
+	defer f.Close()
+
+	// First file to define a key wins — top-level .env is first in the list,
+	// so shared/canonical values there take priority over any per-service
+	// duplicate definition.
+	seen := map[string]bool{}
+	for _, path := range files {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			key := trimmed
+			if idx := strings.Index(trimmed, "="); idx > 0 {
+				key = trimmed[:idx]
+			}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			fmt.Fprintln(f, trimmed)
+		}
+	}
+	log.Printf("[docker] merged %d env file(s) into %s (%d unique variables)", len(files), mergedPath, len(seen))
+	return mergedPath
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // detectProjectName reads the com.docker.compose.project label off any
