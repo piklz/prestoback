@@ -3220,13 +3220,15 @@ func (s *Server) runStackOpLocked(tgCfg notify.TelegramConfig, composeFile, op s
 	var err error
 	switch op {
 	case "up":
-		err = backup.StackUp(composeFile, emit)
+		// selfName excludes PrestoBack's own container from the recreate
+		// target list — see StackUp's doc comment for why this is required.
+		err = backup.StackUp(composeFile, s.selfName, emit)
 	case "down":
 		err = backup.StackDown(composeFile, emit)
 	case "restart":
-		err = backup.StackRestart(composeFile, emit)
+		err = backup.StackRestart(composeFile, s.selfName, emit)
 	case "pull":
-		err = backup.StackPull(composeFile, emit)
+		err = backup.StackPull(composeFile, s.selfName, emit)
 	}
 	dur := time.Since(start)
 

@@ -1191,6 +1191,40 @@ func UnpauseOneContainer(c ContainerInfo, emit func(string)) error {
 // service dependency order, etc.).
 
 // StackPs returns "docker compose ps" output for the configured stack.
+// composeServiceNames returns every service name defined in the compose
+// file, using "docker compose config --services" (fast, no side effects).
+func composeServiceNames(composeFile string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := composeCmd(ctx, stackFileArgs(composeFile), "config", "--services").CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("%s", stripDockerOutput(string(out)))
+	}
+	var names []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if n := strings.TrimSpace(line); n != "" {
+			names = append(names, n)
+		}
+	}
+	return names, nil
+}
+
+// servicesExcluding returns every service name EXCEPT selfService. Used so
+// bulk stack operations that recreate or restart containers never target
+// PrestoBack's own container — see the detailed explanation on StackUp.
+func servicesExcluding(all []string, selfService string) []string {
+	if selfService == "" {
+		return all
+	}
+	var out []string
+	for _, n := range all {
+		if n != selfService {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 func StackPs(composeFile string) (string, error) {
 	if composeFile == "" {
 		return "", fmt.Errorf("no compose file configured (PRESTOBACK_COMPOSE_FILE)")
@@ -1209,7 +1243,11 @@ func StackPs(composeFile string) (string, error) {
 
 // StackUp runs "docker compose up -d" for the whole stack — creates/starts
 // any service that isn't running, leaves running services untouched.
-func StackUp(composeFile string, emit func(string)) error {
+//
+// selfName is PrestoBack's own container/service name (PRESTOBACK_CONTAINER).
+// It is ALWAYS excluded from the target service list — see the detailed
+// explanation below for why this is not optional.
+func StackUp(composeFile, selfName string, emit func(string)) error {
 	if composeFile == "" {
 		return fmt.Errorf("no compose file configured (PRESTOBACK_COMPOSE_FILE)")
 	}
@@ -1219,7 +1257,32 @@ func StackUp(composeFile string, emit func(string)) error {
 	// Self-heal: clean up any containers stranded by a previous interrupted
 	// recreate before starting a new one — see CleanupStaleRenames doc comment.
 	CleanupStaleRenames(emit)
-	emit("Running: docker compose up -d…")
+
+	// ── Why PrestoBack must exclude itself from "up -d" ─────────────────────
+	// PrestoBack's own container is a service in this same compose file. If
+	// "up -d" runs with no explicit service list, Compose eventually reaches
+	// the prestoback service and tries to stop/recreate it — but that
+	// container is the one CURRENTLY RUNNING this exact "docker compose"
+	// invocation. Stopping it kills the compose CLI process itself mid-run,
+	// aborting the ENTIRE "up" for every service compose hadn't reached yet.
+	// This is exactly what produced "only prestoback ends up running,
+	// everything else stays stopped, and prestoback itself gets orphaned" —
+	// the operation was decapitating itself partway through.
+	//
+	// Fix: explicitly list every service EXCEPT prestoback. PrestoBack's own
+	// lifecycle is handled separately by SelfUpdate (via /selfupdate), which
+	// uses a detached helper container specifically so it survives
+	// prestoback stopping/restarting.
+	services, svcErr := composeServiceNames(composeFile)
+	if svcErr != nil {
+		return fmt.Errorf("could not list compose services: %w", svcErr)
+	}
+	targets := servicesExcluding(services, selfName)
+	if len(targets) == 0 {
+		return fmt.Errorf("no services to bring up (compose file only contains %q)", selfName)
+	}
+	emit(fmt.Sprintf("Running: docker compose up -d (%d services, excluding %s)…", len(targets), selfName))
+
 	// 20 minutes — a multi-service stack (esp. with immich-sized images) can
 	// legitimately take this long to recreate everything. The old 5-minute
 	// timeout was firing mid-recreate and killing compose between its
@@ -1232,15 +1295,13 @@ func StackUp(composeFile string, emit func(string)) error {
 	// Compose the exact same view of the project it always has, it correctly
 	// recognizes every existing container as its own and only touches what
 	// actually changed — there's nothing spurious left over to remove.
-	out, err := composeCmd(ctx, stackFileArgs(composeFile), "up", "-d").CombinedOutput()
+	upArgs := append([]string{"up", "-d"}, targets...)
+	out, err := composeCmd(ctx, stackFileArgs(composeFile), upArgs...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s", stripDockerOutput(string(out)))
 	}
 	// Second cleanup pass: catches any containers compose renamed during THIS
-	// run but failed to remove — including prestoback itself (compose stops
-	// the old prestoback to recreate it, which kills this process before it
-	// can do its own cleanup; only the NEW prestoback can clean up the old
-	// one, which it does at startup via CleanupStaleRenames in NewServer).
+	// run but failed to remove.
 	CleanupStaleRenames(emit)
 	emit("Stack up ✓")
 	return nil
@@ -1270,17 +1331,29 @@ func StackDown(composeFile string, emit func(string)) error {
 
 // StackRestart runs "docker compose restart" — restarts every running
 // service in place without recreating containers.
-func StackRestart(composeFile string, emit func(string)) error {
+//
+// selfName is excluded here too: "restart" stops then starts the SAME
+// container, and since that container is running this very compose CLI
+// invocation, restarting it kills the process reporting the operation's
+// result mid-run (docker's restart:unless-stopped policy would bring it
+// back, but the "Stack restart ✓" confirmation would never arrive).
+func StackRestart(composeFile, selfName string, emit func(string)) error {
 	if composeFile == "" {
 		return fmt.Errorf("no compose file configured (PRESTOBACK_COMPOSE_FILE)")
 	}
 	if _, err := os.Stat(composeFile); err != nil {
 		return fmt.Errorf("compose file not accessible inside this container: %w", err)
 	}
-	emit("Running: docker compose restart…")
+	services, svcErr := composeServiceNames(composeFile)
+	if svcErr != nil {
+		return fmt.Errorf("could not list compose services: %w", svcErr)
+	}
+	targets := servicesExcluding(services, selfName)
+	emit(fmt.Sprintf("Running: docker compose restart (%d services, excluding %s)…", len(targets), selfName))
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	out, err := composeCmd(ctx, stackFileArgs(composeFile), "restart").CombinedOutput()
+	restartArgs := append([]string{"restart"}, targets...)
+	out, err := composeCmd(ctx, stackFileArgs(composeFile), restartArgs...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s", stripDockerOutput(string(out)))
 	}
@@ -1293,14 +1366,19 @@ func StackRestart(composeFile string, emit func(string)) error {
 // This is the compose-native equivalent of /update all, and is tried as a
 // single atomic operation rather than looping UpdateContainer per-service —
 // faster for stacks with many services since compose pulls in parallel.
-func StackPull(composeFile string, emit func(string)) error {
+//
+// selfName is excluded from the recreate ("up -d") phase for the same
+// self-decapitation reason as StackUp — pulling the prestoback image is
+// harmless (no container is touched), but recreating it here would still
+// kill this process mid-run. Self-updates go through /selfupdate instead.
+func StackPull(composeFile, selfName string, emit func(string)) error {
 	if composeFile == "" {
 		return fmt.Errorf("no compose file configured (PRESTOBACK_COMPOSE_FILE)")
 	}
 	if _, err := os.Stat(composeFile); err != nil {
 		return fmt.Errorf("compose file not accessible inside this container: %w", err)
 	}
-	// Self-heal before doing anything — see cleanupStaleRenames doc comment.
+	// Self-heal before doing anything — see CleanupStaleRenames doc comment.
 	CleanupStaleRenames(emit)
 	fileArgs := stackFileArgs(composeFile)
 
@@ -1313,11 +1391,18 @@ func StackPull(composeFile string, emit func(string)) error {
 	}
 	emit("Pull complete — recreating changed containers…")
 
+	services, svcErr := composeServiceNames(composeFile)
+	if svcErr != nil {
+		return fmt.Errorf("could not list compose services: %w", svcErr)
+	}
+	targets := servicesExcluding(services, selfName)
+
 	// 20 minutes for the same reason as StackUp: killing compose mid-recreate
 	// is what produces {id}_{name} orphans, so it's better to wait it out.
 	upCtx, upCancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer upCancel()
-	upOut, upErr := composeCmd(upCtx, fileArgs, "up", "-d").CombinedOutput()
+	upArgs := append([]string{"up", "-d"}, targets...)
+	upOut, upErr := composeCmd(upCtx, fileArgs, upArgs...).CombinedOutput()
 	if upErr != nil {
 		return fmt.Errorf("up failed: %s", stripDockerOutput(string(upOut)))
 	}
