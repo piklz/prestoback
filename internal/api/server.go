@@ -89,6 +89,18 @@ func NewServer(cfg *config.Config, image, selfName string) *Server {
 	go s.runTelegramBot()
 	go s.diskMonitorLoop()
 	go s.updateCheckLoop()
+	// Clean up any {hash}_{name} containers left over from a previous
+	// interrupted compose recreate — including prestoback itself (compose
+	// stops the old prestoback to recreate it, killing the compose process
+	// before it can delete the old container; only the new prestoback can
+	// clean it up, which is now). Brief sleep so Docker has finished
+	// starting us before we start poking at the container list.
+	go func() {
+		time.Sleep(8 * time.Second)
+		backup.CleanupStaleRenames(func(msg string) {
+			log.Printf("[startup-cleanup] %s", msg)
+		})
+	}()
 	return s
 }
 
@@ -3214,6 +3226,21 @@ func (s *Server) runStackOpLocked(tgCfg notify.TelegramConfig, composeFile, op s
 	emit := func(msg string) {
 		log.Printf("[stack:%s] %s", op, msg)
 		s.engine.EmitLog("_stack", msg)
+	}
+
+	// PrestoBack itself is in the compose stack. Any op that recreates or
+	// stops containers (up, down, pull) will stop the old prestoback process
+	// mid-operation — meaning this goroutine will be killed before it can
+	// send a "complete" message. Warn the user now, before we start, so they
+	// know to expect the Telegram thread to go quiet and then see the startup
+	// "🟢 PrestoBack online" notification when the new instance comes up.
+	// restart is safe — it doesn't recreate containers, just sends SIGTERM.
+	if op == "up" || op == "down" || op == "pull" {
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+			"⚙️ _Note: PrestoBack is part of this stack — it may restart during `%s`\\. "+
+				"If Telegram goes quiet, watch for the_ 🟢 _startup notification as confirmation it completed\\._",
+			op,
+		))
 	}
 
 	start := time.Now()
