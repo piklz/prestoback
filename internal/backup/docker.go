@@ -1079,11 +1079,10 @@ func UpdateContainer(c ContainerInfo, composeFile string, emit func(string)) Con
 		emit(fmt.Sprintf("Recreating %s via compose (service: %s)…", c.Name, service))
 		upCtx, upCancel := context.WithTimeout(context.Background(), composeUpTimeout)
 		defer upCancel()
-		// stackFileArgs handles both --env-file discovery AND forcing the
-		// correct -p project name (detected from the existing container's own
-		// labels) — critical so a single-container update doesn't ALSO trigger
-		// the mass-rename-to-orphan behavior described in stackFileArgs's doc
-		// comment. Building fileArgs manually here previously skipped that.
+		// stackFileArgs uses --project-directory so this single-container
+		// update sees the exact same project context as /stack commands and
+		// as a manual "cd ~/presto && docker compose up -d" — same .env
+		// loading, same env_file resolution, same config hash.
 		fileArgs := stackFileArgs(composeFile)
 		// --force-recreate: recreate even if config hash looks unchanged — after
 		// a pull the image digest changed but compose's config hash may not have,
@@ -1229,11 +1228,11 @@ func StackUp(composeFile string, emit func(string)) error {
 	// is worse than waiting longer.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
-	// --remove-orphans: removes containers for services that are no longer in
-	// the compose file. Without this, removed or renamed services leave
-	// running containers that show up with hash-prefixed names like
-	// "ae5f67985bd9_immich_postgres" and pollute `docker ps` output.
-	out, err := composeCmd(ctx, stackFileArgs(composeFile), "up", "-d", "--remove-orphans").CombinedOutput()
+	// No --remove-orphans here by design: with --project-directory giving
+	// Compose the exact same view of the project it always has, it correctly
+	// recognizes every existing container as its own and only touches what
+	// actually changed — there's nothing spurious left over to remove.
+	out, err := composeCmd(ctx, stackFileArgs(composeFile), "up", "-d").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s", stripDockerOutput(string(out)))
 	}
@@ -1261,7 +1260,7 @@ func StackDown(composeFile string, emit func(string)) error {
 	emit("Running: docker compose down…")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	out, err := composeCmd(ctx, stackFileArgs(composeFile), "down", "--remove-orphans").CombinedOutput()
+	out, err := composeCmd(ctx, stackFileArgs(composeFile), "down").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s", stripDockerOutput(string(out)))
 	}
@@ -1318,7 +1317,7 @@ func StackPull(composeFile string, emit func(string)) error {
 	// is what produces {id}_{name} orphans, so it's better to wait it out.
 	upCtx, upCancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer upCancel()
-	upOut, upErr := composeCmd(upCtx, fileArgs, "up", "-d", "--remove-orphans").CombinedOutput()
+	upOut, upErr := composeCmd(upCtx, fileArgs, "up", "-d").CombinedOutput()
 	if upErr != nil {
 		return fmt.Errorf("up failed: %s", stripDockerOutput(string(upOut)))
 	}
@@ -1328,191 +1327,36 @@ func StackPull(composeFile string, emit func(string)) error {
 	return nil
 }
 
-// stackFileArgs builds the -f / --env-file args shared by all stack operations.
+// stackFileArgs builds the compose invocation args using --project-directory.
 //
-// IMPORTANT: this only finds the top-level .env next to docker-compose.yml.
-// If your stack uses per-service env_file: references (e.g.
-// "./services/caddy/caddy.env"), Docker Compose resolves those relative to
-// the project directory AT PARSE TIME, from inside this container. If only
-// docker-compose.yml itself is mounted, those nested .env files don't exist
-// inside the container, every variable they'd provide silently becomes an
-// empty string, and any volume spec built from one of those vars (e.g.
-// "${DB_DATA_LOCATION}:/data") becomes invalid (":/data" — empty section
-// between colons). The only robust fix is mounting the WHOLE project
-// directory at the same host path, not just the single compose file — see
-// ProjectDirIssue for the pre-flight check that catches this early.
+// THE FIX — why --project-directory and nothing else:
+// Running "docker compose up -d" manually from the project's own working
+// directory (cd ~/presto && docker compose up -d) NEVER produces orphans,
+// because Compose:
+//  1. Loads .env automatically from the current directory
+//  2. Resolves every per-service "env_file: ./services/<app>/<app>.env"
+//     path relative to that same directory
+//  3. Computes the exact same project name and config hash it always has
+//     for this stack, so it sees zero unexpected changes and recreates
+//     nothing that hasn't actually changed
 //
-// -p / --project-name is ALWAYS forced to the project name detected from
-// the existing containers themselves (see detectProjectName). This is the
-// fix for the mass-orphan bug: without an explicit -p, compose infers the
-// project name from the basename of the compose file's directory AS SEEN
-// INSIDE THIS CONTAINER. If that differs even slightly from whatever name
-// the containers were originally created under (different mount path,
-// trailing slash, symlink, or an explicit -p used by a different tool like
-// a bash wrapper), compose considers every single existing container
-// "not mine" and renames ALL of them out of the way to create fresh ones —
-// which is exactly the "every container becomes {id}_{name}" pattern.
-// Forcing the same project name compose originally used makes it correctly
-// recognize and in-place-recreate only what actually changed.
+// Every previous approach here (manually passing -f with an absolute path,
+// forcing -p from a detected label, merging env files into a synthetic
+// temp file, adding --remove-orphans as a cleanup band-aid) was working
+// around symptoms of the same root problem: none of those reproduce cwd
+// semantics, so Compose's computed config differs slightly from what it
+// used originally, some services look "changed" when they aren't, and a
+// recreate gets triggered where none was needed — which is what produces
+// {container_id}_{service} orphans when anything interrupts it.
+//
+// --project-directory <dir> makes Compose behave EXACTLY as if invoked
+// from inside that directory — same .env loading, same env_file
+// resolution, same project name, same config hash — without needing a
+// real shell or actually changing this process's working directory. This
+// is the single correct fix; everything else in this list becomes
+// unnecessary once it's in place.
 func stackFileArgs(composeFile string) []string {
-	args := []string{"-f", composeFile}
-	if project := detectProjectName(composeFile); project != "" {
-		args = append([]string{"-p", project}, args...)
-	}
-	if merged := mergeAllEnvFiles(composeFile); merged != "" {
-		args = append(args, "--env-file", merged)
-	}
-	return args
-}
-
-// mergeAllEnvFiles combines the top-level .env with every per-service
-// services/<app>/<app>.env file into a single file at a fixed path, and
-// returns that path (or "" if there's nothing to merge).
-//
-// WHY THIS IS NECESSARY:
-// docker compose's ${VAR} substitution is a PARSE-TIME text operation done
-// by the compose CLI itself, using only the OS environment or --env-file —
-// it never reads a service's own env_file: entries, because those are
-// loaded by the CONTAINER at runtime, well after substitution already
-// happened. In this project's layout
-// (~/presto/.env + ~/presto/services/<app>/<app>.env), a variable shared
-// between two services — e.g. DB_PASSWORD needed by both immich_postgres
-// and immich_server — only works if it lives in the TOP-LEVEL .env. If it
-// was instead only placed in one service's own .env, every OTHER service
-// referencing that same "${VAR}" sees an empty string. Compose only WARNS
-// about this ("variable is not set — defaulting to a blank string") and
-// keeps going — it does not abort — so the empty string then flows into
-// whatever it was used for (commonly a volume path like
-// "${UPLOAD_LOCATION}:/data"), producing an invalid bind spec ("empty
-// section between colons") that fails at container CREATE time. Compose's
-// own recreate procedure has already renamed the old container out of the
-// way by that point, the create then fails, and the old container is left
-// stranded with no replacement — which is exactly the selective
-// "some services orphaned with no clean replacement" pattern observed.
-//
-// Merging every known env file together (top-level .env takes priority on
-// key collisions, since shared/canonical values conventionally live there)
-// means every "${VAR}" in the compose file resolves to its real value
-// regardless of which specific file it happens to be defined in.
-func mergeAllEnvFiles(composeFile string) string {
-	projectDir := filepath.Dir(composeFile)
-	var files []string
-
-	if top := filepath.Join(projectDir, ".env"); fileExists(top) {
-		files = append(files, top)
-	}
-
-	servicesDir := filepath.Join(projectDir, "services")
-	if entries, err := os.ReadDir(servicesDir); err == nil {
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
-			}
-			// Expected: services/<app>/<app>.env
-			candidate := filepath.Join(servicesDir, e.Name(), e.Name()+".env")
-			if fileExists(candidate) {
-				files = append(files, candidate)
-				continue
-			}
-			// Fallback: any single *.env file directly inside the app's dir,
-			// in case naming doesn't exactly match the directory name.
-			if subEntries, err2 := os.ReadDir(filepath.Join(servicesDir, e.Name())); err2 == nil {
-				for _, se := range subEntries {
-					if strings.HasSuffix(se.Name(), ".env") {
-						files = append(files, filepath.Join(servicesDir, e.Name(), se.Name()))
-						break
-					}
-				}
-			}
-		}
-	}
-
-	if len(files) == 0 {
-		return ""
-	}
-
-	// Fixed path — overwritten on every call, so nothing accumulates in /tmp.
-	const mergedPath = "/tmp/prestoback-merged.env"
-	f, err := os.Create(mergedPath)
-	if err != nil {
-		log.Printf("[docker] mergeAllEnvFiles: could not create %s: %v", mergedPath, err)
-		return ""
-	}
-	defer f.Close()
-
-	// First file to define a key wins — top-level .env is first in the list,
-	// so shared/canonical values there take priority over any per-service
-	// duplicate definition.
-	seen := map[string]bool{}
-	for _, path := range files {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(string(data), "\n") {
-			trimmed := strings.TrimSpace(line)
-			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-				continue
-			}
-			key := trimmed
-			if idx := strings.Index(trimmed, "="); idx > 0 {
-				key = trimmed[:idx]
-			}
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			fmt.Fprintln(f, trimmed)
-		}
-	}
-	log.Printf("[docker] merged %d env file(s) into %s (%d unique variables)", len(files), mergedPath, len(seen))
-	return mergedPath
-}
-
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}
-
-// detectProjectName reads the com.docker.compose.project label off any
-// EXISTING container that has one, so we can force docker compose to use
-// that exact same project name via -p. This avoids relying on compose's own
-// name-inference (basename of the compose file's directory), which can
-// silently diverge from the name used when the stack was first created —
-// causing compose to treat the whole existing stack as foreign and mass-
-// rename every container on every "up". See stackFileArgs doc comment.
-//
-// Returns "" if no existing container has the label (e.g. genuinely first
-// run, nothing created yet) — in that case compose's own inference is fine
-// because there's nothing pre-existing to conflict with.
-func detectProjectName(composeFile string) string {
-	out, err := exec.Command("docker", "ps", "-a",
-		"--filter", "label=com.docker.compose.project",
-		"--format", `{{.Label "com.docker.compose.project"}}`,
-	).Output()
-	if err != nil {
-		return ""
-	}
-	counts := map[string]int{}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		name := strings.TrimSpace(line)
-		if name != "" {
-			counts[name]++
-		}
-	}
-	// Pick whichever project name the majority of existing containers agree
-	// on — normally there's only one, but this is defensive against stray
-	// containers from an unrelated compose project also running on the host.
-	best, bestCount := "", 0
-	for name, n := range counts {
-		if n > bestCount {
-			best, bestCount = name, n
-		}
-	}
-	if best != "" {
-		log.Printf("[docker] detected existing compose project name: %q (from %d containers)", best, bestCount)
-	}
-	return best
+	return []string{"--project-directory", filepath.Dir(composeFile), "-f", composeFile}
 }
 
 // CleanupStaleRenames finds and removes containers left over from a
