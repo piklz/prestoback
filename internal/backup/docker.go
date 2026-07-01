@@ -1079,12 +1079,12 @@ func UpdateContainer(c ContainerInfo, composeFile string, emit func(string)) Con
 		emit(fmt.Sprintf("Recreating %s via compose (service: %s)…", c.Name, service))
 		upCtx, upCancel := context.WithTimeout(context.Background(), composeUpTimeout)
 		defer upCancel()
-		fileArgs := []string{"-f", composeFile}
-		envFile := filepath.Join(filepath.Dir(composeFile), ".env")
-		if _, envErr := os.Stat(envFile); envErr == nil {
-			fileArgs = append(fileArgs, "--env-file", envFile)
-			log.Printf("[docker] using env-file: %s", envFile)
-		}
+		// stackFileArgs handles both --env-file discovery AND forcing the
+		// correct -p project name (detected from the existing container's own
+		// labels) — critical so a single-container update doesn't ALSO trigger
+		// the mass-rename-to-orphan behavior described in stackFileArgs's doc
+		// comment. Building fileArgs manually here previously skipped that.
+		fileArgs := stackFileArgs(composeFile)
 		// --force-recreate: recreate even if config hash looks unchanged — after
 		// a pull the image digest changed but compose's config hash may not have,
 		// causing it to leave the old container running. Docksentry uses this too.
@@ -1333,13 +1333,70 @@ func StackPull(composeFile string, emit func(string)) error {
 // between colons). The only robust fix is mounting the WHOLE project
 // directory at the same host path, not just the single compose file — see
 // ProjectDirIssue for the pre-flight check that catches this early.
+//
+// -p / --project-name is ALWAYS forced to the project name detected from
+// the existing containers themselves (see detectProjectName). This is the
+// fix for the mass-orphan bug: without an explicit -p, compose infers the
+// project name from the basename of the compose file's directory AS SEEN
+// INSIDE THIS CONTAINER. If that differs even slightly from whatever name
+// the containers were originally created under (different mount path,
+// trailing slash, symlink, or an explicit -p used by a different tool like
+// a bash wrapper), compose considers every single existing container
+// "not mine" and renames ALL of them out of the way to create fresh ones —
+// which is exactly the "every container becomes {id}_{name}" pattern.
+// Forcing the same project name compose originally used makes it correctly
+// recognize and in-place-recreate only what actually changed.
 func stackFileArgs(composeFile string) []string {
 	args := []string{"-f", composeFile}
+	if project := detectProjectName(composeFile); project != "" {
+		args = append([]string{"-p", project}, args...)
+	}
 	envFile := filepath.Join(filepath.Dir(composeFile), ".env")
 	if _, err := os.Stat(envFile); err == nil {
 		args = append(args, "--env-file", envFile)
 	}
 	return args
+}
+
+// detectProjectName reads the com.docker.compose.project label off any
+// EXISTING container that has one, so we can force docker compose to use
+// that exact same project name via -p. This avoids relying on compose's own
+// name-inference (basename of the compose file's directory), which can
+// silently diverge from the name used when the stack was first created —
+// causing compose to treat the whole existing stack as foreign and mass-
+// rename every container on every "up". See stackFileArgs doc comment.
+//
+// Returns "" if no existing container has the label (e.g. genuinely first
+// run, nothing created yet) — in that case compose's own inference is fine
+// because there's nothing pre-existing to conflict with.
+func detectProjectName(composeFile string) string {
+	out, err := exec.Command("docker", "ps", "-a",
+		"--filter", "label=com.docker.compose.project",
+		"--format", `{{.Label "com.docker.compose.project"}}`,
+	).Output()
+	if err != nil {
+		return ""
+	}
+	counts := map[string]int{}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		name := strings.TrimSpace(line)
+		if name != "" {
+			counts[name]++
+		}
+	}
+	// Pick whichever project name the majority of existing containers agree
+	// on — normally there's only one, but this is defensive against stray
+	// containers from an unrelated compose project also running on the host.
+	best, bestCount := "", 0
+	for name, n := range counts {
+		if n > bestCount {
+			best, bestCount = name, n
+		}
+	}
+	if best != "" {
+		log.Printf("[docker] detected existing compose project name: %q (from %d containers)", best, bestCount)
+	}
+	return best
 }
 
 // cleanupStaleRenames finds and removes containers left over from a
