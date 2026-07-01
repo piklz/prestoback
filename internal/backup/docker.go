@@ -1218,8 +1218,8 @@ func StackUp(composeFile string, emit func(string)) error {
 		return fmt.Errorf("compose file not accessible inside this container: %w", err)
 	}
 	// Self-heal: clean up any containers stranded by a previous interrupted
-	// recreate before starting a new one — see cleanupStaleRenames doc comment.
-	cleanupStaleRenames(emit)
+	// recreate before starting a new one — see CleanupStaleRenames doc comment.
+	CleanupStaleRenames(emit)
 	emit("Running: docker compose up -d…")
 	// 20 minutes — a multi-service stack (esp. with immich-sized images) can
 	// legitimately take this long to recreate everything. The old 5-minute
@@ -1237,6 +1237,12 @@ func StackUp(composeFile string, emit func(string)) error {
 	if err != nil {
 		return fmt.Errorf("%s", stripDockerOutput(string(out)))
 	}
+	// Second cleanup pass: catches any containers compose renamed during THIS
+	// run but failed to remove — including prestoback itself (compose stops
+	// the old prestoback to recreate it, which kills this process before it
+	// can do its own cleanup; only the NEW prestoback can clean up the old
+	// one, which it does at startup via CleanupStaleRenames in NewServer).
+	CleanupStaleRenames(emit)
 	emit("Stack up ✓")
 	return nil
 }
@@ -1296,7 +1302,7 @@ func StackPull(composeFile string, emit func(string)) error {
 		return fmt.Errorf("compose file not accessible inside this container: %w", err)
 	}
 	// Self-heal before doing anything — see cleanupStaleRenames doc comment.
-	cleanupStaleRenames(emit)
+	CleanupStaleRenames(emit)
 	fileArgs := stackFileArgs(composeFile)
 
 	emit("Pulling latest images for all services…")
@@ -1316,6 +1322,8 @@ func StackPull(composeFile string, emit func(string)) error {
 	if upErr != nil {
 		return fmt.Errorf("up failed: %s", stripDockerOutput(string(upOut)))
 	}
+	// Second cleanup pass — same reasoning as StackUp.
+	CleanupStaleRenames(emit)
 	emit("Stack updated ✓")
 	return nil
 }
@@ -1507,7 +1515,7 @@ func detectProjectName(composeFile string) string {
 	return best
 }
 
-// cleanupStaleRenames finds and removes containers left over from a
+// CleanupStaleRenames finds and removes containers left over from a
 // docker compose recreate sequence that was interrupted mid-flight (e.g. by
 // a timeout firing while compose was between its internal "rename old
 // container out of the way" and "remove old container" steps).
@@ -1526,7 +1534,7 @@ func detectProjectName(composeFile string) string {
 // same compose project+service labels — i.e. the recreate actually
 // succeeded and this is provably the abandoned leftover, not a container
 // that's still mid-recreate.
-func cleanupStaleRenames(emit func(string)) {
+func CleanupStaleRenames(emit func(string)) {
 	out, err := exec.Command("docker", "ps", "-a",
 		"--format", `{"id":"{{.ID}}","name":"{{.Names}}","labels":"{{.Labels}}"}`,
 	).Output()
@@ -1583,7 +1591,7 @@ func cleanupStaleRenames(emit func(string)) {
 		if emit != nil {
 			emit(fmt.Sprintf("Removing stale interrupted-recreate container %s…", e.Name))
 		}
-		log.Printf("[docker] cleanupStaleRenames: removing %s (%s) — confirmed replaced by a running container for %s/%s",
+		log.Printf("[docker] CleanupStaleRenames: removing %s (%s) — confirmed replaced by a running container for %s/%s",
 			e.Name, e.ID, project, service)
 		_ = exec.Command("docker", "rm", "-f", e.ID).Run()
 	}
@@ -1593,6 +1601,11 @@ func cleanupStaleRenames(emit func(string)) {
 // compose recreate: a 12-character hex container ID followed by an
 // underscore and the original name, e.g. "a68df191956f_homebox".
 var staleRenamePattern = regexp.MustCompile(`^[a-f0-9]{12}_`)
+
+// IsOrphanName reports whether name looks like a stale compose-recreate
+// orphan. Exported so pickers in server.go can filter them without importing
+// the regex directly.
+func IsOrphanName(name string) bool { return staleRenamePattern.MatchString(name) }
 
 // labelValue extracts a single label's value from Docker CLI's
 // comma-separated "--format {{.Labels}}" output (e.g. "a=1,b=2,c=3").
