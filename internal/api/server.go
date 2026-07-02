@@ -139,6 +139,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/update/check", s.authJWT(s.handleUpdateCheck))
 	s.mux.HandleFunc("/api/update/apply", s.authJWT(s.handleUpdateApply))
 	s.mux.HandleFunc("/api/cron/preview", s.authJWT(s.handleCronPreview))
+	s.mux.HandleFunc("/api/maintenance", s.authJWT(s.handleMaintenance))
 }
 
 // ── SSE ───────────────────────────────────────────────────────────────────────
@@ -606,6 +607,62 @@ func (s *Server) getMaintUntil() time.Time {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	return s.maintUntil
+}
+
+// handleMaintenance exposes the same maintenance-mode state the Telegram
+// /maintenance command controls, so the dashboard can display and manage it
+// too — previously this was Telegram-only, so the "Edit Application" modal
+// (and the rest of the UI) had no way to know a global maintenance window
+// was active, even though it fully overrides each app's own Pinned setting.
+//
+//	GET  /api/maintenance         → {active, until, remaining_seconds}
+//	POST /api/maintenance         → {duration: "2h"|"1d"|"1w"|"on"|"off"}
+func (s *Server) handleMaintenance(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		until := s.getMaintUntil()
+		active := !until.IsZero() && time.Now().Before(until)
+		resp := map[string]any{"active": active}
+		if active {
+			resp["until"] = until.UTC().Format(time.RFC3339)
+			resp["remaining_seconds"] = int(time.Until(until).Seconds())
+		}
+		respond(w, 200, resp)
+
+	case http.MethodPost:
+		var req struct {
+			Duration string `json:"duration"`
+		}
+		if err := parseJSON(r, &req); err != nil {
+			errOut(w, 400, "invalid JSON: "+err.Error())
+			return
+		}
+		lower := strings.ToLower(strings.TrimSpace(req.Duration))
+		if lower == "" || lower == "off" {
+			s.stateMu.Lock()
+			s.maintUntil = time.Time{}
+			s.stateMu.Unlock()
+			respond(w, 200, map[string]any{"active": false})
+			return
+		}
+		dur, ok := parseMaintDuration(lower)
+		if !ok {
+			errOut(w, 400, "invalid duration — use e.g. \"2h\", \"1d\", \"1w\", or \"on\"")
+			return
+		}
+		until := time.Now().Add(dur)
+		s.stateMu.Lock()
+		s.maintUntil = until
+		s.stateMu.Unlock()
+		respond(w, 200, map[string]any{
+			"active":            true,
+			"until":             until.UTC().Format(time.RFC3339),
+			"remaining_seconds": int(dur.Seconds()),
+		})
+
+	default:
+		errOut(w, 405, "method not allowed")
+	}
 }
 
 // parseMaintDuration parses duration strings like "2h", "1d", "2day", "1w",
@@ -3149,7 +3206,7 @@ func (s *Server) handleStackCommand(tgCfg notify.TelegramConfig, sub string) {
 		// destructive-ish ops get a confirm step via callback for "down"
 		if sub == "down" {
 			_ = notify.SendRawWithButtons(tgCfg,
-				"⚠️ *Stack Down*\nThis stops and removes ALL containers in the stack \\(named volumes are preserved\\)\\. Continue?",
+				"⚠️ *Stack Down*\nThis stops and removes every container EXCEPT PrestoBack itself \\(named volumes are preserved\\)\\. PrestoBack stays running so you can `/stack up` again from anywhere\\. Continue?",
 				[]notify.ButtonAction{
 					{Label: "✅ Yes, take the stack down", Data: "stackdown:confirm"},
 					{Label: "❌ Cancel", Data: "stackdown:cancel"},
@@ -3224,7 +3281,9 @@ func (s *Server) runStackOpLocked(tgCfg notify.TelegramConfig, composeFile, op s
 		// target list — see StackUp's doc comment for why this is required.
 		err = backup.StackUp(composeFile, s.selfName, emit)
 	case "down":
-		err = backup.StackDown(composeFile, emit)
+		// selfName excludes PrestoBack's own container — see StackDown's doc
+		// comment for why the management tool must survive its own "down".
+		err = backup.StackDown(composeFile, s.selfName, emit)
 	case "restart":
 		err = backup.StackRestart(composeFile, s.selfName, emit)
 	case "pull":

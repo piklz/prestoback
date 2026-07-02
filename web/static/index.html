@@ -382,6 +382,16 @@ select.fi{cursor:pointer}
     <div><div class="pt">Dashboard</div><div class="ps">Overview &amp; live activity</div></div>
     <div class="ha"><button class="btn btn-g btn-sm" onclick="loadAll()">↺ Refresh</button></div>
   </div>
+  <div id="maint-banner" style="display:none;background:var(--amber2,#3a2a0f);border:1px solid var(--amber,#f0a020);border-radius:8px;padding:10px 14px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:12px">
+    <div style="display:flex;align-items:center;gap:10px">
+      <span style="font-size:18px">🔧</span>
+      <div>
+        <div style="font-weight:600;color:var(--amber,#f0a020)">Maintenance mode active</div>
+        <div style="font-size:12px;color:var(--txt3)" id="maint-banner-detail">All scheduled backups are paused</div>
+      </div>
+    </div>
+    <button class="btn btn-g btn-sm" onclick="cancelMaintenance()">End now</button>
+  </div>
   <div class="sec">
     <div class="stats">
       <div class="stat" onclick="V('apps')" title="Go to Applications"><div class="sl">Applications</div><div class="sv a" id="s-apps">0</div></div>
@@ -768,6 +778,9 @@ select.fi{cursor:pointer}
           </div>
         </div>
         <div class="ftog" onclick="togEditPin()"><div class="ftog-sw" id="edit-pin-tog"><div class="ftog-kn"></div></div><div class="ftog-lbl">Pin / freeze (skip scheduled backups)</div></div>
+        <div id="edit-maint-note" style="display:none;margin-top:8px;font-size:12px;color:var(--amber,#f0a020);align-items:center;gap:6px">
+          <span>🔧</span><span id="edit-maint-note-text"></span>
+        </div>
       </div>
     </div>
     <div class="mf"><button class="btn btn-g" onclick="CM('m-edit-app')">Cancel</button><button class="btn btn-p" onclick="submitEditApp()">Save Changes</button></div>
@@ -1102,6 +1115,13 @@ async function loadStatus() {
       const builtDate = new Date(d.built_at);
       document.getElementById('upd-built').textContent = isNaN(builtDate) ? d.built_at : builtDate.toLocaleString();
     }
+    // Maintenance mode — global window set via /maintenance (Telegram) or
+    // the dashboard itself. Stored on S so the Edit Application modal can
+    // also show it alongside that app's own Pin/freeze toggle, since the
+    // two are independent: maintenance overrides ALL schedules regardless
+    // of any single app's pinned state.
+    S.maintUntil = d.maintenance_until || '';
+    renderMaintBanner();
     // Disk space — dashboard stat
     if (d.disk_total_bytes && d.disk_total_bytes > 0) {
       const free = d.disk_free_bytes, total = d.disk_total_bytes;
@@ -1144,6 +1164,41 @@ async function loadStatus() {
     const secUser = document.getElementById('sec-username');
     if (secUser) secUser.textContent = S.username || '—';
   } catch {}
+}
+
+// Shows/hides the dashboard maintenance banner and fills in the expiry
+// detail text. Called after every loadStatus() poll so it stays live.
+function renderMaintBanner() {
+  const banner = document.getElementById('maint-banner');
+  const detail = document.getElementById('maint-banner-detail');
+  if (!banner) return;
+  if (!S.maintUntil) {
+    banner.style.display = 'none';
+    return;
+  }
+  const until = new Date(S.maintUntil);
+  if (isNaN(until) || until <= new Date()) {
+    banner.style.display = 'none';
+    return;
+  }
+  banner.style.display = 'flex';
+  if (detail) {
+    detail.textContent = 'All scheduled backups paused until ' + until.toLocaleString() +
+      ' — this overrides every app\'s own Pin/freeze setting';
+  }
+}
+
+// Ends the current global maintenance window immediately, from the
+// dashboard — equivalent to sending "/maintenance off" in Telegram.
+async function cancelMaintenance() {
+  try {
+    await api('/api/maintenance', { method: 'POST', body: JSON.stringify({ duration: 'off' }) });
+    S.maintUntil = '';
+    renderMaintBanner();
+    toast('Maintenance mode ended');
+  } catch (e) {
+    toast('Could not end maintenance mode: ' + (e.message || e), 'error');
+  }
 }
 
 // ════════════════════ Reality probe ════════════════════
@@ -1369,6 +1424,17 @@ function openEditApp(id) {
   S.editSchedOn=a.schedule?.enabled||false; setTog('edit-sched-tog',S.editSchedOn);
   document.getElementById('edit-sched-fields').style.display=S.editSchedOn?'':'none';
   S.editPinOn=a.pinned||false; setTog('edit-pin-tog',S.editPinOn);
+  const maintNote = document.getElementById('edit-maint-note');
+  if (maintNote) {
+    const until = S.maintUntil ? new Date(S.maintUntil) : null;
+    const maintActive = until && !isNaN(until) && until > new Date();
+    maintNote.style.display = maintActive ? 'flex' : 'none';
+    if (maintActive) {
+      document.getElementById('edit-maint-note-text').textContent =
+        'Global maintenance mode is active until ' + until.toLocaleString() +
+        ' — schedules are paused regardless of this toggle';
+    }
+  }
   document.getElementById('ea-excludes').value=(a.excludes||[]).join('\n');
   document.getElementById('ea-prebakcmd').value=a.pre_backup_cmd||'';
   document.getElementById('ea-prebakcmd-badge').style.display=a.pre_backup_cmd?'':'none';

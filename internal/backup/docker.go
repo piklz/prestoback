@@ -1311,21 +1311,48 @@ func StackUp(composeFile, selfName string, emit func(string)) error {
 // containers (and the project's default network). Named volumes are NOT
 // removed (compose down does not remove volumes unless -v is passed, and we
 // deliberately never pass -v here — that would be data loss).
-func StackDown(composeFile string, emit func(string)) error {
+// StackDown stops and removes every service EXCEPT PrestoBack's own
+// container.
+//
+// This intentionally does NOT run "docker compose down" — that command
+// always operates on the WHOLE project with no way to exclude a single
+// service. Instead it uses "docker compose rm -f -s <services>" against an
+// explicit list (every service except selfName), which stops and removes
+// only those targets while leaving PrestoBack — and the shared network —
+// alive.
+//
+// Why exclude self here, same as StackUp/StackRestart/StackPull: if a full
+// "docker compose down" also took PrestoBack down, the Telegram bot and
+// dashboard would die along with the rest of the stack, and there would be
+// no way to bring anything back up without physically going to the Pi and
+// running a compose command by hand — defeating the entire point of a
+// remote management tool. Keeping PrestoBack alive means /stack up can
+// always be run immediately afterward to restore everything, from
+// anywhere.
+func StackDown(composeFile, selfName string, emit func(string)) error {
 	if composeFile == "" {
 		return fmt.Errorf("no compose file configured (PRESTOBACK_COMPOSE_FILE)")
 	}
 	if _, err := os.Stat(composeFile); err != nil {
 		return fmt.Errorf("compose file not accessible inside this container: %w", err)
 	}
-	emit("Running: docker compose down…")
+	services, svcErr := composeServiceNames(composeFile)
+	if svcErr != nil {
+		return fmt.Errorf("could not list compose services: %w", svcErr)
+	}
+	targets := servicesExcluding(services, selfName)
+	if len(targets) == 0 {
+		return fmt.Errorf("no services to take down (compose file only contains %q)", selfName)
+	}
+	emit(fmt.Sprintf("Running: docker compose rm -f -s (%d services, excluding %s)…", len(targets), selfName))
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	out, err := composeCmd(ctx, stackFileArgs(composeFile), "down").CombinedOutput()
+	rmArgs := append([]string{"rm", "-f", "-s"}, targets...)
+	out, err := composeCmd(ctx, stackFileArgs(composeFile), rmArgs...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s", stripDockerOutput(string(out)))
 	}
-	emit("Stack down ✓ — all containers stopped and removed (volumes preserved)")
+	emit(fmt.Sprintf("Stack down ✓ — %d containers stopped and removed (volumes preserved, %s left running so you can /stack up again)", len(targets), selfName))
 	return nil
 }
 
