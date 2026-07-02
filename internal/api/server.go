@@ -1864,7 +1864,17 @@ func (s *Server) handleBackupDownload(w http.ResponseWriter, r *http.Request, ap
 // an unverified claim. The client (see frontend) is responsible for
 // proposing that app_id, either by matching it against already-registered
 // apps, or via the Adopt Orphan flow for a brand new one.
-var backupArchiveNamePattern = regexp.MustCompile(`^[a-z0-9_]+_[a-z0-9_]+_\d{8}_\d{6}(_prerestore)?\.tar\.gz$`)
+//
+// Character class includes '-' as well as '_': volume slugs are frequently
+// derived directly from Docker volume/folder names (e.g. "homebox-data",
+// "immich-postgres"), which commonly use hyphens. Every archive PrestoBack
+// legitimately produces for such a volume was being permanently rejected by
+// this endpoint before the hyphen was added here — e.g.
+// "homebox_homebox-data_20260702_102658.tar.gz" failed validation even
+// though it's a perfectly normal, correctly-named archive; nothing on the
+// writing side was ever wrong, this check just hadn't caught up to what
+// real volume names look like.
+var backupArchiveNamePattern = regexp.MustCompile(`^[a-z0-9_-]+_[a-z0-9_-]+_\d{8}_\d{6}(_prerestore)?\.tar\.gz$`)
 
 func (s *Server) handleBackupsImport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
