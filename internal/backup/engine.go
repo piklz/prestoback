@@ -513,11 +513,29 @@ func (e *Engine) DeleteAppBackups(appID string) error {
 	return os.RemoveAll(dir)
 }
 
-// PruneBackups keeps only the newest `retain` non-prerestore backups per volume slug.
+// PruneBackups keeps only the newest `retain` non-prerestore backups per
+// volume slug, then removes any manifest.json whose referenced archives have
+// ALL since been deleted.
+//
+// BUG THIS FIXES: the original version only ever deleted .tar.gz files via
+// the loop below — it never looked at *_manifest.json at all. Manifests
+// accumulated forever regardless of retain count, which is why a directory
+// with retain:2 could show 11 manifests spanning 9 days but only 2 real
+// archives from the last 2 days: retention was correctly pruning tars the
+// whole time, it just never took the matching manifest litter with it.
+//
+// The cleanup pass below is deliberately conservative: it reads each
+// manifest's own list of archive filenames (ManifestEntry.FileName) and only
+// deletes the manifest if NONE of the files it references still exist on
+// disk. A manifest covering multiple volume slugs survives as long as any
+// one of those slugs still has a retained archive — so InspectOrphan (which
+// depends on manifests to recover app details for orphaned backup dirs)
+// keeps working correctly through partial prunes.
 func (e *Engine) PruneBackups(appID string, retain int) error {
 	if retain <= 0 {
 		retain = 5
 	}
+	dir := filepath.Join(e.backupDir, appID)
 	metas, err := e.ListBackups(appID)
 	if err != nil {
 		return err
@@ -539,6 +557,61 @@ func (e *Engine) PruneBackups(appID string, retain int) error {
 		for _, m := range list[retain:] {
 			log.Printf("[prune] removing old backup: %s (%s)", m.FilePath, slug)
 			_ = os.Remove(m.FilePath)
+		}
+	}
+
+	if err := e.pruneOrphanedManifests(dir); err != nil {
+		// Non-fatal — the archives themselves were pruned successfully above,
+		// which is the part that actually matters for disk space and
+		// retention correctness. Log and move on rather than fail the whole
+		// prune run over a manifest-cleanup hiccup.
+		log.Printf("[prune] manifest cleanup warning for %s: %v", appID, err)
+	}
+	return nil
+}
+
+// pruneOrphanedManifests deletes any {appID}_{timestamp}_manifest.json in dir
+// where none of the archive files it references (via ManifestEntry.FileName)
+// still exist on disk. Manifests that fail to parse, or that list zero
+// entries, are left alone — we only ever delete a manifest when we're
+// certain every archive it once described is gone.
+func (e *Engine) pruneOrphanedManifests(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, ent := range entries {
+		if ent.IsDir() || !strings.HasSuffix(ent.Name(), "_manifest.json") {
+			continue
+		}
+		manifestPath := filepath.Join(dir, ent.Name())
+		data, readErr := os.ReadFile(manifestPath)
+		if readErr != nil {
+			continue
+		}
+		var m Manifest
+		if jsonErr := json.Unmarshal(data, &m); jsonErr != nil {
+			continue // don't touch anything we can't confidently parse
+		}
+		if len(m.Entries) == 0 {
+			continue // nothing to check against — leave it rather than guess
+		}
+		anyArchiveSurvives := false
+		for _, entMeta := range m.Entries {
+			if entMeta.FileName == "" {
+				continue
+			}
+			if _, statErr := os.Stat(filepath.Join(dir, entMeta.FileName)); statErr == nil {
+				anyArchiveSurvives = true
+				break
+			}
+		}
+		if !anyArchiveSurvives {
+			log.Printf("[prune] removing orphaned manifest (all referenced archives gone): %s", manifestPath)
+			_ = os.Remove(manifestPath)
 		}
 	}
 	return nil

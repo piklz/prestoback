@@ -921,8 +921,15 @@ function authHeader() {
   if (S.apiKey) return {'X-API-Key':S.apiKey}; // legacy compat
   return {};
 }
-// For browser navigations (downloads, SSE) that can't set request headers —
-// the backend accepts ?token= or ?api_key= as a fallback.
+// SSE (EventSource) can't set custom request headers at all — this is a
+// genuine browser API limitation, so it authenticates via this query param
+// instead. Downloads used to do the same, but that path is broken: the
+// backend's authJWT middleware only reads ?api_key= as a query-param
+// fallback (for the legacy API key) — it never reads ?token= for JWT-based
+// logins. Any JWT-authenticated user hitting a plain <a href> download link
+// with ?token=... in the URL got a silent 401 instead of their file. See
+// downloadBackup() below, which fixes this properly via fetch() + the
+// Authorization header instead of a query param.
 function authQueryParam() {
   if (S.token) return 'token='+encodeURIComponent(S.token);
   if (S.apiKey) return 'api_key='+encodeURIComponent(S.apiKey);
@@ -2097,7 +2104,7 @@ function renderBkPage() {
       <div style="display:flex;gap:6px">
         ${!missing && !isOrphan?`<button class="btn btn-g btn-sm" onclick="openRsModal('${S.selAppID}','${esc(m.id)}')">↺ Restore</button>`:''}
         ${!missing && isOrphan?`<button class="btn btn-g btn-sm" disabled title="Adopt this app first" style="opacity:.5">↺ Restore</button>`:''}
-        ${!missing?`<a class="btn btn-g btn-sm btn-ic" href="/api/backups/${S.selAppID}/${esc(m.id)}/download?${authQueryParam()}" download title="Download to this device" style="text-decoration:none">⬇</a>`:''}
+        ${!missing?`<button class="btn btn-g btn-sm btn-ic" onclick="downloadBackup('${esc(m.id)}')" title="Download to this device">⬇</button>`:''}
         <button class="btn btn-d btn-sm btn-ic" onclick="delBackup('${esc(m.id)}')">🗑</button>
       </div>
     </div>`;
@@ -2126,6 +2133,52 @@ async function delBackup(id) {
   if (!confirm('Delete this archive? Cannot be undone.')) return;
   try { await api('/api/backups/'+S.selAppID+'/'+id,{method:'DELETE'}); toast('Deleted','success'); loadBackups(); }
   catch(e) { toast(e.message,'error'); }
+}
+
+// Downloads a backup archive to the device.
+//
+// This deliberately does NOT use a plain <a href="...download"> element. The
+// download endpoint requires auth, and a real browser navigation triggered by
+// clicking an <a> tag cannot attach an Authorization header — only a JS fetch()
+// call can. The previous version tried to work around this by putting the JWT
+// in a query string (?token=...), but the backend's authJWT middleware only
+// ever reads the LEGACY API key from a query param (?api_key=) — it never reads
+// ?token= for JWT-authenticated users at all. So any user logged in normally
+// (JWT, not API key) got a 401 JSON error back instead of the archive, and the
+// browser — seeing a JSON response with no Content-Disposition header, at a
+// URL whose last path segment is "download" — saved it as a generic
+// "download.json" file. That's the exact bug this replaces.
+//
+// Using fetch() with the same authHeader() used everywhere else in this app
+// works with either auth mode (JWT Bearer or legacy X-API-Key), needs no
+// backend changes, and never puts a token in the URL/browser history.
+async function downloadBackup(id) {
+  const filename = id + '.tar.gz';
+  try {
+    const res = await fetch('/api/backups/'+S.selAppID+'/'+id+'/download', {
+      headers: authHeader()
+    });
+    if (res.status === 401) {
+      authClear();
+      showAuthScreen('login');
+      throw new Error('session expired — please log in again');
+    }
+    if (!res.ok) {
+      const e = await res.json().catch(()=>({error:res.statusText}));
+      throw new Error(e.error||res.statusText);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch(e) {
+    toast('Download failed: ' + e.message, 'error');
+  }
 }
 
 // ════════════════════ Adopt Orphan ════════════════════
@@ -2510,10 +2563,7 @@ async function applyUpdate() {
 
 // ════════════════════ SSE ════════════════════
 function connectSSE() {
-  const tokenParam = S.token ? encodeURIComponent(S.token) :
-                     S.apiKey ? encodeURIComponent(S.apiKey) : '';
-  const paramName  = S.token ? 'token' : 'api_key';
-  const es=new EventSource('/api/events?'+paramName+'='+tokenParam);
+  const es=new EventSource('/api/events?'+authQueryParam());
   es.onmessage=e=>{
     try {
       const u=JSON.parse(e.data);

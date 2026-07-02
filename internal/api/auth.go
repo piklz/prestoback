@@ -94,7 +94,19 @@ func jwtVerify(token string, secret []byte) (*jwtClaims, error) {
 
 // authJWT replaces the old auth() middleware. Accepts:
 //  1. Legacy X-API-Key header or ?api_key= query param (for scripts)
-//  2. Authorization: Bearer <jwt>
+//  2. Authorization: Bearer <jwt> header (normal fetch()-based API calls —
+//     always preferred whenever the caller can set custom headers)
+//  3. ?token=<jwt> query param — ONLY as a fallback for clients that
+//     genuinely cannot set custom headers, such as EventSource (used by the
+//     SSE live-activity stream). Query-string tokens are a weaker posture
+//     than a header (they can end up in browser history and server access
+//     logs), so this exists for parity with the ?api_key= fallback already
+//     used the same way, not as a general-purpose alternative — callers
+//     that CAN use fetch()/XHR should always send the Authorization header
+//     instead. Previously each caller (e.g. handleSSE) reimplemented this
+//     check independently, which is how it ended up out of sync with this
+//     function; now there is exactly one place that decides what counts as
+//     valid auth, and every route — including SSE — goes through it.
 func (s *Server) authJWT(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Legacy API key (backwards compat for scripts / automations)
@@ -109,10 +121,16 @@ func (s *Server) authJWT(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// JWT Bearer token
-		bearer := r.Header.Get("Authorization")
-		if strings.HasPrefix(bearer, "Bearer ") {
-			token := strings.TrimPrefix(bearer, "Bearer ")
+		// JWT — prefer the Authorization header; fall back to ?token= only
+		// when no valid Bearer header was present at all.
+		var token string
+		if bearer := r.Header.Get("Authorization"); strings.HasPrefix(bearer, "Bearer ") {
+			token = strings.TrimPrefix(bearer, "Bearer ")
+		}
+		if token == "" {
+			token = r.URL.Query().Get("token")
+		}
+		if token != "" {
 			if s.cfg.IsTokenRevoked(token) {
 				errOut(w, 401, "token has been revoked — please log in again")
 				return

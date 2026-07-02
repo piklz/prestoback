@@ -114,7 +114,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/auth/status", s.handleAuthStatus)
 	s.mux.HandleFunc("/api/auth/setup", s.handleAuthSetup)
 	s.mux.HandleFunc("/api/auth/login", s.handleAuthLogin)
-	s.mux.HandleFunc("/api/events", s.handleSSE)
+	s.mux.HandleFunc("/api/events", s.authJWT(s.handleSSE))
 
 	// Auth-required
 	s.mux.HandleFunc("/api/auth/logout", s.authJWT(s.handleAuthLogout))
@@ -144,24 +144,13 @@ func (s *Server) routes() {
 
 // ── SSE ───────────────────────────────────────────────────────────────────────
 
+// handleSSE streams live job progress. Auth is handled entirely by the
+// authJWT middleware wrapping this route (see routes()) — including its
+// ?token= query-param fallback for EventSource, which cannot set custom
+// headers. This used to duplicate that check inline with its own goto-based
+// logic; that duplication is exactly how it drifted out of sync with
+// authJWT's actual rules. One source of truth now.
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
-	token := r.URL.Query().Get("token")
-	if token != "" {
-		if !s.cfg.IsTokenRevoked(token) {
-			if _, err := jwtVerify(token, jwtSecret(s.cfg.APIKey())); err == nil {
-				goto authorized
-			}
-		}
-		http.Error(w, "unauthorized", 401)
-		return
-	}
-	if key := r.URL.Query().Get("api_key"); key == s.cfg.APIKey() {
-		goto authorized
-	}
-	http.Error(w, "unauthorized", 401)
-	return
-
-authorized:
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
