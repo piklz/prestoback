@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -487,6 +488,39 @@ func (c *Config) AddUser(u User) error {
 		return fmt.Errorf("user '%s' already exists", u.Username)
 	}
 	c.users[u.Username] = u
+	c.mu.Unlock()
+	return c.Save()
+}
+
+// ListUsers returns every user account, sorted by username. Hashes are
+// included since this is an internal type — callers rendering to JSON for
+// the API must strip Hash themselves (see handleUsers in server.go).
+func (c *Config) ListUsers() []User {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]User, 0, len(c.users))
+	for _, u := range c.users {
+		out = append(out, u)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Username < out[j].Username })
+	return out
+}
+
+// DeleteUser removes a user account. Returns an error if it's the last
+// remaining account — PrestoBack must always have at least one login, or the
+// UI becomes permanently inaccessible (there's no "forgot password" recovery
+// flow other than editing config.json directly on disk).
+func (c *Config) DeleteUser(username string) error {
+	c.mu.Lock()
+	if len(c.users) <= 1 {
+		c.mu.Unlock()
+		return fmt.Errorf("cannot delete the last remaining account")
+	}
+	if _, exists := c.users[username]; !exists {
+		c.mu.Unlock()
+		return fmt.Errorf("user '%s' not found", username)
+	}
+	delete(c.users, username)
 	c.mu.Unlock()
 	return c.Save()
 }

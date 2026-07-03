@@ -116,30 +116,35 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/auth/login", s.handleAuthLogin)
 	s.mux.HandleFunc("/api/events", s.authJWT(s.handleSSE))
 
-	// Auth-required
-	s.mux.HandleFunc("/api/auth/logout", s.authJWT(s.handleAuthLogout))
+	// Auth-required — read-only for any authenticated role (including viewer)
+	s.mux.HandleFunc("/api/auth/logout", s.authJWT(s.handleAuthLogout)) // self-service, not privilege-gated
 	s.mux.HandleFunc("/api/auth/me", s.authJWT(s.handleAuthMe))
 	s.mux.HandleFunc("/api/volumes", s.authJWT(s.handleListVolumes))
 	s.mux.HandleFunc("/api/discover", s.authJWT(s.handleDiscover))
 	s.mux.HandleFunc("/api/suggest-excludes", s.authJWT(s.handleSuggestExcludes))
 	s.mux.HandleFunc("/api/validate-path", s.authJWT(s.handleValidatePath))
 	s.mux.HandleFunc("/api/dir-size", s.authJWT(s.handleDirSize))
-	s.mux.HandleFunc("/api/apps", s.authJWT(s.handleApps))
-	s.mux.HandleFunc("/api/apps/", s.authJWT(s.handleApp))
-	s.mux.HandleFunc("/api/backups/", s.authJWT(s.handleBackups))
 	s.mux.HandleFunc("/api/container-health", s.authJWT(s.handleContainerHealth))
-	s.mux.HandleFunc("/api/backups-orphans/", s.authJWT(s.handleOrphans))
-	s.mux.HandleFunc("/api/backups-orphans", s.authJWT(s.handleOrphans))
-	s.mux.HandleFunc("/api/backups-import", s.authJWT(s.handleBackupsImport))
 	s.mux.HandleFunc("/api/history", s.authJWT(s.handleHistory))
-	s.mux.HandleFunc("/api/notify", s.authJWT(s.handleNotify))
-	s.mux.HandleFunc("/api/notify/test", s.authJWT(s.handleNotifyTest))
-	s.mux.HandleFunc("/api/apikey", s.authJWT(s.handleAPIKey))
-	s.mux.HandleFunc("/api/apikey/regenerate", s.authJWT(s.handleRegenKey))
+	s.mux.HandleFunc("/api/apikey", s.authJWT(s.handleAPIKey)) // masked fingerprint only, never the live key
 	s.mux.HandleFunc("/api/update/check", s.authJWT(s.handleUpdateCheck))
-	s.mux.HandleFunc("/api/update/apply", s.authJWT(s.handleUpdateApply))
 	s.mux.HandleFunc("/api/cron/preview", s.authJWT(s.handleCronPreview))
-	s.mux.HandleFunc("/api/maintenance", s.authJWT(s.handleMaintenance))
+
+	// Auth-required — admin-only for any write (GET still allowed for viewer);
+	// see adminForWrites doc comment for why these aren't split into separate
+	// read/write handlers.
+	s.mux.HandleFunc("/api/apps", s.adminForWrites(s.handleApps))
+	s.mux.HandleFunc("/api/apps/", s.adminForWrites(s.handleApp))
+	s.mux.HandleFunc("/api/backups/", s.adminForWrites(s.handleBackups))
+	s.mux.HandleFunc("/api/backups-orphans/", s.adminForWrites(s.handleOrphans))
+	s.mux.HandleFunc("/api/backups-orphans", s.adminForWrites(s.handleOrphans))
+	s.mux.HandleFunc("/api/backups-import", s.adminForWrites(s.handleBackupsImport))
+	s.mux.HandleFunc("/api/notify", s.adminForWrites(s.handleNotify))
+	s.mux.HandleFunc("/api/notify/test", s.adminForWrites(s.handleNotifyTest))
+	s.mux.HandleFunc("/api/apikey/regenerate", s.adminForWrites(s.handleRegenKey))
+	s.mux.HandleFunc("/api/update/apply", s.adminForWrites(s.handleUpdateApply))
+	s.mux.HandleFunc("/api/maintenance", s.adminForWrites(s.handleMaintenance))
+	s.mux.HandleFunc("/api/users", s.adminForWrites(s.handleUsers))
 }
 
 // ── SSE ───────────────────────────────────────────────────────────────────────
@@ -154,7 +159,12 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	// No Access-Control-Allow-Origin: same-origin requests (the only
+	// legitimate caller — this app's own frontend) never need CORS headers
+	// at all. A wildcard here only helps a DIFFERENT origin's JavaScript read
+	// this live activity stream, which is not a use case this app has —
+	// unnecessary attack surface for zero functional benefit, especially
+	// combined with the ?token= query-param auth fallback this route accepts.
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", 500)
@@ -1783,6 +1793,16 @@ func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
 		errOut(w, 400, "app ID required")
 		return
 	}
+	// Defense-in-depth: appID here comes straight from a URL path segment.
+	// Go's http.ServeMux already collapses literal ".." before dispatch, and
+	// SplitN naturally caps how much of the path can land in one segment, so
+	// this was never practically exploitable beyond one directory level up —
+	// but "provably low risk after testing" isn't the same as "intentionally
+	// safe." This makes it safe by construction instead.
+	if !appIDCharset.MatchString(appID) {
+		errOut(w, 400, "invalid app ID")
+		return
+	}
 
 	// GET /api/backups/{appID}/{backupID}/download — serve the archive file
 	if len(parts) == 3 && parts[2] == "download" && r.Method == http.MethodGet {
@@ -1874,6 +1894,15 @@ func (s *Server) handleBackupDownload(w http.ResponseWriter, r *http.Request, ap
 // though it's a perfectly normal, correctly-named archive; nothing on the
 // writing side was ever wrong, this check just hadn't caught up to what
 // real volume names look like.
+// appIDCharset matches a real PrestoBack app ID — exactly what sanitizeID
+// produces (see config.go): lowercase letters, digits, underscore only. Used
+// to explicitly validate any app_id arriving from a client (URL path segment
+// or form field) before it's used in any filesystem path construction, so
+// path-traversal safety doesn't depend on incidental interaction with other
+// checks (see handleBackupsImport and handleBackups for where this closes
+// that gap).
+var appIDCharset = regexp.MustCompile(`^[a-z0-9_]+$`)
+
 var backupArchiveNamePattern = regexp.MustCompile(`^[a-z0-9_-]+_[a-z0-9_-]+_\d{8}_\d{6}(_prerestore)?\.tar\.gz$`)
 
 func (s *Server) handleBackupsImport(w http.ResponseWriter, r *http.Request) {
@@ -1888,6 +1917,19 @@ func (s *Server) handleBackupsImport(w http.ResponseWriter, r *http.Request) {
 	appID := strings.TrimSpace(r.FormValue("app_id"))
 	if appID == "" {
 		errOut(w, 400, "app_id required")
+		return
+	}
+	// Explicit validation, not just reliance on the filename-prefix check
+	// below happening to constrain it: app_id arrives as a raw multipart
+	// form field with no inherent shape. Real app IDs are always produced by
+	// sanitizeID (a-z, 0-9, underscore only — see config.go) — a hyphen or
+	// any other character here means this isn't a real app_id at all, and
+	// definitely isn't one PrestoBack would ever have generated. Checking
+	// this up front means the safety of this endpoint no longer depends on
+	// the filename-pattern check below happening to compose correctly with
+	// it — it's correct by construction, not as a side effect.
+	if !appIDCharset.MatchString(appID) {
+		errOut(w, 400, "app_id contains invalid characters — expected only a-z, 0-9, and underscore")
 		return
 	}
 	file, header, err := r.FormFile("file")
@@ -1995,6 +2037,14 @@ func (s *Server) handleOrphans(w http.ResponseWriter, r *http.Request) {
 		dirName := parts[0]
 		if len(parts) != 2 || parts[1] != "inspect" {
 			errOut(w, 404, "not found")
+			return
+		}
+		// Same reasoning as handleBackups: validate before any filesystem use
+		// rather than rely on os.ReadDir simply failing harmlessly for a
+		// malformed path. The DELETE branch below already guards this via a
+		// resolved-path prefix check; this makes the GET branch consistent.
+		if !appIDCharset.MatchString(dirName) {
+			errOut(w, 400, "invalid directory name")
 			return
 		}
 		if registered[dirName] {
