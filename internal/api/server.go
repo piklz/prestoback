@@ -380,29 +380,13 @@ func (s *Server) handleListVolumes(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSuggestExcludes(w http.ResponseWriter, r *http.Request) {
 	image := r.URL.Query().Get("image")
-	containerName := r.URL.Query().Get("container") // used to substitute {container} placeholder
 	patterns := backup.SuggestExcludes(image)
 	if patterns == nil {
 		patterns = []string{}
 	}
-	var preSuggestion any
-	if sug := backup.SuggestPreBackupCmd(image); sug != nil {
-		// Substitute the {container} placeholder if we know the container name
-		name := containerName
-		if name == "" {
-			name = "{container}"
-		}
-		preSuggestion = map[string]string{
-			"cmd":               strings.ReplaceAll(sug.Cmd, "{container}", name),
-			"dump_file":         sug.DumpFile,
-			"post_restore_hint": strings.ReplaceAll(sug.PostRestoreHint, "{container}", name),
-			"doc_note":          sug.DocNote,
-		}
-	}
 	respond(w, 200, map[string]any{
-		"image":          image,
-		"patterns":       patterns,
-		"pre_backup_cmd": preSuggestion,
+		"image":    image,
+		"patterns": patterns,
 	})
 }
 
@@ -1374,7 +1358,10 @@ func (s *Server) handleLinkedContainers(w http.ResponseWriter, r *http.Request, 
 	if candidates == nil {
 		candidates = []LinkedContainerCandidate{}
 	}
-	respond(w, 200, map[string]any{"detected": candidates})
+	respond(w, 200, map[string]any{
+		"detected":              candidates,
+		"linked_containers_set": app.LinkedContainersSet,
+	})
 }
 
 // handleAddVolume adds a new VolumeConfig to an existing app.
@@ -1523,17 +1510,10 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 		return
 	}
 
-	// ── Pre-backup hook ───────────────────────────────────────────────────────
-	// Run any pre-backup command (e.g. pg_dump, sqlite3 .backup) while containers
-	// are still running so databases are accessible.
-	if app.PreBackupCmd != "" {
-		emit(fmt.Sprintf("→ Running pre-backup hook: %s", app.PreBackupCmd))
-		if err := s.engine.RunPreBackupCmd(app.ID, app.PreBackupCmd, emit); err != nil {
-			emit(fmt.Sprintf("⚠  Pre-backup hook failed: %v — continuing anyway", err))
-		} else {
-			emit("✓ Pre-backup hook completed")
-		}
-	}
+	// (Pre-backup command feature removed — no longer executed even if an
+	// old config.json still has pre_backup_cmd set from before this was
+	// removed from the UI. The field stays defined in AppConfig purely so
+	// existing saved configs still parse without error; it's just inert.)
 
 	containers := backup.FindContainers(app.ID)
 	containers = append(containers, backup.ContainersByName(app.LinkedContainers)...)

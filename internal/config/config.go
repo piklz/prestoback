@@ -68,6 +68,17 @@ type AppConfig struct {
 	// (the zero-downtime option), so nothing is auto-included.
 	LinkedContainers []string `json:"linked_containers,omitempty"`
 
+	// LinkedContainersSet distinguishes "user has never reviewed the
+	// dependency checklist" from "user reviewed it and explicitly unchecked
+	// everything." Both states produce an empty LinkedContainers slice, which
+	// is indistinguishable on its own — the Edit App UI used to default to
+	// "first time, so check everything" purely based on the slice being
+	// empty, which meant an explicit "no, I don't want this linked" choice
+	// silently reverted to checked again the next time the modal opened.
+	// Set to true by the frontend on every Edit App save; the UI then only
+	// applies its "default checked" convenience behavior while this is false.
+	LinkedContainersSet bool `json:"linked_containers_set,omitempty"`
+
 	// ContainerStrategy controls how running containers are quiesced during
 	// backup/restore:
 	//   "stop"  (default, safest) — graceful SIGTERM, archive, then restart.

@@ -41,7 +41,8 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .btn-g{background:transparent;color:var(--txt2);border-color:var(--line2)}.btn-g:hover{background:var(--bg3);color:var(--txt)}
 .btn-d{background:transparent;color:var(--red);border-color:rgba(240,95,95,.3)}.btn-d:hover{background:var(--rd)}
 .btn-w{background:var(--ad);color:var(--amber);border-color:rgba(245,166,35,.3)}.btn-w:hover{background:rgba(245,166,35,.22)}
-.btn-sm{padding:5px 10px;font-size:12px}.btn-ic{padding:7px}
+.btn-sm{padding:5px 10px;font-size:12px}.btn-ic{padding:8px 10px;font-size:13px}
+.ra .btn-d{margin-left:10px}
 .btn:disabled{opacity:.35;cursor:not-allowed;pointer-events:none}
 /* cards */
 .card{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;margin-bottom:18px}
@@ -686,11 +687,6 @@ select.fi{cursor:pointer}
         <div class="fh" id="a-strategy-hint"></div>
       </div>
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
-        <div class="divlbl">Pre-backup command <span style="color:var(--txt3);font-weight:400;font-size:11px">(optional — runs before container stops)</span></div>
-        <input class="fi" id="a-prebakcmd" placeholder="docker exec myapp sqlite3 /data/app.db '.backup /data/app.db.bak'" style="font-family:var(--mono);font-size:11.5px">
-        <div class="fh">Runs while the container is still up, before it's stopped. Use for database dumps so the archive includes a consistent snapshot.</div>
-      </div>
-      <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
         <div class="divlbl">Scheduled backup (optional)</div>
         <div class="ftog" onclick="togAddSched()"><div class="ftog-sw" id="add-sched-tog"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable scheduled backup</div></div>
         <div id="add-sched-fields" style="display:none">
@@ -748,20 +744,6 @@ select.fi{cursor:pointer}
         <label class="fl">Detected dependencies</label>
         <div id="ea-linked-list" style="display:flex;flex-direction:column;gap:6px"></div>
         <div class="fh">Detected via Docker Compose's <code>depends_on</code> — checked containers are paused/stopped alongside this app. We only read what this app itself depends on, never the reverse (e.g. a reverse proxy in front of it is never included).</div>
-      </div>
-      <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
-        <div class="divlbl" style="display:flex;align-items:center;gap:8px">
-          Pre-backup command
-          <span id="ea-prebakcmd-badge" style="display:none;background:var(--gd);color:var(--green);border-radius:4px;padding:1px 7px;font-size:10px;font-family:var(--mono)">ACTIVE</span>
-          <span style="color:var(--txt3);font-weight:400;font-size:11px">(optional — runs before container stops, while app is still live)</span>
-        </div>
-        <input class="fi" id="ea-prebakcmd"
-          placeholder="e.g. docker exec homebox sqlite3 /data/homebox-data/homebox.db '.backup /data/homebox-data/homebox.db.bak'"
-          style="font-family:var(--mono);font-size:11.5px"
-          oninput="document.getElementById('ea-prebakcmd-badge').style.display=this.value.trim()?'':'none'">
-        <div id="ea-prebakcmd-hint" class="fh" style="margin-top:6px"></div>
-        <input type="hidden" id="ea-postrestorehint">
-        <div class="fh">Uses <code>docker exec</code> to run inside the target container — no extra tools needed on your Pi or in PrestoBack. The dump file lands in your volume and is included in the tar automatically. Use for: SQLite → <code>.backup</code>, Postgres → <code>pg_dump</code>, MySQL → <code>mysqldump</code>.</div>
       </div>
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
         <div class="divlbl">Exclude patterns <span style="color:var(--txt3);font-weight:400;font-size:11px">(one per line — dirs: Cache/, globs: *.log)</span></div>
@@ -868,6 +850,24 @@ select.fi{cursor:pointer}
   </div>
 </div>
 
+<!-- Delete app confirm -->
+<div class="overlay hidden" id="m-del-app">
+  <div class="modal">
+    <div class="mh"><div class="mt">Remove Application</div><button class="btn btn-g btn-ic" onclick="CM('m-del-app')">✕</button></div>
+    <div class="mb">
+      <div class="danger-b"><svg width="15" height="15" fill="none" stroke="var(--red)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="danger-t">Remove <strong id="del-app-name">this app</strong> from PrestoBack? Its schedule stops immediately.</div></div>
+      <div style="margin-top:14px;padding:10px 14px;background:var(--bg3);border-radius:var(--rs);font-size:12.5px;color:var(--txt2)">
+        💡 <strong id="del-app-count">This app</strong> has backup archives on disk. By default they're <strong>kept</strong> — you can re-adopt them later from the Backups tab even after removing the app config.
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;margin-top:14px;font-size:13px;cursor:pointer">
+        <input type="checkbox" id="del-app-purge">
+        <span>Also permanently delete all <span id="del-app-count2">its</span> backup archives from disk <span style="color:var(--red)">(cannot be undone)</span></span>
+      </label>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="CM('m-del-app')">Cancel</button><button class="btn btn-d" onclick="confirmDelApp()">🗑 Remove Application</button></div>
+  </div>
+</div>
+
 <!-- Adopt orphan backup -->
 <div class="overlay hidden" id="m-adopt">
   <div class="modal">
@@ -923,6 +923,8 @@ const S = {
   selAppID:null, bkAppID:null, rsAppID:null, rsID:null,
   editApp:null, addSchedOn:false, editSchedOn:false, editPinOn:false,
   pendingUpdates:[],
+  nextRuns:{},
+  pathSizes:{},
   notif:{},
   // reality tracking
   pathStatuses:{},   // appID → 'ok'|'missing'|'unknown'
@@ -1181,6 +1183,11 @@ async function loadStatus() {
     }
     // Next scheduled run
     if (d.next_runs && d.next_runs.length) {
+      // Keep a fast id->next_run lookup for the apps list schedule column
+      // (see renderApps' schedPill) and the maintenance banner, in addition
+      // to the existing sorted list used by the dashboard ticker.
+      S.nextRuns = {};
+      d.next_runs.forEach(r => { if (r.next_run) S.nextRuns[r.app_id] = r.next_run; });
       const upcoming = d.next_runs
         .filter(r => r.next_run)
         .sort((a,b) => new Date(a.next_run) - new Date(b.next_run));
@@ -1188,6 +1195,7 @@ async function loadStatus() {
         document.getElementById('s-next-stat').style.display = '';
         initSchedTicker(upcoming);
       }
+      renderApps(); // re-render so schedule column picks up S.nextRuns
     }
     // Fetch masked key fingerprint from server — full key is never returned
     // except once, at regeneration time (see regenKey).
@@ -1241,8 +1249,27 @@ function renderMaintBanner() {
   }
   banner.style.display = 'flex';
   if (detail) {
-    detail.textContent = 'All scheduled backups paused until ' + until.toLocaleString() +
+    // List which apps' next scheduled run actually falls inside this
+    // maintenance window (i.e. would fire, but won't) — not just a generic
+    // "schedules are paused" message. S.nextRuns comes from /api/status,
+    // computed by the real scheduler, so these are the actual times that
+    // would have fired, not a client-side guess.
+    const cancelled = S.apps
+      .filter(a => a.schedule?.enabled && !a.pinned && S.nextRuns[a.id])
+      .map(a => ({ name: a.name, at: new Date(S.nextRuns[a.id]) }))
+      .filter(r => r.at < until)
+      .sort((a,b) => a.at - b.at);
+
+    let html = 'All scheduled backups paused until ' + esc(until.toLocaleString()) +
       ' — this overrides every app\'s own Pin/freeze setting';
+    if (cancelled.length) {
+      const shown = cancelled.slice(0, 3)
+        .map(r => `${esc(r.name)} (would run ${esc(fmtRelTime(r.at.toISOString()))})`)
+        .join(', ');
+      const more = cancelled.length > 3 ? ` and ${cancelled.length - 3} more` : '';
+      html += `<div style="margin-top:4px">🚫 Cancelled this window: ${shown}${more}</div>`;
+    }
+    detail.innerHTML = html;
   }
 }
 
@@ -1280,6 +1307,18 @@ async function probeAllApps() {
       S.pathStatuses[a.id] = (r.ok && r.is_dir) ? 'ok' : 'missing';
     } catch {
       S.pathStatuses[a.id] = 'unknown';
+    }
+    // probe size — deliberately only done here (on explicit "Check paths"
+    // click or initial load), NOT on the 30s status poll. This walks the
+    // full directory tree on disk; re-running that every 30s for every app
+    // would hammer a Pi's SD card/USB drive for no real benefit, since
+    // backup sizes don't change minute to minute. Cached in S.pathSizes
+    // until the next explicit check.
+    try {
+      const r = await api('/api/dir-size?path=' + encodeURIComponent(a.path));
+      S.pathSizes[a.id] = r.human; // pre-formatted by the backend (e.g. "1.4 GB") — same humanBytes() logic used everywhere else in PrestoBack, so it matches the numbers shown elsewhere exactly
+    } catch {
+      S.pathSizes[a.id] = null;
     }
   }));
 
@@ -1414,6 +1453,16 @@ function renderApps() {
     const dotCls = pathSt==='ok' ? 'path-ok' : pathSt==='missing' ? 'path-missing' : 'path-unknown';
     const dotTitle = pathSt==='ok' ? 'Path found on disk' : pathSt==='missing' ? 'Path not found on disk' : 'Path not yet checked';
     const rowCls = pathSt==='missing' ? 'path-missing' : '';
+    // Size on disk — populated by the "⟳ Check paths" probe (see
+    // probeAllApps), not on every 30s poll (full directory walk is too
+    // expensive to repeat that often, especially on SD-card storage).
+    // undefined = never checked yet; null = check failed; string = formatted size.
+    const sz = S.pathSizes[a.id];
+    const pathSizeLine = sz
+      ? `<div style="font-size:10px;color:var(--txt3);margin-top:2px;font-family:var(--mono)">${esc(sz)}</div>`
+      : sz === null
+        ? `<div style="font-size:10px;color:var(--txt3);margin-top:2px">size: —</div>`
+        : '';
     const cnt = S.backupCounts[a.id];
     const cntHtml = cnt !== undefined
       ? `<span style="font-family:var(--mono);font-size:10px;color:${cnt>0?'var(--green)':'var(--txt3)'};margin-left:4px">[${cnt}]</span>`
@@ -1445,12 +1494,26 @@ function renderApps() {
     const schedPill = a.schedule?.enabled && !a.pinned
       ? `<span class="pill pg"><span class="pd"></span>${esc(a.schedule.cron_expr)}</span>`
       : `<span class="pill" style="background:var(--bg4);color:var(--txt3)">manual</span>`;
+    // Real next-run time under the cron pill, sourced from S.nextRuns
+    // (populated by loadStatus from /api/status's next_runs — the scheduler's
+    // own computed next fire time, not re-derived client-side, so it's always
+    // exactly what will actually happen). If maintenance mode is currently
+    // active, this run is paused regardless of what the schedule says, so
+    // that's called out explicitly rather than silently showing a time that
+    // won't actually happen.
+    let nextRunLine = '';
+    if (a.schedule?.enabled && !a.pinned && S.nextRuns[a.id]) {
+      const maintActive = S.maintUntil && new Date(S.maintUntil) > new Date();
+      nextRunLine = maintActive
+        ? `<div style="font-size:10px;color:var(--amber,#f0a020);margin-top:3px" title="Next scheduled run would be ${esc(fmtRelTime(S.nextRuns[a.id]))}, but maintenance mode is pausing all schedules">🔧 paused — would run ${esc(fmtRelTime(S.nextRuns[a.id]))}</div>`
+        : `<div style="font-size:10px;color:var(--txt3);margin-top:3px">next: ${esc(fmtRelTime(S.nextRuns[a.id]))}</div>`;
+    }
     const pinPill = a.pinned ? `<span class="pill pa" style="margin-left:4px">📌 pinned</span>` : '';
     return `<tr class="${rowCls}">
       <td data-label="Application"><div class="an">${esc(a.name)}${cntHtml}${updBadge}</div>${healthBadge}</td>
-      <td data-label="Path"><div style="display:flex;align-items:center;gap:4px"><span class="path-status-dot ${dotCls}" title="${dotTitle}"></span><span class="ap" style="margin-top:0">${esc(a.path)}</span></div></td>
+      <td data-label="Path"><div style="display:flex;align-items:center;gap:4px"><span class="path-status-dot ${dotCls}" title="${dotTitle}"></span><span class="ap" style="margin-top:0">${esc(a.path)}</span></div>${pathSizeLine}</td>
       <td data-label="Retain"><span class="pill pb">${a.retain||5}</span></td>
-      <td data-label="Schedule">${schedPill}${pinPill}</td>
+      <td data-label="Schedule">${schedPill}${pinPill}${nextRunLine}</td>
       <td data-label="Actions"><div class="ra">
         <button class="btn btn-g btn-sm" onclick="openBkModal('${a.id}','${esc(a.name)}')"${pathSt==='missing'?' title="Config path missing — backup may fail"':''}>▶ Backup</button>
         <button class="btn btn-g btn-sm btn-ic" title="Edit" onclick="openEditApp('${a.id}')">✎</button>
@@ -1460,15 +1523,35 @@ function renderApps() {
   }).join('');
 }
 
-async function delApp(id) {
-  if (!confirm('Remove this app? Backup archives on disk are NOT deleted.')) return;
-  try { await api('/api/apps/'+id,{method:'DELETE'}); toast('App removed','success'); loadApps(); }
-  catch(e) { toast(e.message,'error'); }
+let _delAppID = null;
+function delApp(id) {
+  const a = S.apps.find(x => x.id === id);
+  if (!a) return;
+  _delAppID = id;
+  document.getElementById('del-app-name').textContent = a.name;
+  const cnt = S.backupCounts[id];
+  const countText = (cnt !== undefined && cnt > 0)
+    ? `${a.name} has ${cnt} backup archive${cnt===1?'':'s'}`
+    : `${a.name}`;
+  document.getElementById('del-app-count').textContent = countText;
+  document.getElementById('del-app-count2').textContent = cnt ? `its ${cnt} backup archive${cnt===1?'':'s'}` : 'its';
+  document.getElementById('del-app-purge').checked = false;
+  OM('m-del-app');
+}
+async function confirmDelApp() {
+  if (!_delAppID) return;
+  const purge = document.getElementById('del-app-purge').checked;
+  try {
+    await api('/api/apps/'+_delAppID+(purge?'?purge=1':''), {method:'DELETE'});
+    toast(purge ? 'App and backups removed' : 'App removed — backups kept on disk', 'success');
+    CM('m-del-app');
+    loadApps();
+  } catch(e) { toast(e.message,'error'); }
 }
 
 // Add App
 function openAddApp() {
-  ['a-name','a-path','a-id','a-cron','a-prebakcmd'].forEach(x=>document.getElementById(x).value='');
+  ['a-name','a-path','a-id','a-cron'].forEach(x=>document.getElementById(x).value='');
   document.getElementById('a-retain').value=5;
   document.getElementById('a-strategy').value='stop';
   updateStrategyHint('a');
@@ -1484,9 +1567,7 @@ function togAddSched() {
 async function submitAddApp() {
   const name=gv('a-name'), path=gv('a-path'), retain=parseInt(gv('a-retain'))||5, id=gv('a-id')||undefined;
   if (!name||!path) { toast('Name and path required','error'); return; }
-  const preCmd = gv('a-prebakcmd').trim();
   const app = {name,path,retain,id,container_strategy:gv('a-strategy'),
-    pre_backup_cmd: preCmd||undefined,
     schedule:{enabled:S.addSchedOn, cron_expr: S.addSchedOn?gv('a-cron'):''}};
   try { await api('/api/apps',{method:'POST',body:JSON.stringify(app)}); toast('App added','success'); CM('m-add-app'); loadApps(); }
   catch(e) { toast(e.message,'error'); }
@@ -1526,15 +1607,11 @@ function openEditApp(id) {
     }
   }
   document.getElementById('ea-excludes').value=(a.excludes||[]).join('\n');
-  document.getElementById('ea-prebakcmd').value=a.pre_backup_cmd||'';
-  document.getElementById('ea-prebakcmd-badge').style.display=a.pre_backup_cmd?'':'none';
-  document.getElementById('ea-postrestorehint').value=a.post_restore_hint||'';
+  // (pre-backup command feature removed)
   loadLinkedContainers(a);
-  // Fetch suggested excludes AND pre-backup cmd for this app's image (best-effort)
+  // Fetch suggested excludes for this app's image (best-effort)
   const hint = document.getElementById('ea-suggest-hint');
-  const preHint = document.getElementById('ea-prebakcmd-hint');
   hint.textContent = '';
-  if (preHint) preHint.innerHTML = '';
   if (a.image) {
     const params = new URLSearchParams({image: a.image});
     if (a.container_name) params.set('container', a.container_name);
@@ -1543,18 +1620,6 @@ function openEditApp(id) {
         hint.innerHTML = '💡 Suggested for '+esc(a.image.split('/').pop())+': ' +
           r.patterns.map(p=>`<code style="background:var(--bg3);padding:1px 5px;border-radius:3px">${esc(p)}</code>`).join(' ') +
           ` <a href="#" onclick="document.getElementById('ea-excludes').value=${JSON.stringify(r.patterns.join('\n'))};return false" style="color:var(--accent)">apply</a>`;
-      }
-      if (r.pre_backup_cmd && !gv('ea-prebakcmd')) {
-        // Only suggest if the field is currently empty — respect what user already set
-        const sug = r.pre_backup_cmd;
-        if (preHint) preHint.innerHTML =
-          `💡 <strong>Optional DB dump detected</strong> — runs inside the container (no extra tools needed on Pi):<br>` +
-          `<code style="display:block;background:var(--bg3);padding:6px 8px;border-radius:4px;font-size:11px;margin:5px 0;word-break:break-all">${esc(sug.cmd)}</code>` +
-          `<span style="color:var(--txt3);font-size:11px">${esc(sug.doc_note)}</span><br>` +
-          `<a href="#" onclick="document.getElementById('ea-prebakcmd').value=${JSON.stringify(sug.cmd)};` +
-          `document.getElementById('ea-postrestorehint').value=${JSON.stringify(sug.post_restore_hint)};` +
-          `this.closest('[style*=hint]')||this.parentElement.style.setProperty('display','none');return false" ` +
-          `style="color:var(--accent);font-size:12px">Apply this suggestion</a>`;
       }
     }).catch(()=>{});
   }
@@ -1566,17 +1631,14 @@ async function submitEditApp() {
   const excludesRaw = (document.getElementById('ea-excludes').value||'')
     .split('\n').map(s=>s.trim()).filter(Boolean);
   const linkedContainers = [...document.querySelectorAll('.ea-linked-chk:checked')].map(el => el.value);
-  const preCmd = gv('ea-prebakcmd').trim();
-  const postRestoreHint = (document.getElementById('ea-postrestorehint').value||'').trim();
   const a = {
     ...S.editApp,
     name:gv('ea-name'), path:gv('ea-path'),
     retain:parseInt(gv('ea-retain'))||5,
     pinned:S.editPinOn,
     container_strategy:gv('ea-strategy'),
-    pre_backup_cmd: preCmd||undefined,
-    post_restore_hint: postRestoreHint||undefined,
     linked_containers: linkedContainers,
+    linked_containers_set: true,
     schedule:{enabled:S.editSchedOn, cron_expr:gv('ea-cron')},
     excludes: excludesRaw,
   };
@@ -1596,7 +1658,14 @@ function loadLinkedContainers(a) {
   api('/api/apps/'+a.id+'/linked-containers').then(r => {
     const detected = (r.detected||[]).filter(c => c.found);
     if (!detected.length) return;
-    const isFirstTime = !(a.linked_containers||[]).length;
+    // BUGFIX: this used to check "!(a.linked_containers||[]).length", which
+    // can't tell "never configured" apart from "explicitly saved as empty" —
+    // both look like an empty array. That meant unchecking everything and
+    // saving silently reverted to checked again next time this opened. Now
+    // driven by linked_containers_set, which the save function always sets
+    // true — so "first time" really only means "never saved," not "saved
+    // with nothing selected."
+    const isFirstTime = !r.linked_containers_set;
     wrap.style.display = '';
     list.innerHTML = detected.map(c => {
       const checked = c.already_linked || isFirstTime;
@@ -1612,7 +1681,7 @@ function loadLinkedContainers(a) {
 const STRATEGY_HINTS = {
   stop:  '🔴 Container is gracefully stopped (SIGTERM) before archiving, then restarted after. The app gets to flush caches and close open files cleanly. Safest for all database types. Downtime = stop + archive + start time.',
   pause: '🟡 Container is frozen (SIGSTOP) — paused mid-execution, not stopped. No restart needed so recovery is instant. Crash-consistent: same guarantee as a VM snapshot. Fine for SQLite, Postgres, MySQL (all have WAL journaling). Not suitable for apps that write non-journaled flat files.',
-  none:  '🟢 Container keeps running. Only use this for stateless apps, or when your Pre-backup command already produces a consistent dump. Archiving a live database without stopping or pausing risks a corrupt backup.',
+  none:  '🟢 Container keeps running. Only use this for stateless apps — archiving a live database without stopping or pausing risks a corrupt backup.',
 };
 function updateStrategyHint(prefix) {
   const val = document.getElementById(prefix+'-strategy').value;
