@@ -1032,6 +1032,25 @@ func pullTimeoutFor(sizeBytes int64) time.Duration {
 	return total
 }
 
+// ContainerPullTimeout resolves c's current image and returns the same
+// size-scaled timeout UpdateContainer will use internally for its own pull
+// step (see pullTimeoutFor). Exported so orchestration code (the /update-all
+// loop in server.go) can size its own outer supervisory deadline to agree
+// with what's actually happening inside UpdateContainer, instead of a
+// separate hardcoded number that can — and did — fire before the real,
+// size-aware pull timeout ever gets a chance to.
+func ContainerPullTimeout(c ContainerInfo) time.Duration {
+	out, err := exec.Command("docker", "inspect", "--format={{.Config.Image}}", c.ID).Output()
+	if err != nil {
+		return pullTimeout
+	}
+	image := strings.TrimSpace(string(out))
+	if image == "" {
+		return pullTimeout
+	}
+	return pullTimeoutFor(estimateDownloadSize(image))
+}
+
 // UpdateContainer pulls the latest image for c and recreates the container.
 //
 // Recreation strategy (in order):

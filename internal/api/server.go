@@ -848,10 +848,11 @@ func (s *Server) runContainerUpdatesLocked(tgCfg notify.TelegramConfig, apps []c
 	}()
 
 	type cResult struct {
-		name     string
-		res      backup.ContainerUpdate
-		dur      time.Duration
-		timedOut bool
+		name         string
+		res          backup.ContainerUpdate
+		dur          time.Duration
+		timedOut     bool
+		timeoutAfter time.Duration
 	}
 	type aResult struct {
 		appName      string
@@ -922,12 +923,21 @@ func (s *Server) runContainerUpdatesLocked(tgCfg notify.TelegramConfig, apps []c
 
 			var cr cResult
 			cr.name = c.Name
+			// Size the wait to agree with what UpdateContainer is actually
+			// doing internally (see ContainerPullTimeout/pullTimeoutFor) —
+			// this used to be a flat 11 minutes regardless of image size,
+			// which fired and abandoned the real pull before its own
+			// (correctly larger) internal timeout ever got a chance to. The
+			// +5m buffer covers the stop→rename→create→start→health-check
+			// steps that run after the pull itself.
+			watchdog := backup.ContainerPullTimeout(c) + 5*time.Minute
 			select {
 			case r := <-ch:
 				cr.res = r.r
-			case <-time.After(11 * time.Minute):
+			case <-time.After(watchdog):
 				cr.timedOut = true
-				emit(fmt.Sprintf("✗ %s timed out (pull >10 min)", c.Name))
+				cr.timeoutAfter = watchdog
+				emit(fmt.Sprintf("✗ %s timed out (no response after %s)", c.Name, formatDuration(watchdog)))
 			}
 			cr.dur = time.Since(cStart)
 			log.Printf("[update] container %s done in %s: err=%q restarted=%v upToDate=%v timedOut=%v",
@@ -979,7 +989,8 @@ func (s *Server) runContainerUpdatesLocked(tgCfg notify.TelegramConfig, apps []c
 			}
 			switch {
 			case cr.timedOut:
-				sb.WriteString(fmt.Sprintf("  ❌ `%s` — timed out \\(pull \\>10 min\\)\n", notify.EscapeMD(cr.name)))
+				sb.WriteString(fmt.Sprintf("  ❌ `%s` — timed out \\(no response after %s\\)\n",
+					notify.EscapeMD(cr.name), notify.EscapeMD(formatDuration(cr.timeoutAfter))))
 			case cr.res.Rolled:
 				sb.WriteString(fmt.Sprintf("  ⚠️ `%s` — new container failed health check, rolled back _%s_\n",
 					notify.EscapeMD(cr.name), notify.EscapeMD(formatDuration(cr.dur))))
