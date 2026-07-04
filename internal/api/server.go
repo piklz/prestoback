@@ -1156,6 +1156,12 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 		s.handleLinkedContainers(w, r, appID)
 		return
 	}
+	// POST /api/apps/{id}/lifecycle — start/stop/restart/pause/unpause, the
+	// web dashboard's equivalent of the Telegram bot's lifecycle commands.
+	if len(parts) == 2 && parts[1] == "lifecycle" && r.Method == http.MethodPost {
+		s.handleAppLifecycle(w, r, appID)
+		return
+	}
 
 	switch r.Method {
 	case http.MethodGet:
@@ -2972,6 +2978,119 @@ func (s *Server) handleContainerLifecycle(tgCfg notify.TelegramConfig, arg, acti
 	s.runContainerLifecycle(tgCfg, *app, action)
 }
 
+// runLifecycleAction runs action ("start"/"stop"/"restart"/"pause"/"unpause")
+// against every container in containers, using the exact same backup.*OneContainer
+// functions and same-status guards regardless of caller. This is the one place
+// both the Telegram bot (runContainerLifecycle) and the web dashboard's
+// container controls (handleAppLifecycle) actually perform the action — the
+// two control surfaces read/write the same underlying state through the same
+// code path, so they can't drift apart the way a duplicated implementation
+// eventually would.
+func (s *Server) runLifecycleAction(containers []backup.ContainerInfo, action string, emit func(string)) []string {
+	var failed []string
+	for _, c := range containers {
+		var err error
+		switch action {
+		case "start":
+			if c.Status == "running" {
+				emit(fmt.Sprintf("%s already running — skipping", c.Name))
+				continue
+			}
+			err = backup.StartOneContainer(c, emit)
+		case "stop":
+			if c.Status != "running" {
+				emit(fmt.Sprintf("%s already %s — skipping", c.Name, c.Status))
+				continue
+			}
+			err = backup.StopOneContainer(c, emit)
+		case "restart":
+			err = backup.RestartOneContainer(c, emit)
+		case "pause":
+			if c.Status != "running" {
+				emit(fmt.Sprintf("%s is %s, not running — cannot pause", c.Name, c.Status))
+				continue
+			}
+			err = backup.PauseOneContainer(c, emit)
+		case "unpause":
+			err = backup.UnpauseOneContainer(c, emit)
+		}
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", c.Name, err))
+			emit(fmt.Sprintf("✗ %s failed: %v", c.Name, err))
+		}
+	}
+	return failed
+}
+
+// validLifecycleActions is shared by the HTTP and Telegram entry points so
+// both reject the same set of unknown actions.
+var validLifecycleActions = map[string]bool{
+	"start": true, "stop": true, "restart": true, "pause": true, "unpause": true,
+}
+
+// handleAppLifecycle is the web dashboard's equivalent of the Telegram
+// /start /stop /restart /pause /unpause commands — same runLifecycleAction
+// call as Telegram uses, same updateMu busy-check, same containers. Without
+// this, a container paused via Telegram (or the reverse) had no way to be
+// acted on from the dashboard even though the dashboard could already see
+// and display its "paused" state — a control surface that could show truth
+// it couldn't act on.
+func (s *Server) handleAppLifecycle(w http.ResponseWriter, r *http.Request, appID string) {
+	app, ok := s.cfg.GetApp(appID)
+	if !ok {
+		errOut(w, 404, "app not found")
+		return
+	}
+
+	var body struct {
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		errOut(w, 400, "invalid request body")
+		return
+	}
+	action := strings.ToLower(strings.TrimSpace(body.Action))
+	if !validLifecycleActions[action] {
+		errOut(w, 400, "unknown action: "+action)
+		return
+	}
+
+	// Same guard runContainerLifecycle uses — refuse to race a manual
+	// start/stop/pause against the stop→rename→create→start sequence inside
+	// an in-progress update. See updateMu's doc comment.
+	s.stateMu.Lock()
+	busy := s.updateRunning
+	s.stateMu.Unlock()
+	if busy {
+		errOut(w, 409, "an update or stack operation is in progress — please wait for it to finish first")
+		return
+	}
+
+	containers := backup.DedupeContainers(backup.FindContainers(app.ID))
+	if len(containers) == 0 {
+		errOut(w, 404, "no containers found for "+app.Name)
+		return
+	}
+
+	emit := func(msg string) {
+		log.Printf("[lifecycle:%s] %s", app.Name, msg)
+		s.engine.EmitLog(app.ID, msg)
+	}
+	emit(fmt.Sprintf("━━━ %s (from dashboard): %s ━━━", action, app.Name))
+	start := time.Now()
+	failed := s.runLifecycleAction(containers, action, emit)
+	dur := time.Since(start)
+	emit(fmt.Sprintf("━━━ %s %s: %s (%s) ━━━", action, map[bool]string{true: "complete", false: "failed"}[len(failed) == 0], app.Name, formatDuration(dur)))
+
+	respond(w, 200, map[string]any{
+		"app":         app.Name,
+		"action":      action,
+		"success":     len(failed) == 0,
+		"failed":      failed,
+		"duration_ms": dur.Milliseconds(),
+	})
+}
+
 // runContainerLifecycle does the actual work for a resolved app — shared by
 // both the slash-command path and the inline-button callback path.
 func (s *Server) runContainerLifecycle(tgCfg notify.TelegramConfig, app config.AppConfig, action string) {
@@ -3018,38 +3137,7 @@ func (s *Server) runContainerLifecycle(tgCfg notify.TelegramConfig, app config.A
 
 		emit(fmt.Sprintf("━━━ %s: %s ━━━", verb, app.Name))
 		start := time.Now()
-		var failed []string
-		for _, c := range containers {
-			var err error
-			switch action {
-			case "start":
-				if c.Status == "running" {
-					emit(fmt.Sprintf("%s already running — skipping", c.Name))
-					continue
-				}
-				err = backup.StartOneContainer(c, emit)
-			case "stop":
-				if c.Status != "running" {
-					emit(fmt.Sprintf("%s already %s — skipping", c.Name, c.Status))
-					continue
-				}
-				err = backup.StopOneContainer(c, emit)
-			case "restart":
-				err = backup.RestartOneContainer(c, emit)
-			case "pause":
-				if c.Status != "running" {
-					emit(fmt.Sprintf("%s is %s, not running — cannot pause", c.Name, c.Status))
-					continue
-				}
-				err = backup.PauseOneContainer(c, emit)
-			case "unpause":
-				err = backup.UnpauseOneContainer(c, emit)
-			}
-			if err != nil {
-				failed = append(failed, fmt.Sprintf("%s: %v", c.Name, err))
-				emit(fmt.Sprintf("✗ %s failed: %v", c.Name, err))
-			}
-		}
+		failed := s.runLifecycleAction(containers, action, emit)
 		dur := time.Since(start)
 
 		if len(failed) == 0 {

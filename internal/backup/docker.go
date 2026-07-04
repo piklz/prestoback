@@ -985,7 +985,52 @@ func composeCmd(ctx context.Context, fileArgs []string, subcmd ...string) *exec.
 	return cmd
 }
 
+// pullTimeout is the floor used when we can't determine a size up front
+// (registry lookup failed, or the image is digest-pinned). See
+// pullTimeoutFor for the size-scaled timeout actually used by UpdateContainer.
 const pullTimeout = 10 * time.Minute
+
+// estimateDownloadSize does a best-effort, cheap registry lookup (the same
+// HEAD-digest + manifest machinery the /check command uses) to size the pull
+// timeout before a real `docker pull` starts. Returns 0 on any failure —
+// callers fall back to the flat pullTimeout floor, so a registry hiccup here
+// never blocks the actual update.
+func estimateDownloadSize(image string) int64 {
+	if strings.Contains(image, "@sha256:") {
+		return 0
+	}
+	registry, repository, _ := parseImageRef(image)
+	_, _, remoteDigest, err := ForceCheckForUpdate(image)
+	if err != nil || remoteDigest == "" {
+		return 0
+	}
+	size, _, err := fetchImageDetails(registry, repository, remoteDigest)
+	if err != nil {
+		return 0
+	}
+	return size
+}
+
+// pullTimeoutFor scales the pull timeout with the actual download size
+// instead of a flat cutoff that fails identically on a 50MB and a 500MB
+// image. The per-MB rate is deliberately conservative (~0.5 MB/s effective)
+// since this runs on Pi-class hardware/SD storage and often contended home
+// upload/download — better to wait longer than to false-timeout a real
+// in-progress pull. Capped so a genuinely stuck pull still gets killed
+// eventually rather than hanging the update lock indefinitely.
+func pullTimeoutFor(sizeBytes int64) time.Duration {
+	const perMB = 2 * time.Second
+	const cap = 40 * time.Minute
+	if sizeBytes <= 0 {
+		return pullTimeout
+	}
+	extra := time.Duration(sizeBytes/(1024*1024)) * perMB
+	total := pullTimeout + extra
+	if total > cap {
+		return cap
+	}
+	return total
+}
 
 // UpdateContainer pulls the latest image for c and recreates the container.
 //
@@ -1011,13 +1056,19 @@ func UpdateContainer(c ContainerInfo, composeFile string, emit func(string)) Con
 	}
 
 	// ── Step 2: pull latest image ─────────────────────────────────────────────
-	emit(fmt.Sprintf("Pulling %s…", res.Image))
-	ctx, cancel := context.WithTimeout(context.Background(), pullTimeout)
+	sizeBytes := estimateDownloadSize(res.Image)
+	timeout := pullTimeoutFor(sizeBytes)
+	if sizeBytes > 0 {
+		emit(fmt.Sprintf("Pulling %s… (~%s, timeout %s)", res.Image, humanBytes(sizeBytes), timeout))
+	} else {
+		emit(fmt.Sprintf("Pulling %s… (timeout %s)", res.Image, timeout))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	pullOut, err := exec.CommandContext(ctx, "docker", "pull", res.Image).CombinedOutput()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			res.Err = fmt.Sprintf("pull timed out after %s", pullTimeout)
+			res.Err = fmt.Sprintf("pull timed out after %s", timeout)
 		} else {
 			res.Err = "pull failed: " + stripDockerOutput(string(pullOut))
 		}

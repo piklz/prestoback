@@ -1124,15 +1124,21 @@ async function loadAll() {
   pollContainerHealth();
 }
 
-async function pollContainerHealth() {
+async function refreshContainerHealth() {
   try {
     const results = await api('/api/container-health');
     S.containerHealth = {};
     (results||[]).forEach(h => { S.containerHealth[h.app_id] = h; });
     renderApps(); // re-render inline status badges
   } catch { /* docker socket may not be available — silently skip */ }
-  // Re-poll every 30s. Uses setTimeout not setInterval so a slow response
-  // doesn't stack up concurrent requests.
+}
+async function pollContainerHealth() {
+  await refreshContainerHealth();
+  // Re-poll every 30s. Uses setTimeout (via this recursive call) not
+  // setInterval so a slow response doesn't stack up concurrent requests.
+  // Anything that wants an immediate one-off refresh (e.g. after a manual
+  // start/stop/pause) should call refreshContainerHealth() directly instead
+  // of this function, or it'll spawn a second endless 30s polling chain.
   setTimeout(pollContainerHealth, 30_000);
 }
 
@@ -1427,6 +1433,23 @@ async function loadApps() {
   } catch(e) { toast(e.message,'error'); }
 }
 
+// Container lifecycle actions (start/stop/restart/pause/unpause) — same
+// backend action Telegram's /start /stop /restart /pause /unpause use
+// (runLifecycleAction, shared code path), so a container paused from
+// Telegram can be unpaused from here and vice versa; the two surfaces can't
+// drift out of sync since they're calling the same Go function.
+async function appLifecycle(id, name, action) {
+  try {
+    const r = await api('/api/apps/'+id+'/lifecycle', {method:'POST', body: JSON.stringify({action})});
+    if (r.success) toast(`${name}: ${action} complete`, 'success');
+    else toast(`${name}: ${action} failed — ${(r.failed||[]).join('; ')}`, 'error');
+  } catch(e) {
+    toast(e.message, 'error');
+  } finally {
+    refreshContainerHealth();
+  }
+}
+
 let appsFilter = '';
 function filterApps(q) {
   appsFilter = q.toLowerCase();
@@ -1509,6 +1532,22 @@ function renderApps() {
         : `<div style="font-size:10px;color:var(--txt3);margin-top:3px">next: ${esc(fmtRelTime(S.nextRuns[a.id]))}</div>`;
     }
     const pinPill = a.pinned ? `<span class="pill pa" style="margin-left:4px">📌 pinned</span>` : '';
+    // Lifecycle button — one contextual action based on the last known
+    // container state (from S.containerHealth / /api/container-health),
+    // calling the same backend action Telegram's /start /stop /restart
+    // /pause /unpause use. Deliberately just one button (the one action
+    // that makes sense right now) rather than five, to keep the row compact;
+    // /stop and full control remain available via Telegram for now.
+    const lcState = ch ? (ch.state || 'unknown') : 'unknown';
+    let lifecycleBtn = '';
+    if (lcState === 'paused') {
+      lifecycleBtn = `<button class="btn btn-g btn-sm" title="Resume (docker unpause)" onclick="appLifecycle('${a.id}','${esc(a.name)}','unpause')">▶ Unpause</button>`;
+    } else if (lcState === 'exited') {
+      lifecycleBtn = `<button class="btn btn-g btn-sm" title="Start container" onclick="appLifecycle('${a.id}','${esc(a.name)}','start')">▶ Start</button>`;
+    } else if (lcState === 'running') {
+      lifecycleBtn = `<button class="btn btn-g btn-sm btn-ic" title="Restart" onclick="appLifecycle('${a.id}','${esc(a.name)}','restart')">↻</button>
+        <button class="btn btn-g btn-sm btn-ic" title="Pause (docker pause — SIGSTOP)" onclick="appLifecycle('${a.id}','${esc(a.name)}','pause')">⏸</button>`;
+    }
     return `<tr class="${rowCls}">
       <td data-label="Application"><div class="an">${esc(a.name)}${cntHtml}${updBadge}</div>${healthBadge}</td>
       <td data-label="Path"><div style="display:flex;align-items:center;gap:4px"><span class="path-status-dot ${dotCls}" title="${dotTitle}"></span><span class="ap" style="margin-top:0">${esc(a.path)}</span></div>${pathSizeLine}</td>
@@ -1516,6 +1555,7 @@ function renderApps() {
       <td data-label="Schedule">${schedPill}${pinPill}${nextRunLine}</td>
       <td data-label="Actions"><div class="ra">
         <button class="btn btn-g btn-sm" onclick="openBkModal('${a.id}','${esc(a.name)}')"${pathSt==='missing'?' title="Config path missing — backup may fail"':''}>▶ Backup</button>
+        ${lifecycleBtn}
         <button class="btn btn-g btn-sm btn-ic" title="Edit" onclick="openEditApp('${a.id}')">✎</button>
         <button class="btn btn-d btn-sm btn-ic" title="Delete" onclick="delApp('${a.id}')">🗑</button>
       </div></td>
