@@ -49,8 +49,9 @@ type Server struct {
 
 	// Pending update tracking — populated by updateCheckLoop, read by the UI
 	// (/api/status) and the Telegram notifier. Guarded by stateMu.
-	pendingUpdates  []string        // app names with an image update available
-	updateAlertSent map[string]bool // debounce: app name -> already alerted
+	pendingUpdates       []string          // app names with an image update available — dashboard-facing, unchanged shape
+	pendingUpdateDetails []AppUpdateReport // per-image detail behind pendingUpdates — Telegram-report-facing, see updatecheck.go
+	updateAlertSent      map[string]bool   // debounce: app name -> already alerted
 
 	// updateMu serializes ALL container recreate operations (UpdateContainer /
 	// standaloneRecreate, via /update, /update all, the update-check button,
@@ -707,95 +708,11 @@ func (s *Server) updateCheckLoop() {
 	}
 }
 
-// checkForUpdates pulls every unique image in use once, dedupes via pullCache,
-// and updates s.pendingUpdates. If notify is true, sends a Telegram alert for
-// any newly-pending app (subject to the per-app debounce in updateAlertSent).
-func (s *Server) checkForUpdates(notifyUser bool) []string {
-	apps := s.cfg.ListApps()
-	var pending []string
-	pullCache := map[string]backup.ImageUpdateStatus{}
-
-	for _, app := range apps {
-		containers := backup.DedupeContainers(backup.FindContainers(app.ID))
-		appHasUpdate := false
-		for _, c := range containers {
-			if c.Status != "running" {
-				continue // can't usefully check a stopped container's image
-			}
-			status := backup.CheckImageUpdate(c, pullCache)
-			if status.Err != "" {
-				log.Printf("[updatecheck] %s/%s: %s", app.Name, c.Name, status.Err)
-				continue
-			}
-			if status.UpdateAvailable {
-				appHasUpdate = true
-			}
-		}
-		if appHasUpdate {
-			pending = append(pending, app.Name)
-		}
-	}
-
-	sort.Strings(pending)
-
-	s.stateMu.Lock()
-	s.pendingUpdates = pending
-	pendingSet := map[string]bool{}
-	for _, n := range pending {
-		pendingSet[n] = true
-	}
-	// Clear debounce for apps that no longer have a pending update (e.g. user
-	// already ran /update) so a future re-appearance alerts again.
-	for name := range s.updateAlertSent {
-		if !pendingSet[name] {
-			delete(s.updateAlertSent, name)
-		}
-	}
-	var toAlert []string
-	for _, name := range pending {
-		if !s.updateAlertSent[name] {
-			s.updateAlertSent[name] = true
-			toAlert = append(toAlert, name)
-		}
-	}
-	s.stateMu.Unlock()
-
-	if !notifyUser || len(toAlert) == 0 {
-		return pending
-	}
-
-	nc := s.cfg.GetNotify()
-	if !nc.TelegramEnabled || nc.TelegramToken == "" || nc.TelegramChatID == "" {
-		log.Printf("[updatecheck] %d app(s) have updates available but Telegram is not configured: %v", len(toAlert), toAlert)
-		return pending
-	}
-	tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
-
-	var sb strings.Builder
-	if len(toAlert) == 1 {
-		sb.WriteString(fmt.Sprintf("⬆️ *Update available* — `%s`\n\nTap below to pull \\+ recreate\\.", notify.EscapeMD(toAlert[0])))
-	} else {
-		sb.WriteString(fmt.Sprintf("⬆️ *%d updates available*\n\n", len(toAlert)))
-		for _, name := range toAlert {
-			sb.WriteString(fmt.Sprintf("• `%s`\n", notify.EscapeMD(name)))
-		}
-	}
-
-	var btns []notify.ButtonAction
-	if len(toAlert) == 1 {
-		if app := s.findAppByNameFragment(toAlert[0]); app != nil {
-			btns = append(btns, notify.ButtonAction{Label: "🔄 Update now", Data: "update:" + app.ID})
-		}
-	} else {
-		btns = append(btns, notify.ButtonAction{Label: fmt.Sprintf("🔄 Update all %d", len(toAlert)), Data: "update:all"})
-	}
-	btns = append(btns, notify.ButtonAction{Label: "👀 Remind me later", Data: "updatecheck:dismiss"})
-
-	if err := notify.SendRawWithButtons(tgCfg, sb.String(), btns); err != nil {
-		log.Printf("[updatecheck] notify failed: %v", err)
-	}
-	return pending
-}
+// checkForUpdates is implemented in updatecheck.go — it now checks every
+// running container's image against its registry directly (HEAD-based
+// digest comparison, no `docker pull`) and groups results under their real
+// owning app so a container matched by more than one app's fuzzy name isn't
+// checked and reported twice. See updatecheck.go for the full explanation.
 
 // diskMonitorLoop checks backup disk space every 30 minutes and fires a
 // Telegram alert (with action buttons) when free space drops below the threshold.
@@ -2207,7 +2124,7 @@ func prestoBackBotCommands() []notify.BotCommand {
 		{Command: "logs", Description: "Detailed recent backups for one app — /logs <name>"},
 		{Command: "disk", Description: "Backup directory disk usage (free / used / total)"},
 		{Command: "next", Description: "Upcoming scheduled backup times across all apps"},
-		{Command: "check", Description: "Check for image updates now (pulls each image)"},
+		{Command: "check", Description: "Check for image updates now (registry check, no downloads)"},
 		{Command: "start", Description: "Start a stopped container — /start <name>"},
 		{Command: "stop", Description: "Stop a running container — /stop <name>"},
 		{Command: "restart", Description: "Restart a container — /restart <name>"},
@@ -2606,32 +2523,20 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 		}
 
 	case "/check":
-		_ = notify.SendRaw(tgCfg, "🔍 Checking for image updates \\(pulls each image — may take a minute\\)\\.\\.\\.")
+		_ = notify.SendRaw(tgCfg, "🔍 Checking for image updates \\(registry check — no downloads\\)\\.\\.\\.")
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("[bot] PANIC in /check: %v", r)
 				}
 			}()
-			pending := s.checkForUpdates(false) // false: we send our own message below, not the debounced alert
-			if len(pending) == 0 {
+			reports := s.checkForUpdates(false) // false: we send our own message below, not the debounced alert
+			if len(reports) == 0 {
 				_ = notify.SendRaw(tgCfg, "✅ Everything is up to date\\.")
 				return
 			}
-			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("⬆️ *%d update\\(s\\) available*\n\n", len(pending)))
-			for _, name := range pending {
-				sb.WriteString(fmt.Sprintf("• `%s`\n", notify.EscapeMD(name)))
-			}
-			var btns []notify.ButtonAction
-			if len(pending) == 1 {
-				if app := s.findAppByNameFragment(pending[0]); app != nil {
-					btns = append(btns, notify.ButtonAction{Label: "🔄 Update now", Data: "update:" + app.ID})
-				}
-			} else {
-				btns = append(btns, notify.ButtonAction{Label: fmt.Sprintf("🔄 Update all %d", len(pending)), Data: "update:all"})
-			}
-			_ = notify.SendRawWithButtons(tgCfg, sb.String(), btns)
+			text, btns := buildUpdateReportMessage(reports)
+			_ = notify.SendRawWithButtons(tgCfg, text, btns)
 		}()
 
 	case "/logs":
@@ -2906,7 +2811,7 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			"🔍 /logs \\<name\\> — detailed recent backups for one app\n" +
 			"💾 /disk — backup directory disk usage\n" +
 			"⏰ /next — upcoming scheduled backup times\n" +
-			"🔍 /check — check for image updates now \\(pulls each image\\)\n" +
+			"🔍 /check — check for image updates now \\(registry check, no downloads\\)\n" +
 			"⏸ /schedpause \\<name\\> — disable an app's backup schedule\n" +
 			"▶ /schedresume \\<name\\> — re\\-enable an app's backup schedule\n" +
 			"🔧 /maintenance \\<2h/1d/1w/on/off\\> — freeze all schedules temporarily\n\n" +
