@@ -953,13 +953,11 @@ function authHeader() {
 }
 // SSE (EventSource) can't set custom request headers at all — this is a
 // genuine browser API limitation, so it authenticates via this query param
-// instead. Downloads used to do the same, but that path is broken: the
-// backend's authJWT middleware only reads ?api_key= as a query-param
-// fallback (for the legacy API key) — it never reads ?token= for JWT-based
-// logins. Any JWT-authenticated user hitting a plain <a href> download link
-// with ?token=... in the URL got a silent 401 instead of their file. See
-// downloadBackup() below, which fixes this properly via fetch() + the
-// Authorization header instead of a query param.
+// instead. downloadBackup() also uses this now, for large-file downloads:
+// a plain authenticated navigation lets the browser stream straight to disk
+// instead of buffering the whole archive in JS memory via fetch()+blob(),
+// which is what silently failed on mobile for large files (see
+// downloadBackup()'s comment for the full story).
 function authQueryParam() {
   if (S.token) return 'token='+encodeURIComponent(S.token);
   if (S.apiKey) return 'api_key='+encodeURIComponent(S.apiKey);
@@ -2409,48 +2407,33 @@ async function delBackup(id) {
 
 // Downloads a backup archive to the device.
 //
-// This deliberately does NOT use a plain <a href="...download"> element. The
-// download endpoint requires auth, and a real browser navigation triggered by
-// clicking an <a> tag cannot attach an Authorization header — only a JS fetch()
-// call can. The previous version tried to work around this by putting the JWT
-// in a query string (?token=...), but the backend's authJWT middleware only
-// ever reads the LEGACY API key from a query param (?api_key=) — it never reads
-// ?token= for JWT-authenticated users at all. So any user logged in normally
-// (JWT, not API key) got a 401 JSON error back instead of the archive, and the
-// browser — seeing a JSON response with no Content-Disposition header, at a
-// URL whose last path segment is "download" — saved it as a generic
-// "download.json" file. That's the exact bug this replaces.
+// Previously this used fetch() + res.blob() + a Blob URL, based on the
+// (now outdated) assumption that authJWT's query-param fallback only ever
+// covered the legacy API key. It actually also accepts ?token=<jwt> (added
+// for SSE, but it's a generic check — see auth.go's authJWT), so a plain
+// authenticated navigation works for both auth modes.
 //
-// Using fetch() with the same authHeader() used everywhere else in this app
-// works with either auth mode (JWT Bearer or legacy X-API-Key), needs no
-// backend changes, and never puts a token in the URL/browser history.
-async function downloadBackup(id) {
-  const filename = id + '.tar.gz';
-  try {
-    const res = await fetch('/api/backups/'+S.selAppID+'/'+id+'/download', {
-      headers: authHeader()
-    });
-    if (res.status === 401) {
-      authClear();
-      showAuthScreen('login');
-      throw new Error('session expired — please log in again');
-    }
-    if (!res.ok) {
-      const e = await res.json().catch(()=>({error:res.statusText}));
-      throw new Error(e.error||res.statusText);
-    }
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  } catch(e) {
-    toast('Download failed: ' + e.message, 'error');
-  }
+// That matters a lot for large archives on mobile, which is where the old
+// approach quietly failed:
+//   1. res.blob() buffers the ENTIRE archive in JS memory before anything is
+//      saved. A 400+MB file on a phone browser can get killed by memory
+//      pressure with no exception thrown — so the catch block never fires
+//      and nothing visibly happens.
+//   2. a.click() ran after two awaits (fetch, then .blob()). Mobile Safari
+//      and others only treat a download/popup trigger as trusted if it
+//      fires SYNCHRONOUSLY within the original tap — by the time those
+//      awaits resolve, the gesture context is gone and the click can be
+//      silently swallowed.
+//
+// Navigating directly to the authenticated URL avoids both: the browser
+// streams the response straight to disk with its own native progress UI,
+// no JS-side buffering, and the navigation happens synchronously in the
+// click handler, inside the original gesture.
+function downloadBackup(id) {
+  const qp = authQueryParam();
+  if (!qp) { toast('Download failed: not authenticated', 'error'); return; }
+  const url = '/api/backups/'+S.selAppID+'/'+id+'/download?'+qp;
+  window.location.href = url;
 }
 
 // ════════════════════ Adopt Orphan ════════════════════
