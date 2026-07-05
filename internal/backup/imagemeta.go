@@ -222,6 +222,35 @@ func fetchImageDetails(registry, repository, digest string) (sizeBytes int64, cr
 	return sizeBytes, createdDate, nil
 }
 
+// LocalImageCreatedDate returns the local image's build date (as recorded in
+// its own config) via `docker image inspect`, formatted "YYYY-MM-DD". Used by
+// the self-update digest-comparison panel, which — unlike the per-app check
+// path — has no ImageMeta struct of its own and needs this looked up
+// directly rather than via CheckImageMeta.
+func LocalImageCreatedDate(image string) (string, error) {
+	out, err := exec.Command("docker", "image", "inspect", "--format={{.Created}}", image).Output()
+	if err != nil {
+		return "", err
+	}
+	raw := strings.TrimSpace(string(out))
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t.Format("2006-01-02"), nil
+	}
+	return raw, nil
+}
+
+// RemoteImageCreatedDate returns the remote image's build date for a digest
+// already obtained via the self-updater's registry HEAD check (updater.go's
+// headRegistryDigest) — reusing fetchImageDetails' manifest-list-aware,
+// config-blob lookup rather than duplicating it. Best-effort: an error here
+// just means the digest-comparison panel omits that row's date, it never
+// blocks the update-available determination itself.
+func RemoteImageCreatedDate(image, remoteDigest string) (string, error) {
+	registry, repository, _ := parseImageRef(image)
+	_, created, err := fetchImageDetails(registry, repository, remoteDigest)
+	return created, err
+}
+
 func getRegistryJSON(url, token, accept string) ([]byte, *http.Response, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {

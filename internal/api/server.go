@@ -2062,12 +2062,36 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		respond(w, 200, map[string]any{"available": false, "error": err.Error()})
 		return
 	}
+
+	// Best-effort build/created dates for each row of the digest-comparison
+	// table — these are what "Checked" was actually meant to show (it was
+	// previously stamped with the client-side check time for both rows,
+	// which is always identical and tells the user nothing). A failure here
+	// just means the UI omits that date; it never affects hasUpdate/local/remote.
+	var localCreated, remoteCreated string
+	if local != "local-build" {
+		if d, err := backup.LocalImageCreatedDate(s.image); err == nil {
+			localCreated = d
+		} else {
+			log.Printf("[update] local created-date lookup failed for %s: %v", s.image, err)
+		}
+	}
+	if remote != "" {
+		if d, err := backup.RemoteImageCreatedDate(s.image, remote); err == nil {
+			remoteCreated = d
+		} else {
+			log.Printf("[update] remote created-date lookup failed for %s: %v", s.image, err)
+		}
+	}
+
 	respond(w, 200, map[string]any{
-		"available":     hasUpdate,
-		"local_digest":  local,
-		"remote_digest": remote,
-		"image":         s.image,
-		"locally_built": local == "local-build",
+		"available":      hasUpdate,
+		"local_digest":   local,
+		"remote_digest":  remote,
+		"image":          s.image,
+		"locally_built":  local == "local-build",
+		"local_created":  localCreated,
+		"remote_created": remoteCreated,
 	})
 }
 

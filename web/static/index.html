@@ -614,7 +614,7 @@ select.fi{cursor:pointer}
             <tr style="color:var(--txt3);font-size:10px;letter-spacing:.5px;text-transform:uppercase">
               <th style="text-align:left;padding:0 0 8px 0;width:70px">Source</th>
               <th style="text-align:left;padding:0 0 8px 0">Digest (sha256)</th>
-              <th style="text-align:left;padding:0 0 8px 0;width:180px">Checked</th>
+              <th style="text-align:left;padding:0 0 8px 0;width:180px">Built</th>
             </tr>
           </thead>
           <tbody>
@@ -2787,12 +2787,12 @@ async function checkUpdate() {
     // Local digest row
     const localDigest = r.local_digest && r.local_digest !== 'local-build' ? r.local_digest : null;
     document.getElementById('upd-local-full').textContent = localDigest ? fmtDigest(localDigest) : 'local build (no registry digest)';
-    document.getElementById('upd-local-time').textContent = nowStr;
+    document.getElementById('upd-local-time').textContent = r.local_created || '—';
 
     // Remote digest row
     if (r.remote_digest) {
       document.getElementById('upd-remote-full').textContent = fmtDigest(r.remote_digest);
-      document.getElementById('upd-remote-time').textContent = nowStr;
+      document.getElementById('upd-remote-time').textContent = r.remote_created || '—';
     }
 
     if (r.error) {
