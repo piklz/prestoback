@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -17,9 +18,10 @@ import (
 
 // ContainerInfo holds what we need about a matched container.
 type ContainerInfo struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Status string `json:"status"` // "running", "exited", etc.
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Status    string `json:"status"`               // "running", "exited", etc. (normalised state)
+	RawStatus string `json:"raw_status,omitempty"` // docker ps's human string, e.g. "Up 2 hours (healthy)" — carries health/exit info without a separate docker inspect
 }
 
 // DockerReachable does one cheap call to confirm the Docker daemon is
@@ -196,13 +198,87 @@ func DedupeContainers(cs []ContainerInfo) []ContainerInfo {
 	return out
 }
 
+// psEntry is one row of a single `docker ps -a` snapshot. Status is the
+// human-readable form ("Up 2 hours (healthy)", "Exited (137) 5 minutes ago"),
+// State is Docker's own normalised state ("running", "exited", "paused", ...).
+type psEntry struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	State  string `json:"state"`
+	Status string `json:"status"`
+	Labels string `json:"labels"`
+}
+
+// dockerPsSnapshot runs exactly one `docker ps -a` and returns every
+// container on the host (running or stopped), with its labels included.
+// This is the single subprocess spawn that FindContainers/FindContainersFor
+// build on — callers that need to match many apps against the container
+// list should fetch one snapshot and reuse it, rather than letting
+// FindContainers re-run `docker ps` per app per name-candidate.
+func dockerPsSnapshot() ([]psEntry, error) {
+	out, err := exec.Command("docker", "ps", "-a",
+		"--format", `{"id":"{{.ID}}","name":"{{.Names}}","state":"{{.State}}","status":"{{.Status}}","labels":"{{.Labels}}"}`,
+	).Output()
+	if err != nil {
+		return nil, err
+	}
+	var entries []psEntry
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var e psEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			continue
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
+
 // FindContainers returns ALL containers (running or stopped) that look like
 // they belong to the given appID. We try several strategies so that
 // standard docker-compose naming (presto-plex-1, presto_plex_1, plex, etc.)
 // all get matched.
 //
 // Returns multiple matches in case of replica sets; the caller should use all of them.
+//
+// This does exactly one `docker ps -a` call and matches everything in memory
+// (see findContainersIn). Callers looping over many apps (health polling,
+// update checks) should prefer FindContainersFor to fetch that snapshot ONCE
+// for the whole batch instead of once per app.
 func FindContainers(appID string) []ContainerInfo {
+	snapshot, err := dockerPsSnapshot()
+	if err != nil {
+		log.Printf("[docker] ps -a failed while looking up app %s: %v", appID, err)
+		return nil
+	}
+	return findContainersIn(snapshot, appID)
+}
+
+// FindContainersFor matches many appIDs against a single `docker ps -a`
+// snapshot, taken once. Used by hot loops (e.g. the /api/container-health
+// poll, hit every 30s by the dashboard) that previously called FindContainers
+// per app and re-spawned `docker ps` (and `docker inspect`) up to a dozen
+// times per app in the process.
+func FindContainersFor(appIDs []string) map[string][]ContainerInfo {
+	result := make(map[string][]ContainerInfo, len(appIDs))
+	snapshot, err := dockerPsSnapshot()
+	if err != nil {
+		log.Printf("[docker] ps -a failed while batch-matching %d apps: %v", len(appIDs), err)
+		return result
+	}
+	for _, appID := range appIDs {
+		result[appID] = findContainersIn(snapshot, appID)
+	}
+	return result
+}
+
+// findContainersIn matches one appID against an already-fetched `docker ps -a`
+// snapshot — same name + label heuristics FindContainers always used, but
+// with zero additional subprocess spawns per call.
+func findContainersIn(snapshot []psEntry, appID string) []ContainerInfo {
 	// Normalise: "homepage_3044" → base name is the part before the first underscore+digits suffix
 	// e.g. homepage_3044 → "homepage", plex_1234 → "plex"
 	baseName := stripIDSuffix(appID)
@@ -219,65 +295,32 @@ func FindContainers(appID string) []ContainerInfo {
 	var results []ContainerInfo
 
 	for _, name := range candidates {
-		// docker ps -a so we also catch already-stopped containers
-		out, err := exec.Command(
-			"docker", "ps", "-a",
-			"--filter", "name="+name,
-			"--format", `{"id":"{{.ID}}","name":"{{.Names}}","status":"{{.Status}}"}`,
-		).Output()
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
+		nameLower := strings.ToLower(name)
+		for _, e := range snapshot {
+			if seen[e.ID] {
 				continue
 			}
-			var ci ContainerInfo
-			if err := json.Unmarshal([]byte(line), &ci); err != nil {
+			// Same word-segment check the old --filter name= substring match relied on.
+			if !nameContains(strings.ToLower(e.Name), nameLower) {
 				continue
 			}
-			// Docker --filter name= is a substring match, so verify the
-			// container name actually contains our candidate as a word segment.
-			nameLower := strings.ToLower(ci.Name)
-			if !nameContains(nameLower, strings.ToLower(name)) {
-				continue
-			}
-			if seen[ci.ID] {
-				continue
-			}
-			seen[ci.ID] = true
-			ci.Status = containerState(ci.ID)
-			results = append(results, ci)
-			log.Printf("[docker] matched container %s (%s) for app %s", ci.Name, ci.ID, appID)
+			seen[e.ID] = true
+			results = append(results, ContainerInfo{ID: e.ID, Name: e.Name, Status: e.State, RawStatus: e.Status})
+			log.Printf("[docker] matched container %s (%s) for app %s", e.Name, e.ID, appID)
 		}
 	}
 
 	// Also try by label (works if containers were tagged with com.presto.app)
 	for _, labelVal := range dedupe([]string{appID, baseName}) {
-		out, err := exec.Command(
-			"docker", "ps", "-a",
-			"--filter", "label=com.presto.app="+labelVal,
-			"--format", `{"id":"{{.ID}}","name":"{{.Names}}","status":"{{.Status}}"}`,
-		).Output()
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
+		for _, e := range snapshot {
+			if seen[e.ID] {
 				continue
 			}
-			var ci ContainerInfo
-			if err := json.Unmarshal([]byte(line), &ci); err != nil {
+			if labelValue(e.Labels, "com.presto.app") != labelVal {
 				continue
 			}
-			if seen[ci.ID] {
-				continue
-			}
-			seen[ci.ID] = true
-			ci.Status = containerState(ci.ID)
-			results = append(results, ci)
+			seen[e.ID] = true
+			results = append(results, ContainerInfo{ID: e.ID, Name: e.Name, Status: e.State, RawStatus: e.Status})
 		}
 	}
 
@@ -285,6 +328,30 @@ func FindContainers(appID string) []ContainerInfo {
 		log.Printf("[docker] no containers found for app %s (tried: %v) — will proceed without stop/start", appID, candidates)
 	}
 	return results
+}
+
+// HealthAndExitFromStatus pulls the health-check state and exit code straight
+// out of `docker ps`'s human-readable Status string, e.g.
+// "Up 2 hours (healthy)" or "Exited (137) 5 minutes ago" — avoiding a
+// `docker inspect` subprocess per container just to read those two fields.
+// Returns health == "" when no healthcheck is configured, matching the old
+// docker-inspect-based behaviour (which treated Docker's own "<nil>" the
+// same way).
+var (
+	healthStatusRe = regexp.MustCompile(`\((healthy|unhealthy|starting)\)`)
+	exitCodeRe     = regexp.MustCompile(`^Exited \((-?\d+)\)`)
+)
+
+func HealthAndExitFromStatus(status string) (health string, exitCode int) {
+	if m := healthStatusRe.FindStringSubmatch(status); m != nil {
+		health = m[1]
+	}
+	if m := exitCodeRe.FindStringSubmatch(status); m != nil {
+		if code, err := strconv.Atoi(m[1]); err == nil {
+			exitCode = code
+		}
+	}
+	return health, exitCode
 }
 
 // PauseContainers freezes all running containers via SIGSTOP (docker pause),

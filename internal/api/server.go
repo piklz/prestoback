@@ -402,17 +402,29 @@ type ContainerHealth struct {
 
 // GET /api/container-health — returns live container state for every registered
 // app. Called periodically by the frontend to show inline status in the app list.
-// Uses the same FindContainers matching as the backup pipeline so the displayed
-// container is always the one that would actually be stopped/paused on backup.
+// Uses the same matching as the backup pipeline so the displayed container is
+// always the one that would actually be stopped/paused on backup.
+//
+// This used to call backup.FindContainers per app — each call spawning up to
+// ~6 separate `docker ps`/`docker inspect` subprocesses on its own — so a
+// 7-app dashboard fired off ~50 subprocesses every 30s, forever. It now takes
+// one `docker ps -a` snapshot for the whole poll and matches every app
+// against it in memory, health/exit code included.
 func (s *Server) handleContainerHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		errOut(w, 405, "method not allowed")
 		return
 	}
 	apps := s.cfg.ListApps()
+	appIDs := make([]string, len(apps))
+	for i, a := range apps {
+		appIDs[i] = a.ID
+	}
+	matches := backup.FindContainersFor(appIDs)
+
 	result := make([]ContainerHealth, 0, len(apps))
 	for _, a := range apps {
-		containers := backup.FindContainers(a.ID)
+		containers := matches[a.ID]
 		if len(containers) == 0 {
 			result = append(result, ContainerHealth{AppID: a.ID, State: "unknown"})
 			continue
@@ -420,21 +432,10 @@ func (s *Server) handleContainerHealth(w http.ResponseWriter, r *http.Request) {
 		// Use the first matched container (primary one for this app).
 		c := containers[0]
 		h := ContainerHealth{AppID: a.ID, Name: c.Name, State: c.Status}
-		// Try to get health check status from docker inspect.
-		out, err := exec.Command("docker", "inspect",
-			"--format={{.State.Health.Status}}:{{.State.ExitCode}}", c.ID).Output()
-		if err == nil {
-			parts := strings.SplitN(strings.TrimSpace(string(out)), ":", 2)
-			healthStr := parts[0]
-			// Docker returns "<nil>" when there is no healthcheck configured.
-			if healthStr != "" && healthStr != "<nil>" {
-				h.Health = healthStr
-			}
-			if len(parts) == 2 {
-				if code, err := strconv.Atoi(parts[1]); err == nil && code != 0 {
-					h.ExitCode = code
-				}
-			}
+		health, exitCode := backup.HealthAndExitFromStatus(c.RawStatus)
+		h.Health = health
+		if exitCode != 0 {
+			h.ExitCode = exitCode
 		}
 		result = append(result, h)
 	}
