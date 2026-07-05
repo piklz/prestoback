@@ -97,8 +97,18 @@ func ownedContainers(apps []config.AppConfig) map[string][]backup.ContainerInfo 
 // names, unchanged shape — still read by the dashboard) and, if notify is
 // true, sends a Telegram alert for any newly-pending app (subject to the
 // existing per-app debounce in updateAlertSent).
-func (s *Server) checkForUpdates(notifyUser bool) []AppUpdateReport {
+//
+// The second return value is false if Docker itself was unreachable and
+// nothing could be checked at all — callers must not report that as "up to
+// date" (an empty report list on its own can't tell those two cases apart).
+func (s *Server) checkForUpdates(notifyUser bool) ([]AppUpdateReport, bool) {
 	apps := s.cfg.ListApps()
+
+	if ok, errMsg := backup.DockerReachable(); !ok {
+		log.Printf("[updatecheck] aborting — Docker daemon unreachable: %s", errMsg)
+		return nil, false
+	}
+
 	owned := ownedContainers(apps)
 	cache := map[string]backup.ImageMeta{}
 
@@ -109,9 +119,14 @@ func (s *Server) checkForUpdates(notifyUser bool) []AppUpdateReport {
 		var images []backup.ImageMeta
 		appHasUpdate := false
 		for _, c := range owned[app.ID] {
-			if c.Status != "running" {
-				continue // can't usefully check a stopped container's image
-			}
+			// No running-only filter here: this is a registry-vs-local-digest
+			// comparison (backup.CheckImageMeta → docker inspect + a registry
+			// HEAD), which works identically for a stopped or paused container
+			// — the image reference doesn't go anywhere when a container is
+			// stopped. Portainer, Diun, and Docksentry all check regardless of
+			// running state for the same reason; skipping non-running
+			// containers here just meant a temporarily-stopped app silently
+			// dropped out of every future check.
 			meta := backup.CheckImageMeta(c, true, cache) // true: /check and the daily loop both want a fresh answer, not a stale hourly cache
 			if meta.Err != "" {
 				log.Printf("[updatecheck] %s/%s: %s", app.Name, c.Name, meta.Err)
@@ -158,13 +173,13 @@ func (s *Server) checkForUpdates(notifyUser bool) []AppUpdateReport {
 	s.stateMu.Unlock()
 
 	if !notifyUser || len(toAlertNames) == 0 {
-		return reports
+		return reports, true
 	}
 
 	nc := s.cfg.GetNotify()
 	if !nc.TelegramEnabled || nc.TelegramToken == "" || nc.TelegramChatID == "" {
 		log.Printf("[updatecheck] %d app(s) have updates available but Telegram is not configured: %v", len(toAlertNames), toAlertNames)
-		return reports
+		return reports, true
 	}
 	tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
 
@@ -184,7 +199,7 @@ func (s *Server) checkForUpdates(notifyUser bool) []AppUpdateReport {
 	if err := notify.SendRawWithButtons(tgCfg, text, btns); err != nil {
 		log.Printf("[updatecheck] notify failed: %v", err)
 	}
-	return reports
+	return reports, true
 }
 
 // buildUpdateReportMessage renders a Docksentry-style Telegram report: a

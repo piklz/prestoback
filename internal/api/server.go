@@ -847,6 +847,14 @@ func (s *Server) runContainerUpdatesLocked(tgCfg notify.TelegramConfig, apps []c
 		}
 	}()
 
+	if ok, errMsg := backup.DockerReachable(); !ok {
+		log.Printf("[update] aborting — Docker daemon unreachable: %s", errMsg)
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+			"⚠️ Can't reach Docker right now \\(daemon may be restarting\\) — nothing was checked or updated\\. Try again in a moment\\.\n\n`%s`",
+			notify.EscapeMD(errMsg)))
+		return
+	}
+
 	type cResult struct {
 		name         string
 		res          backup.ContainerUpdate
@@ -2547,7 +2555,11 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 					log.Printf("[bot] PANIC in /check: %v", r)
 				}
 			}()
-			reports := s.checkForUpdates(false) // false: we send our own message below, not the debounced alert
+			reports, dockerOK := s.checkForUpdates(false) // false: we send our own message below, not the debounced alert
+			if !dockerOK {
+				_ = notify.SendRaw(tgCfg, "⚠️ Can't reach Docker right now \\(daemon may be restarting\\) — nothing was checked\\. Try again in a moment\\.")
+				return
+			}
 			if len(reports) == 0 {
 				_ = notify.SendRaw(tgCfg, "✅ Everything is up to date\\.")
 				return
@@ -3077,6 +3089,11 @@ func (s *Server) handleAppLifecycle(w http.ResponseWriter, r *http.Request, appI
 		return
 	}
 
+	if ok, errMsg := backup.DockerReachable(); !ok {
+		errOut(w, 503, "Docker isn't reachable right now (daemon may be restarting): "+errMsg)
+		return
+	}
+
 	containers := backup.DedupeContainers(backup.FindContainers(app.ID))
 	if len(containers) == 0 {
 		errOut(w, 404, "no containers found for "+app.Name)
@@ -3138,6 +3155,12 @@ func (s *Server) runContainerLifecycle(tgCfg notify.TelegramConfig, app config.A
 		emit := func(msg string) {
 			log.Printf("[lifecycle:%s] %s", app.Name, msg)
 			s.engine.EmitLog(app.ID, msg)
+		}
+
+		if ok, errMsg := backup.DockerReachable(); !ok {
+			log.Printf("[lifecycle] aborting — Docker daemon unreachable: %s", errMsg)
+			_ = notify.SendRaw(tgCfg, "⚠️ Can't reach Docker right now \\(daemon may be restarting\\) — try again in a moment\\.")
+			return
 		}
 
 		containers := backup.DedupeContainers(backup.FindContainers(app.ID))

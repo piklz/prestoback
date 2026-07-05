@@ -22,6 +22,31 @@ type ContainerInfo struct {
 	Status string `json:"status"` // "running", "exited", etc.
 }
 
+// DockerReachable does one cheap call to confirm the Docker daemon is
+// actually reachable right now. Every container-listing function in this
+// package (FindContainers, ContainersByName, DiscoverApps, ...) treats
+// "docker ps failed" identically to "found nothing" — that's a reasonable
+// default for a single lookup, but it means a genuinely down/restarting
+// Docker daemon looks IDENTICAL to "you have zero containers" across an
+// entire /update or /check run: every app reports "no containers found",
+// and a check loop that finds nothing to check reports "up to date" even
+// though nothing was actually checked. Callers about to loop over many apps
+// (runContainerUpdatesLocked, checkForUpdates, handleContainerLifecycle)
+// call this first and report ONE clear error instead of many confusing,
+// individually-plausible-looking results that are actually all the same
+// underlying failure.
+func DockerReachable() (bool, string) {
+	out, err := exec.Command("docker", "version", "--format", "{{.Server.Version}}").CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return false, msg
+	}
+	return true, ""
+}
+
 // ── Compose dependency discovery ──────────────────────────────────────────────
 //
 // Docker Compose stamps every container it creates with labels recording
