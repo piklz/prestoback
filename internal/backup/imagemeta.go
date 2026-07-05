@@ -43,18 +43,18 @@ import (
 // longer used by the default check path), this is built entirely from
 // registry API metadata.
 type ImageMeta struct {
-	ContainerName   string
-	Image           string // full ref as configured, e.g. ghcr.io/immich-app/immich-server:release
-	CurrentTag      string
-	UpdateAvailable bool
-	LocalDigest     string
-	RemoteDigest    string
-	CurrentVersion  string // e.g. "2.7.5" — only set if CurrentTag itself is a semver tag
-	LatestVersion   string // e.g. "3.0.1" — highest semver tag found in the registry, best-effort
-	SizeBytes       int64  // best-effort compressed download size of the new image, 0 if not determined
-	CreatedDate     string // best-effort remote image build date "YYYY-MM-DD", "" if not determined
-	Err             string // non-empty if the check itself failed OR was skipped for a benign reason (see Skipped)
-	Skipped         bool   // true when Err is set for a benign, non-actionable reason — pinned-by-digest or a locally-built image — rather than a genuine check failure (registry unreachable, bad tag, etc.). Reporting layers should render these as informational, not warnings.
+	ContainerName   string `json:"container_name"`
+	Image           string `json:"image"` // full ref as configured, e.g. ghcr.io/immich-app/immich-server:release
+	CurrentTag      string `json:"current_tag"`
+	UpdateAvailable bool   `json:"update_available"`
+	LocalDigest     string `json:"local_digest"`
+	RemoteDigest    string `json:"remote_digest"`
+	CurrentVersion  string `json:"current_version"`   // e.g. "2.7.5" — only set if CurrentTag itself is a semver tag
+	LatestVersion   string `json:"latest_version"`    // e.g. "3.0.1" — highest semver tag found in the registry, best-effort
+	SizeBytes       int64  `json:"size_bytes"`        // best-effort compressed download size of the new image, 0 if not determined
+	CreatedDate     string `json:"created_date"`      // best-effort remote image build date "YYYY-MM-DD", "" if not determined
+	Err             string `json:"err,omitempty"`     // non-empty if the check itself failed OR was skipped for a benign reason (see Skipped)
+	Skipped         bool   `json:"skipped,omitempty"` // true when Err is set for a benign, non-actionable reason — pinned-by-digest or a locally-built image — rather than a genuine check failure (registry unreachable, bad tag, etc.). Reporting layers should render these as informational, not warnings.
 }
 
 // CheckImageMeta checks c's image against its registry using the same

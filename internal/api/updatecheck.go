@@ -36,9 +36,9 @@ import (
 // available or a check error are included — up-to-date images are omitted
 // to keep the report focused.
 type AppUpdateReport struct {
-	AppID   string
-	AppName string
-	Images  []backup.ImageMeta
+	AppID   string             `json:"app_id"`
+	AppName string             `json:"app_name"`
+	Images  []backup.ImageMeta `json:"images"`
 }
 
 // ownedContainers assigns each running container discoverable from apps to
@@ -195,7 +195,12 @@ func (s *Server) checkForUpdates(notifyUser bool) ([]AppUpdateReport, bool) {
 	}
 
 	text, btns := buildUpdateReportMessage(toAlertReports)
-	btns = append(btns, notify.ButtonAction{Label: "👀 Remind me later", Data: "updatecheck:dismiss"})
+	s.stateMu.Lock()
+	s.dismissSeq++
+	batchID := fmt.Sprintf("%d", s.dismissSeq)
+	s.dismissBatches[batchID] = toAlertNames
+	s.stateMu.Unlock()
+	btns = append(btns, notify.ButtonAction{Label: "👀 Remind me later", Data: "updatecheck:dismiss:" + batchID})
 	if err := notify.SendRawWithButtons(tgCfg, text, btns); err != nil {
 		log.Printf("[updatecheck] notify failed: %v", err)
 	}

@@ -52,6 +52,15 @@ type Server struct {
 	pendingUpdates       []string          // app names with an image update available — dashboard-facing, unchanged shape
 	pendingUpdateDetails []AppUpdateReport // per-image detail behind pendingUpdates — Telegram-report-facing, see updatecheck.go
 	updateAlertSent      map[string]bool   // debounce: app name -> already alerted
+	// dismissBatches backs the "👀 Remind me later" button: each alert message
+	// stores the app names it covered under a short id (Telegram callback_data
+	// is capped at 64 bytes, too small to embed potentially-many app names
+	// directly). Dismissing clears updateAlertSent for exactly those apps, so
+	// — matching what the button's own reply text promises — the very next
+	// background check re-alerts if the update is still pending, instead of
+	// silently no-op'ing forever like it used to.
+	dismissBatches map[string][]string
+	dismissSeq     int
 
 	// updateMu serializes ALL container recreate operations (UpdateContainer /
 	// standaloneRecreate, via /update, /update all, the update-check button,
@@ -83,6 +92,7 @@ func NewServer(cfg *config.Config, image, selfName string) *Server {
 		selfName:        selfName,
 		sseClients:      make(map[chan backup.JobUpdate]struct{}),
 		updateAlertSent: make(map[string]bool),
+		dismissBatches:  make(map[string][]string),
 	}
 	s.routes()
 	s.loadSchedules()
@@ -129,6 +139,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/history", s.authJWT(s.handleHistory))
 	s.mux.HandleFunc("/api/apikey", s.authJWT(s.handleAPIKey)) // masked fingerprint only, never the live key
 	s.mux.HandleFunc("/api/update/check", s.authJWT(s.handleUpdateCheck))
+	s.mux.HandleFunc("/api/updates/check", s.authJWT(s.handleUpdatesCheck)) // per-app registry check — distinct from /api/update/check (PrestoBack's own self-update)
 	s.mux.HandleFunc("/api/cron/preview", s.authJWT(s.handleCronPreview))
 
 	// Auth-required — admin-only for any write (GET still allowed for viewer);
@@ -2060,6 +2071,40 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ── Per-app update checking ──────────────────────────────────────────────────
+//
+// GET /api/updates/check — the dashboard's on-demand equivalent of Telegram's
+// /check command. Previously this had no web equivalent at all: the
+// dashboard only ever saw a passive, compact byproduct (pending_updates —
+// app names only, via /api/status, populated by the background loop on its
+// own schedule) with no way to trigger a fresh check and no way to see the
+// per-image detail (version delta, size, or WHY something is flagged —
+// pinned-by-digest, locally-built, or a real registry error) that Telegram's
+// /check report always had. UI/UX is the source of truth for what a feature
+// can do; Telegram/Discord/ntfy are notification front-ends on top of it, not
+// a separate feature surface — so this closes that gap.
+//
+// notifyUser is false here: the dashboard rendering the result on-screen IS
+// the notification for this request. It still updates s.pendingUpdates /
+// s.pendingUpdateDetails under the hood (checkForUpdates always does that
+// regardless of notifyUser), so the compact dashboard badges reflect this
+// check immediately too, same as they would after the background loop runs.
+func (s *Server) handleUpdatesCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	reports, dockerOK := s.checkForUpdates(false)
+	if !dockerOK {
+		respond(w, 200, map[string]any{"docker_ok": false, "reports": []AppUpdateReport{}})
+		return
+	}
+	if reports == nil {
+		reports = []AppUpdateReport{}
+	}
+	respond(w, 200, map[string]any{"docker_ok": true, "reports": reports})
+}
+
 func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errOut(w, 405, "method not allowed")
@@ -2948,6 +2993,14 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 
 	case "updatecheck":
 		if len(parts) >= 2 && parts[1] == "dismiss" {
+			if len(parts) >= 3 {
+				s.stateMu.Lock()
+				for _, name := range s.dismissBatches[parts[2]] {
+					delete(s.updateAlertSent, name)
+				}
+				delete(s.dismissBatches, parts[2])
+				s.stateMu.Unlock()
+			}
 			_ = notify.SendRaw(tgCfg, "OK — I'll remind you again if it's still pending at the next check\\.")
 		}
 	}

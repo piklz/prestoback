@@ -395,7 +395,10 @@ select.fi{cursor:pointer}
         <div style="font-size:12px;color:var(--txt3)" id="updates-banner-detail"></div>
       </div>
     </div>
-    <button class="btn btn-g btn-sm" onclick="V('apps')">Review</button>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-g btn-sm" onclick="checkForUpdatesNow()" id="updates-check-btn">🔍 Check now</button>
+      <button class="btn btn-g btn-sm" onclick="V('apps')">Review</button>
+    </div>
   </div>
   <div class="sec">
     <div class="stats">
@@ -923,6 +926,8 @@ const S = {
   selAppID:null, bkAppID:null, rsAppID:null, rsID:null,
   editApp:null, addSchedOn:false, editSchedOn:false, editPinOn:false,
   pendingUpdates:[],
+  lastUpdateReports:[], // per-app image detail from a manual /api/updates/check — richer than pendingUpdates (name-only)
+  lastUpdateCheckAt:null,
   nextRuns:{},
   pathSizes:{},
   notif:{},
@@ -1292,6 +1297,50 @@ async function cancelMaintenance() {
   }
 }
 
+// On-demand per-app registry check — the dashboard's equivalent of Telegram's
+// /check command. Previously this had no web trigger at all: the dashboard
+// only ever saw pending_updates (app names) refreshed passively by the
+// background loop, with no way to ask for a fresh answer and no way to see
+// WHY an app is flagged (version delta, size, or a benign skip like
+// pinned-by-digest vs. a real registry error). Populates S.lastUpdateReports,
+// which renderApps() reads for the detailed per-app badge tooltip.
+async function checkForUpdatesNow() {
+  const btn = document.getElementById('updates-check-btn');
+  const prevLabel = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '🔍 Checking…'; }
+  try {
+    const data = await api('/api/updates/check', { method: 'POST' });
+    if (!data.docker_ok) {
+      toast('Could not check for updates — Docker daemon unreachable', 'error');
+      return;
+    }
+    S.lastUpdateReports = data.reports || [];
+    S.lastUpdateCheckAt = new Date().toISOString();
+    // Recompute the compact name list from the fresh detail so the banner
+    // and badges agree with what was just checked, without waiting for the
+    // next 30s /api/status poll.
+    S.pendingUpdates = S.lastUpdateReports
+      .filter(r => r.images.some(im => im.update_available))
+      .map(r => r.app_name);
+    renderUpdatesBanner();
+    renderApps();
+    const nUpdates = S.pendingUpdates.length;
+    const nIssues = S.lastUpdateReports.filter(r => r.images.some(im => im.err && !im.skipped)).length;
+    if (nUpdates === 0 && nIssues === 0) {
+      toast('Everything up to date');
+    } else {
+      const parts = [];
+      if (nUpdates) parts.push(`${nUpdates} app(s) have updates`);
+      if (nIssues) parts.push(`${nIssues} check issue(s)`);
+      toast(parts.join(' · '), nUpdates ? 'success' : 'error');
+    }
+  } catch (e) {
+    toast('Update check failed: ' + (e.message || e), 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = prevLabel; }
+  }
+}
+
 // ════════════════════ Reality probe ════════════════════
 // Fetches backup counts for all apps from the real disk (via API).
 // Also detects orphan directories that exist on disk but aren't in config.
@@ -1494,9 +1543,27 @@ function renderApps() {
     // pending_updates field (checkForUpdates on the backend, refreshed every
     // 30s via loadStatus). This was computed server-side long before there
     // was anywhere in the UI to show it.
-    const updBadge = (S.pendingUpdates||[]).includes(a.name)
-      ? `<span class="pill" style="background:var(--amber2,#3a2a0f);color:var(--amber,#f0a020);border:1px solid var(--amber,#f0a020);margin-left:6px" title="Newer image available">⬆ update</span>`
-      : '';
+    // Once a manual check has run (checkForUpdatesNow → S.lastUpdateReports),
+    // upgrade to the real per-image detail — version delta in the tooltip,
+    // and a distinct badge for a check that failed vs. one that's just
+    // pinned-by-digest/locally-built (not actionable, so no badge at all).
+    const rpt = (S.lastUpdateReports||[]).find(r => r.app_name === a.name);
+    let updBadge = '';
+    if (rpt) {
+      const updatable = rpt.images.filter(im => im.update_available);
+      const failed = rpt.images.filter(im => im.err && !im.skipped);
+      if (updatable.length) {
+        const detail = updatable.map(im =>
+          `${im.container_name}: ${im.current_version || im.current_tag || '?'} → ${im.latest_version || 'newer'}`
+        ).join('\n');
+        updBadge = `<span class="pill" style="background:var(--amber2,#3a2a0f);color:var(--amber,#f0a020);border:1px solid var(--amber,#f0a020);margin-left:6px" title="${esc(detail)}">⬆ update</span>`;
+      } else if (failed.length) {
+        const detail = failed.map(im => `${im.container_name}: ${im.err}`).join('\n');
+        updBadge = `<span class="pill" style="background:var(--red2,#3a1010);color:var(--red,#e05050);border:1px solid var(--red,#e05050);margin-left:6px" title="${esc(detail)}">⚠ check issue</span>`;
+      }
+    } else if ((S.pendingUpdates||[]).includes(a.name)) {
+      updBadge = `<span class="pill" style="background:var(--amber2,#3a2a0f);color:var(--amber,#f0a020);border:1px solid var(--amber,#f0a020);margin-left:6px" title="Newer image available">⬆ update</span>`;
+    }
     // Container health badge — shown under the app name once polling data arrives
     const ch = S.containerHealth[a.id];
     const healthBadge = ch ? (() => {
