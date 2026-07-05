@@ -248,13 +248,17 @@ func dockerPsSnapshot() ([]psEntry, error) {
 // (see findContainersIn). Callers looping over many apps (health polling,
 // update checks) should prefer FindContainersFor to fetch that snapshot ONCE
 // for the whole batch instead of once per app.
+//
+// Logs each match — this is the path real operations (backup, update,
+// restore) go through, where an audit trail of what got matched/stopped is
+// useful. FindContainersFor (the health-poll path) stays quiet instead.
 func FindContainers(appID string) []ContainerInfo {
 	snapshot, err := dockerPsSnapshot()
 	if err != nil {
 		log.Printf("[docker] ps -a failed while looking up app %s: %v", appID, err)
 		return nil
 	}
-	return findContainersIn(snapshot, appID)
+	return findContainersIn(snapshot, appID, true)
 }
 
 // FindContainersFor matches many appIDs against a single `docker ps -a`
@@ -262,6 +266,10 @@ func FindContainers(appID string) []ContainerInfo {
 // poll, hit every 30s by the dashboard) that previously called FindContainers
 // per app and re-spawned `docker ps` (and `docker inspect`) up to a dozen
 // times per app in the process.
+//
+// Deliberately quiet: unlike FindContainers, this runs on every poll forever,
+// so per-match logging here would just be permanent log noise rather than a
+// useful audit trail.
 func FindContainersFor(appIDs []string) map[string][]ContainerInfo {
 	result := make(map[string][]ContainerInfo, len(appIDs))
 	snapshot, err := dockerPsSnapshot()
@@ -270,15 +278,18 @@ func FindContainersFor(appIDs []string) map[string][]ContainerInfo {
 		return result
 	}
 	for _, appID := range appIDs {
-		result[appID] = findContainersIn(snapshot, appID)
+		result[appID] = findContainersIn(snapshot, appID, false)
 	}
 	return result
 }
 
 // findContainersIn matches one appID against an already-fetched `docker ps -a`
 // snapshot — same name + label heuristics FindContainers always used, but
-// with zero additional subprocess spawns per call.
-func findContainersIn(snapshot []psEntry, appID string) []ContainerInfo {
+// with zero additional subprocess spawns per call. verbose controls the
+// per-match log line (see FindContainers vs FindContainersFor above); the
+// "no containers found" line always logs, since a permanently-unmatched app
+// is worth knowing about even from the poll path.
+func findContainersIn(snapshot []psEntry, appID string, verbose bool) []ContainerInfo {
 	// Normalise: "homepage_3044" → base name is the part before the first underscore+digits suffix
 	// e.g. homepage_3044 → "homepage", plex_1234 → "plex"
 	baseName := stripIDSuffix(appID)
@@ -306,7 +317,9 @@ func findContainersIn(snapshot []psEntry, appID string) []ContainerInfo {
 			}
 			seen[e.ID] = true
 			results = append(results, ContainerInfo{ID: e.ID, Name: e.Name, Status: e.State, RawStatus: e.Status})
-			log.Printf("[docker] matched container %s (%s) for app %s", e.Name, e.ID, appID)
+			if verbose {
+				log.Printf("[docker] matched container %s (%s) for app %s", e.Name, e.ID, appID)
+			}
 		}
 	}
 
@@ -321,10 +334,13 @@ func findContainersIn(snapshot []psEntry, appID string) []ContainerInfo {
 			}
 			seen[e.ID] = true
 			results = append(results, ContainerInfo{ID: e.ID, Name: e.Name, Status: e.State, RawStatus: e.Status})
+			if verbose {
+				log.Printf("[docker] matched container %s (%s) for app %s", e.Name, e.ID, appID)
+			}
 		}
 	}
 
-	if len(results) == 0 {
+	if len(results) == 0 && verbose {
 		log.Printf("[docker] no containers found for app %s (tried: %v) — will proceed without stop/start", appID, candidates)
 	}
 	return results
