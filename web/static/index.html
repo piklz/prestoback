@@ -1665,6 +1665,10 @@ function openAddApp() {
   S.addSchedOn=false; setTog('add-sched-tog',false);
   document.getElementById('add-sched-fields').style.display='none';
   document.getElementById('path-status').textContent='';
+  // a-cron was just cleared above, but the preview div is a singleton
+  // reused across every Add-app open — without this it can still show
+  // whatever cron was last previewed before a cancelled attempt.
+  _doPreviewCron('a-cron', 'a-cron-preview');
   OM('m-add-app');
 }
 function togAddSched() {
@@ -1699,6 +1703,15 @@ function openEditApp(id) {
   document.getElementById('ea-strategy').value=a.container_strategy||'stop';
   updateStrategyHint('ea');
   document.getElementById('ea-cron').value=a.schedule?.cron_expr||'';
+  // The preview div/desc/runs below are singleton elements reused across
+  // every open of this modal, and previewCron only ever fired on user
+  // input (oninput) — never when this line sets .value programmatically.
+  // Without this call, opening app B's edit modal right after app A's would
+  // silently keep showing app A's "next 5 runs", since nothing ever told
+  // the preview to recompute for the app actually being edited now.
+  // _doPreviewCron itself hides the panel when the expr is empty, so this
+  // is also what clears a stale preview for an app with no schedule set.
+  _doPreviewCron('ea-cron', 'ea-cron-preview');
   S.editSchedOn=a.schedule?.enabled||false; setTog('edit-sched-tog',S.editSchedOn);
   document.getElementById('edit-sched-fields').style.display=S.editSchedOn?'':'none';
   S.editPinOn=a.pinned||false; setTog('edit-pin-tog',S.editPinOn);
