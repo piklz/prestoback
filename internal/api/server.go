@@ -2143,8 +2143,7 @@ func (s *Server) syncSchedule(app config.AppConfig) {
 // picker in every Telegram client. Command names must be lowercase, no slash.
 func prestoBackBotCommands() []notify.BotCommand {
 	return []notify.BotCommand{
-		{Command: "status", Description: "All apps with paths, schedules, and backup retain counts"},
-		{Command: "apps", Description: "Compact app overview with readable schedule descriptions"},
+		{Command: "apps", Description: "All apps — path, schedule, next run, volumes, retain count"},
 		{Command: "backup", Description: "Trigger a backup — /backup <name> or pick from list"},
 		{Command: "history", Description: "Last 10 events — or /history <name> to filter by app"},
 		{Command: "logs", Description: "Detailed recent backups for one app — /logs <name>"},
@@ -2254,31 +2253,6 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 	}
 
 	switch cmd {
-	case "/status":
-		apps := s.cfg.ListApps()
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("*PrestoBack v%s*\n🐳 *%d apps*\n\n", notify.EscapeMD(config.Version), len(apps)))
-		for _, a := range apps {
-			badges := ""
-			if a.Pinned {
-				badges += " 📌"
-			}
-			if s.engine.IsRunning(a.ID) {
-				badges += " ⏳"
-			}
-			schedInfo := "manual"
-			if a.Schedule.Enabled {
-				schedInfo = notify.EscapeMD(a.Schedule.CronExpr)
-			}
-			sb.WriteString(fmt.Sprintf("• `%s`%s\n  📁 `%s`\n  🗓 `%s` · retain %d\n\n",
-				notify.EscapeMD(a.Name), badges,
-				notify.EscapeMD(a.PrimaryPath()),
-				schedInfo, a.Retain))
-		}
-		if err := notify.SendRaw(tgCfg, sb.String()); err != nil {
-			log.Printf("[bot] send status: %v", err)
-		}
-
 	case "/backup":
 		if arg == "" {
 			s.sendTelegramAppList(tgCfg, "backup")
@@ -2416,17 +2390,18 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			// on startup instead (see the startup notification in runTelegramBot).
 		}()
 
-	case "/apps":
-		// Compact overview: name, badges, human schedule, volume count, retain
+	case "/apps", "/status": // /status is a legacy alias — merged into /apps, same report either way
+		// One detailed pass per app: path, human schedule + next run, volume
+		// count, retain — everything that used to be split across /status
+		// and /apps (each missing a field the other had) now in one place.
 		apps := s.cfg.ListApps()
 		nextRunMap := map[string]time.Time{}
 		for _, nr := range s.sched.NextRuns() {
 			nextRunMap[nr.AppID] = nr.NextRun
 		}
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("*Apps \\(%d\\)*\n\n", len(apps)))
+		sb.WriteString(fmt.Sprintf("*PrestoBack v%s* · *%d apps*\n\n", notify.EscapeMD(config.Version), len(apps)))
 		for _, a := range apps {
-			// Badges
 			badges := ""
 			if a.Pinned {
 				badges += " 📌"
@@ -2434,11 +2409,7 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			if s.engine.IsRunning(a.ID) {
 				badges += " ⏳"
 			}
-			if a.Schedule.Enabled && a.Schedule.CronExpr != "" {
-				badges += " 🗓"
-			}
 
-			// Schedule description
 			schedLine := "manual"
 			if a.Schedule.Enabled && a.Schedule.CronExpr != "" {
 				schedLine = scheduler.DescribeCron(a.Schedule.CronExpr)
@@ -2449,15 +2420,15 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 				schedLine = "⏸ paused"
 			}
 
-			// Volume count
 			volCount := len(a.EnabledVolumes())
 			volLabel := "vol"
 			if volCount != 1 {
 				volLabel = "vols"
 			}
 
-			sb.WriteString(fmt.Sprintf("• *%s*%s\n  🗓 %s\n  📦 %d %s · retain %d\n\n",
+			sb.WriteString(fmt.Sprintf("• *%s*%s\n  📁 `%s`\n  🗓 %s\n  📦 %d %s · retain %d\n\n",
 				notify.EscapeMD(a.Name), badges,
+				notify.EscapeMD(a.PrimaryPath()),
 				notify.EscapeMD(schedLine),
 				volCount, volLabel, a.Retain,
 			))
@@ -2834,8 +2805,7 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 		// The | in <name|all> and () throughout are the most common sources of 400 errors.
 		help := "*PrestoBack Bot Commands*\n\n" +
 			"*Backups*\n" +
-			"📊 /status — all apps with paths, cron, retain counts\n" +
-			"📱 /apps — compact overview with readable schedules\n" +
+			"📱 /apps — all apps: path, schedule, next run, volumes, retain\n" +
 			"▶ /backup \\<name\\> — trigger a backup \\(or pick from list\\)\n" +
 			"📜 /history — last 10 events \\(or /history \\<name\\> to filter\\)\n" +
 			"🔍 /logs \\<name\\> — detailed recent backups for one app\n" +
