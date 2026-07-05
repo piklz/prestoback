@@ -245,10 +245,37 @@ func LocalImageCreatedDate(image string) (string, error) {
 // config-blob lookup rather than duplicating it. Best-effort: an error here
 // just means the digest-comparison panel omits that row's date, it never
 // blocks the update-available determination itself.
+// createdDateCache maps a manifest digest -> its remote-fetched created date.
+// Unlike updater.go's updateCacheEntry (which must expire, since "does a
+// newer digest exist" is a question whose answer changes over time), a
+// digest's own created date never changes once fetched — so this cache has
+// no TTL and just grows for the life of the process. In practice it's
+// bounded anyway: the self-update panel only ever tracks one image, so this
+// holds at most a handful of entries (one per digest PrestoBack has ever
+// checked), not one per click.
+var (
+	createdDateCacheMu sync.Mutex
+	createdDateCache   = map[string]string{}
+)
+
 func RemoteImageCreatedDate(image, remoteDigest string) (string, error) {
+	createdDateCacheMu.Lock()
+	if cached, ok := createdDateCache[remoteDigest]; ok {
+		createdDateCacheMu.Unlock()
+		return cached, nil
+	}
+	createdDateCacheMu.Unlock()
+
 	registry, repository, _ := parseImageRef(image)
 	_, created, err := fetchImageDetails(registry, repository, remoteDigest)
-	return created, err
+	if err != nil {
+		return "", err
+	}
+
+	createdDateCacheMu.Lock()
+	createdDateCache[remoteDigest] = created
+	createdDateCacheMu.Unlock()
+	return created, nil
 }
 
 func getRegistryJSON(url, token, accept string) ([]byte, *http.Response, error) {
