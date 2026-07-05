@@ -12,6 +12,15 @@ import (
 	"sync"
 )
 
+// Version is a plain package-level var (not const) so the Docker build can
+// override it via `-ldflags "-X .../config.Version=..."`. docker-build.yml
+// already does this for every build: a `v*` tag gets the tag's own version,
+// and every dev-branch push gets `dev-<short-sha>` — specifically so the
+// running version string always identifies exactly which commit produced
+// it. This literal is only the fallback for a bare `go build`/`go run` that
+// skips that flag entirely — it will not appear in any image the CI
+// pipeline actually produces, so there's no reason to hand-bump it; see
+// CHANGELOG.md instead for tracking what changed and when.
 var Version = "dev"
 
 // ── Sub-types ─────────────────────────────────────────────────────────────────
