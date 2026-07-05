@@ -209,23 +209,41 @@ func (s *Server) checkForUpdates(notifyUser bool) ([]AppUpdateReport, bool) {
 // stay visually consistent.
 func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.ButtonAction) {
 	var updatableApps []string
+	hasRealIssue := false
+	hasSkip := false
 	for _, r := range reports {
 		for _, img := range r.Images {
 			if img.UpdateAvailable {
 				updatableApps = append(updatableApps, r.AppName)
-				break
+				break // count each app once, even if several of its images have updates
+			}
+		}
+	}
+	for _, r := range reports {
+		for _, img := range r.Images {
+			if img.Err == "" {
+				continue
+			}
+			if img.Skipped {
+				hasSkip = true
+			} else {
+				hasRealIssue = true
 			}
 		}
 	}
 
 	var sb strings.Builder
-	switch len(updatableApps) {
-	case 0:
-		sb.WriteString("⚠️ *Update check had issues* — see below\\.\n\n")
-	case 1:
+	switch {
+	case len(updatableApps) == 1:
 		sb.WriteString(fmt.Sprintf("⬆️ *Update available* — `%s`\n\n", notify.EscapeMD(updatableApps[0])))
-	default:
+	case len(updatableApps) > 1:
 		sb.WriteString(fmt.Sprintf("⬆️ *%d app\\(s\\) have updates*\n\n", len(updatableApps)))
+	case hasRealIssue:
+		sb.WriteString("⚠️ *Update check had issues* — see below\\.\n\n")
+	case hasSkip:
+		sb.WriteString("ℹ️ *Update check complete* — some images couldn't be checked \\(pinned by digest or locally built\\) and are tracked manually\\.\n\n")
+	default:
+		sb.WriteString("✅ *Update check complete* — everything up to date\\.\n\n")
 	}
 
 	for _, r := range reports {
@@ -233,6 +251,8 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 		for _, img := range r.Images {
 			name := notify.EscapeMD(img.ContainerName)
 			switch {
+			case img.Err != "" && img.Skipped:
+				sb.WriteString(fmt.Sprintf("ℹ️ `%s` — %s \\(tracked manually\\)\n", name, notify.EscapeMD(img.Err)))
 			case img.Err != "":
 				sb.WriteString(fmt.Sprintf("⚠️ `%s` — %s\n", name, notify.EscapeMD(img.Err)))
 			case img.CurrentVersion != "" && img.LatestVersion != "" && img.CurrentVersion != img.LatestVersion:

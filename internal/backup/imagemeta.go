@@ -53,7 +53,8 @@ type ImageMeta struct {
 	LatestVersion   string // e.g. "3.0.1" — highest semver tag found in the registry, best-effort
 	SizeBytes       int64  // best-effort compressed download size of the new image, 0 if not determined
 	CreatedDate     string // best-effort remote image build date "YYYY-MM-DD", "" if not determined
-	Err             string // non-empty if the check itself failed (registry unreachable, no digest, etc.)
+	Err             string // non-empty if the check itself failed OR was skipped for a benign reason (see Skipped)
+	Skipped         bool   // true when Err is set for a benign, non-actionable reason — pinned-by-digest or a locally-built image — rather than a genuine check failure (registry unreachable, bad tag, etc.). Reporting layers should render these as informational, not warnings.
 }
 
 // CheckImageMeta checks c's image against its registry using the same
@@ -80,6 +81,7 @@ func CheckImageMeta(c ContainerInfo, force bool, cache map[string]ImageMeta) Ima
 
 	if strings.Contains(image, "@sha256:") {
 		res.Err = "image is pinned by digest, not a tag — nothing to compare against"
+		res.Skipped = true
 		cache[image] = res
 		return res
 	}
@@ -104,6 +106,7 @@ func CheckImageMeta(c ContainerInfo, force bool, cache map[string]ImageMeta) Ima
 	}
 	if localDigest == "local-build" {
 		res.Err = "locally built image — no registry digest to track"
+		res.Skipped = true
 		cache[image] = res
 		return res
 	}
