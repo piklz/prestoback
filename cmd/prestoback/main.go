@@ -144,7 +144,11 @@ func installShutdownMarker(dataDir string) {
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		sig := <-sigCh
-		reason := fmt.Sprintf("an external stop signal (%s)", sig)
+		sigName := "SIGTERM"
+		if sig == syscall.SIGINT {
+			sigName = "SIGINT"
+		}
+		reason := fmt.Sprintf("an external stop signal (%s)", sigName)
 		m := shutdownMarker{Reason: reason, At: time.Now().UTC()}
 		if data, err := json.Marshal(m); err == nil {
 			_ = os.WriteFile(shutdownMarkerPath(dataDir), data, 0644)
