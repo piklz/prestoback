@@ -41,6 +41,18 @@ type AppUpdateReport struct {
 	Images  []backup.ImageMeta `json:"images"`
 }
 
+// appCandidates holds one app's already-resolved exact and fuzzy container
+// matches, plus the fuzzy-match specificity to use for tiebreaking (always
+// len(app.ID) today — passed in explicitly rather than recomputed inside
+// resolveContainerOwnership so that function stays pure/testable and doesn't
+// need to know anything about config.AppConfig).
+type appCandidates struct {
+	appID            string
+	exact            []backup.ContainerInfo
+	fuzzy            []backup.ContainerInfo
+	fuzzySpecificity int
+}
+
 // ownedContainers assigns each running container discoverable from apps to
 // exactly one owning app. Exact matches (app.ContainerName, app.LinkedContainers)
 // always outrank fuzzy FindContainers(app.ID) substring matches; among fuzzy
@@ -51,7 +63,47 @@ type AppUpdateReport struct {
 // be used for backup quiescing or update-apply container selection — those
 // deliberately keep the maximal-inclusion FindContainers/LinkedContainers
 // behavior as-is (see the updateMu comment in server.go).
+//
+// The actual specificity/conflict-resolution logic lives in
+// resolveContainerOwnership below — split out so it can be unit tested with
+// plain ContainerInfo fixtures, without needing a real Docker daemon to
+// exercise backup.ContainersByName/FindContainers.
 func ownedContainers(apps []config.AppConfig) map[string][]backup.ContainerInfo {
+	candidates := make([]appCandidates, 0, len(apps))
+	for _, app := range apps {
+		var exact []backup.ContainerInfo
+		if app.ContainerName != "" {
+			exact = append(exact, backup.ContainersByName([]string{app.ContainerName})...)
+		}
+		exact = append(exact, backup.ContainersByName(app.LinkedContainers)...)
+
+		candidates = append(candidates, appCandidates{
+			appID:            app.ID,
+			exact:            backup.DedupeContainers(exact),
+			fuzzy:            backup.DedupeContainers(backup.FindContainers(app.ID)),
+			fuzzySpecificity: len(app.ID),
+		})
+	}
+	return resolveContainerOwnership(candidates)
+}
+
+// resolveContainerOwnership implements the specificity-based conflict
+// resolution described in ownedContainers' doc comment above, given each
+// app's already-resolved candidate container lists. Pure — no Docker calls,
+// no I/O — so it's the piece of this logic most worth covering directly:
+// exact matches always outrank fuzzy ones (constant exactSpecificity, always
+// higher than any real app.ID length), and among fuzzy matches the longer
+// (more specific) app.ID wins.
+//
+// Note the two branches use different tie-break directions on purpose vs.
+// by-accident — worth knowing either way: the fuzzy branch uses strict `>`,
+// so on a tie the FIRST app in candidates to claim a container keeps it. The
+// exact branch uses `>=`, so on a tie (two apps both exact-matching the same
+// container — a config mistake, e.g. via overlapping LinkedContainers) the
+// LAST app in candidates wins instead. See
+// TestResolveContainerOwnership_TiedExactMatchLastAppWins for the
+// reproduction of this asymmetry.
+func resolveContainerOwnership(candidates []appCandidates) map[string][]backup.ContainerInfo {
 	type claim struct {
 		appID       string
 		specificity int
@@ -61,24 +113,17 @@ func ownedContainers(apps []config.AppConfig) map[string][]backup.ContainerInfo 
 	owner := map[string]claim{}               // container ID -> current best claim
 	byID := map[string]backup.ContainerInfo{} // container ID -> the container itself
 
-	for _, app := range apps {
-		var exact []backup.ContainerInfo
-		if app.ContainerName != "" {
-			exact = append(exact, backup.ContainersByName([]string{app.ContainerName})...)
-		}
-		exact = append(exact, backup.ContainersByName(app.LinkedContainers)...)
-		for _, c := range backup.DedupeContainers(exact) {
+	for _, ac := range candidates {
+		for _, c := range ac.exact {
 			byID[c.ID] = c
 			if cur, ok := owner[c.ID]; !ok || exactSpecificity >= cur.specificity {
-				owner[c.ID] = claim{appID: app.ID, specificity: exactSpecificity}
+				owner[c.ID] = claim{appID: ac.appID, specificity: exactSpecificity}
 			}
 		}
-
-		specificity := len(app.ID)
-		for _, c := range backup.DedupeContainers(backup.FindContainers(app.ID)) {
+		for _, c := range ac.fuzzy {
 			byID[c.ID] = c
-			if cur, ok := owner[c.ID]; !ok || specificity > cur.specificity {
-				owner[c.ID] = claim{appID: app.ID, specificity: specificity}
+			if cur, ok := owner[c.ID]; !ok || ac.fuzzySpecificity > cur.specificity {
+				owner[c.ID] = claim{appID: ac.appID, specificity: ac.fuzzySpecificity}
 			}
 		}
 	}
