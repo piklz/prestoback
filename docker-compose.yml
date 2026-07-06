@@ -5,7 +5,7 @@
 #   1. Copy docker-compose.yml to your deployment dir
 #   2. Edit the environment section below (TZ, PRESTOBACK_IMAGE, PRESTOBACK_CONTAINER)
 #   3. docker compose up -d
-#   4. Open http://<pi-ip>:8765 — the API key is printed in the container logs
+#   4. Open http://<pi-ip>:8778 — the API key is printed in the container logs
 
 version: "3.9"
 
@@ -29,7 +29,7 @@ services:
     restart: unless-stopped
 
     ports:
-      - "8765:8765"
+      - "8778:8778"
 
     networks:
       - prestoback-net
@@ -60,7 +60,7 @@ services:
       PRESTOBACK_CONTAINER: prestoback
 
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8765/api/status"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8778/api/status"]
       interval: 30s
       timeout: 5s
       retries: 3

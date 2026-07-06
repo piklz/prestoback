@@ -28,10 +28,10 @@ WORKDIR /app
 COPY --from=builder /prestoback .
 
 VOLUME ["/data", "/volumes"]
-EXPOSE 8765
+EXPOSE 8778
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- http://localhost:8765/healthz || exit 1
 
 ENTRYPOINT ["/app/prestoback"]
-CMD ["--port=8765", "--data=/data", "--volumes=/volumes"]
+CMD ["--port=8778", "--data=/data", "--volumes=/volumes"]
