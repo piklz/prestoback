@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -201,6 +202,15 @@ func inspectSelfMounts(selfName string) map[string]string {
 
 // translateHostPath converts a host path to a path accessible inside the
 // prestoback container using its known mount mappings.
+//
+// When multiple known mounts are prefixes of hostPath (e.g. both "/mnt" and
+// "/mnt/data" are mounted — a realistic compose setup), the MOST SPECIFIC
+// (longest/deepest) mount must win. Candidate mounts are sorted by path
+// length, longest first, before checking prefixes, so the result is always
+// the deepest matching mount rather than whichever one a plain `for range`
+// over the map happened to visit first — map iteration order in Go is
+// intentionally randomized per run, which previously made this function's
+// result non-deterministic for exactly this overlapping-mount case.
 func translateHostPath(hostPath string, hostToContainer map[string]string) (string, bool) {
 	hostPath = filepath.Clean(hostPath)
 
@@ -208,10 +218,16 @@ func translateHostPath(hostPath string, hostToContainer map[string]string) (stri
 		return cp, true
 	}
 
-	for hostMount, containerMount := range hostToContainer {
+	hostMounts := make([]string, 0, len(hostToContainer))
+	for hostMount := range hostToContainer {
+		hostMounts = append(hostMounts, hostMount)
+	}
+	sort.Slice(hostMounts, func(i, j int) bool { return len(hostMounts[i]) > len(hostMounts[j]) })
+
+	for _, hostMount := range hostMounts {
 		if strings.HasPrefix(hostPath, hostMount+"/") {
 			rel := strings.TrimPrefix(hostPath, hostMount)
-			return filepath.Join(containerMount, rel), true
+			return filepath.Join(hostToContainer[hostMount], rel), true
 		}
 	}
 	return "", false
