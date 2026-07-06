@@ -41,18 +41,6 @@ type AppUpdateReport struct {
 	Images  []backup.ImageMeta `json:"images"`
 }
 
-// appCandidates holds one app's already-resolved exact and fuzzy container
-// matches, plus the fuzzy-match specificity to use for tiebreaking (always
-// len(app.ID) today — passed in explicitly rather than recomputed inside
-// resolveContainerOwnership so that function stays pure/testable and doesn't
-// need to know anything about config.AppConfig).
-type appCandidates struct {
-	appID            string
-	exact            []backup.ContainerInfo
-	fuzzy            []backup.ContainerInfo
-	fuzzySpecificity int
-}
-
 // ownedContainers assigns each running container discoverable from apps to
 // exactly one owning app. Exact matches (app.ContainerName, app.LinkedContainers)
 // always outrank fuzzy FindContainers(app.ID) substring matches; among fuzzy
@@ -63,47 +51,7 @@ type appCandidates struct {
 // be used for backup quiescing or update-apply container selection — those
 // deliberately keep the maximal-inclusion FindContainers/LinkedContainers
 // behavior as-is (see the updateMu comment in server.go).
-//
-// The actual specificity/conflict-resolution logic lives in
-// resolveContainerOwnership below — split out so it can be unit tested with
-// plain ContainerInfo fixtures, without needing a real Docker daemon to
-// exercise backup.ContainersByName/FindContainers.
 func ownedContainers(apps []config.AppConfig) map[string][]backup.ContainerInfo {
-	candidates := make([]appCandidates, 0, len(apps))
-	for _, app := range apps {
-		var exact []backup.ContainerInfo
-		if app.ContainerName != "" {
-			exact = append(exact, backup.ContainersByName([]string{app.ContainerName})...)
-		}
-		exact = append(exact, backup.ContainersByName(app.LinkedContainers)...)
-
-		candidates = append(candidates, appCandidates{
-			appID:            app.ID,
-			exact:            backup.DedupeContainers(exact),
-			fuzzy:            backup.DedupeContainers(backup.FindContainers(app.ID)),
-			fuzzySpecificity: len(app.ID),
-		})
-	}
-	return resolveContainerOwnership(candidates)
-}
-
-// resolveContainerOwnership implements the specificity-based conflict
-// resolution described in ownedContainers' doc comment above, given each
-// app's already-resolved candidate container lists. Pure — no Docker calls,
-// no I/O — so it's the piece of this logic most worth covering directly:
-// exact matches always outrank fuzzy ones (constant exactSpecificity, always
-// higher than any real app.ID length), and among fuzzy matches the longer
-// (more specific) app.ID wins.
-//
-// Note the two branches use different tie-break directions on purpose vs.
-// by-accident — worth knowing either way: the fuzzy branch uses strict `>`,
-// so on a tie the FIRST app in candidates to claim a container keeps it. The
-// exact branch uses `>=`, so on a tie (two apps both exact-matching the same
-// container — a config mistake, e.g. via overlapping LinkedContainers) the
-// LAST app in candidates wins instead. See
-// TestResolveContainerOwnership_TiedExactMatchLastAppWins for the
-// reproduction of this asymmetry.
-func resolveContainerOwnership(candidates []appCandidates) map[string][]backup.ContainerInfo {
 	type claim struct {
 		appID       string
 		specificity int
@@ -113,17 +61,24 @@ func resolveContainerOwnership(candidates []appCandidates) map[string][]backup.C
 	owner := map[string]claim{}               // container ID -> current best claim
 	byID := map[string]backup.ContainerInfo{} // container ID -> the container itself
 
-	for _, ac := range candidates {
-		for _, c := range ac.exact {
+	for _, app := range apps {
+		var exact []backup.ContainerInfo
+		if app.ContainerName != "" {
+			exact = append(exact, backup.ContainersByName([]string{app.ContainerName})...)
+		}
+		exact = append(exact, backup.ContainersByName(app.LinkedContainers)...)
+		for _, c := range backup.DedupeContainers(exact) {
 			byID[c.ID] = c
 			if cur, ok := owner[c.ID]; !ok || exactSpecificity >= cur.specificity {
-				owner[c.ID] = claim{appID: ac.appID, specificity: exactSpecificity}
+				owner[c.ID] = claim{appID: app.ID, specificity: exactSpecificity}
 			}
 		}
-		for _, c := range ac.fuzzy {
+
+		specificity := len(app.ID)
+		for _, c := range backup.DedupeContainers(backup.FindContainers(app.ID)) {
 			byID[c.ID] = c
-			if cur, ok := owner[c.ID]; !ok || ac.fuzzySpecificity > cur.specificity {
-				owner[c.ID] = claim{appID: ac.appID, specificity: ac.fuzzySpecificity}
+			if cur, ok := owner[c.ID]; !ok || specificity > cur.specificity {
+				owner[c.ID] = claim{appID: app.ID, specificity: specificity}
 			}
 		}
 	}
@@ -300,22 +255,40 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 		sb.WriteString(fmt.Sprintf("*%s*\n", notify.EscapeMD(r.AppName)))
 		for _, img := range r.Images {
 			name := notify.EscapeMD(img.ContainerName)
+			// Link the name to its registry/package page when recognized
+			// (Docker Hub, GHCR, Quay — see registryWebURL in imagemeta.go).
+			// A markdown link and inline code can't nest in Telegram's
+			// MarkdownV2, so this replaces the old plain backtick styling
+			// rather than layering on top of it.
+			label := fmt.Sprintf("`%s`", name)
+			if img.WebURL != "" {
+				label = fmt.Sprintf("[%s](%s)", name, escapeMDURL(img.WebURL))
+			}
 			switch {
 			case img.Err != "" && img.Skipped:
-				sb.WriteString(fmt.Sprintf("ℹ️ `%s` — %s \\(tracked manually\\)\n", name, notify.EscapeMD(img.Err)))
+				sb.WriteString(fmt.Sprintf("ℹ️ %s — %s \\(tracked manually\\)\n", label, notify.EscapeMD(img.Err)))
 			case img.Err != "":
-				sb.WriteString(fmt.Sprintf("⚠️ `%s` — %s\n", name, notify.EscapeMD(img.Err)))
+				sb.WriteString(fmt.Sprintf("⚠️ %s — %s\n", label, notify.EscapeMD(img.Err)))
 			case img.CurrentVersion != "" && img.LatestVersion != "" && img.CurrentVersion != img.LatestVersion:
-				sb.WriteString(fmt.Sprintf("• `%s` %s → %s", name, notify.EscapeMD(img.CurrentVersion), notify.EscapeMD(img.LatestVersion)))
+				sb.WriteString(fmt.Sprintf("• %s %s → %s", label, notify.EscapeMD(img.CurrentVersion), notify.EscapeMD(img.LatestVersion)))
 				appendSizeSuffix(&sb, img.SizeBytes)
 				sb.WriteString("\n")
 			default:
-				sb.WriteString(fmt.Sprintf("• `%s` update available \\(tag: %s\\)", name, notify.EscapeMD(img.CurrentTag)))
+				sb.WriteString(fmt.Sprintf("• %s update available \\(tag: %s\\)", label, notify.EscapeMD(img.CurrentTag)))
 				appendSizeSuffix(&sb, img.SizeBytes)
 				sb.WriteString("\n")
 			}
+			// "Current" is the build date of the image actually running right
+			// now — this is what Docksentry's "Current: <date>" shows, and
+			// what was missing before. "New build" (when known — only
+			// fetched once an update is confirmed available) is the
+			// replacement image's date, kept separate so the two are never
+			// conflated.
+			if img.LocalCreatedDate != "" {
+				sb.WriteString(fmt.Sprintf("   📅 Current: %s\n", notify.EscapeMD(img.LocalCreatedDate)))
+			}
 			if img.CreatedDate != "" {
-				sb.WriteString(fmt.Sprintf("   📦 %s\n", notify.EscapeMD(img.CreatedDate)))
+				sb.WriteString(fmt.Sprintf("   📦 New build: %s\n", notify.EscapeMD(img.CreatedDate)))
 			}
 		}
 		sb.WriteString("\n")
@@ -339,4 +312,13 @@ func appendSizeSuffix(sb *strings.Builder, sizeBytes int64) {
 		return
 	}
 	sb.WriteString(fmt.Sprintf(" \\(%s\\)", notify.EscapeMD(humanBytes(sizeBytes))))
+}
+
+// escapeMDURL escapes only the two characters MarkdownV2 requires escaping
+// inside a link's URL segment — "\" and ")" — per Telegram's spec. Deliberately
+// NOT notify.EscapeMD, which is for display text and would mangle the URL
+// itself here (e.g. it escapes "." , which would corrupt "github.com").
+func escapeMDURL(url string) string {
+	r := strings.NewReplacer(`\`, `\\`, `)`, `\)`)
+	return r.Replace(url)
 }

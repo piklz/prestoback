@@ -61,6 +61,10 @@ type Server struct {
 	// silently no-op'ing forever like it used to.
 	dismissBatches map[string][]string
 	dismissSeq     int
+	// restartNote carries a human-readable reason from main.go's shutdown-
+	// marker check (see installShutdownMarker/checkPreviousShutdown there) —
+	// "" for a normal start. Read once by runTelegramBot's startup message.
+	restartNote string
 
 	// updateMu serializes ALL container recreate operations (UpdateContainer /
 	// standaloneRecreate, via /update, /update all, the update-check button,
@@ -78,7 +82,7 @@ type Server struct {
 	updateRunning bool
 }
 
-func NewServer(cfg *config.Config, image, selfName string) *Server {
+func NewServer(cfg *config.Config, image, selfName, restartNote string) *Server {
 	hist, _ := history.Load(cfg.HistoryFile())
 	sched := scheduler.New()
 
@@ -93,6 +97,7 @@ func NewServer(cfg *config.Config, image, selfName string) *Server {
 		sseClients:      make(map[chan backup.JobUpdate]struct{}),
 		updateAlertSent: make(map[string]bool),
 		dismissBatches:  make(map[string][]string),
+		restartNote:     restartNote,
 	}
 	s.routes()
 	s.loadSchedules()
@@ -2062,36 +2067,12 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		respond(w, 200, map[string]any{"available": false, "error": err.Error()})
 		return
 	}
-
-	// Best-effort build/created dates for each row of the digest-comparison
-	// table — these are what "Checked" was actually meant to show (it was
-	// previously stamped with the client-side check time for both rows,
-	// which is always identical and tells the user nothing). A failure here
-	// just means the UI omits that date; it never affects hasUpdate/local/remote.
-	var localCreated, remoteCreated string
-	if local != "local-build" {
-		if d, err := backup.LocalImageCreatedDate(s.image); err == nil {
-			localCreated = d
-		} else {
-			log.Printf("[update] local created-date lookup failed for %s: %v", s.image, err)
-		}
-	}
-	if remote != "" {
-		if d, err := backup.RemoteImageCreatedDate(s.image, remote); err == nil {
-			remoteCreated = d
-		} else {
-			log.Printf("[update] remote created-date lookup failed for %s: %v", s.image, err)
-		}
-	}
-
 	respond(w, 200, map[string]any{
-		"available":      hasUpdate,
-		"local_digest":   local,
-		"remote_digest":  remote,
-		"image":          s.image,
-		"locally_built":  local == "local-build",
-		"local_created":  localCreated,
-		"remote_created": remoteCreated,
+		"available":     hasUpdate,
+		"local_digest":  local,
+		"remote_digest": remote,
+		"image":         s.image,
+		"locally_built": local == "local-build",
 	})
 }
 
@@ -2243,9 +2224,16 @@ func (s *Server) runTelegramBot() {
 		time.Sleep(3 * time.Second) // wait for initial config to load
 		nc := s.cfg.GetNotify()
 		if nc.TelegramEnabled && nc.TelegramToken != "" && nc.TelegramChatID != "" {
+			msg := fmt.Sprintf("🟢 *PrestoBack online* — v%s\nType /help for available commands\\.", notify.EscapeMD(config.Version))
+			if s.restartNote != "" {
+				// Plain-text note escaped as a whole rather than hand-built with
+				// inline code spans — simpler than juggling MarkdownV2's nested
+				// escaping rules for a one-off informational line.
+				msg += "\n\n↺ " + notify.EscapeMD(s.restartNote)
+			}
 			_ = notify.SendRaw(
 				notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID},
-				fmt.Sprintf("🟢 *PrestoBack online* — v%s\nType /help for available commands\\.", notify.EscapeMD(config.Version)),
+				msg,
 			)
 		}
 	}()

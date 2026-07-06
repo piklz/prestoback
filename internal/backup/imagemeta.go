@@ -43,18 +43,20 @@ import (
 // longer used by the default check path), this is built entirely from
 // registry API metadata.
 type ImageMeta struct {
-	ContainerName   string `json:"container_name"`
-	Image           string `json:"image"` // full ref as configured, e.g. ghcr.io/immich-app/immich-server:release
-	CurrentTag      string `json:"current_tag"`
-	UpdateAvailable bool   `json:"update_available"`
-	LocalDigest     string `json:"local_digest"`
-	RemoteDigest    string `json:"remote_digest"`
-	CurrentVersion  string `json:"current_version"`   // e.g. "2.7.5" — only set if CurrentTag itself is a semver tag
-	LatestVersion   string `json:"latest_version"`    // e.g. "3.0.1" — highest semver tag found in the registry, best-effort
-	SizeBytes       int64  `json:"size_bytes"`        // best-effort compressed download size of the new image, 0 if not determined
-	CreatedDate     string `json:"created_date"`      // best-effort remote image build date "YYYY-MM-DD", "" if not determined
-	Err             string `json:"err,omitempty"`     // non-empty if the check itself failed OR was skipped for a benign reason (see Skipped)
-	Skipped         bool   `json:"skipped,omitempty"` // true when Err is set for a benign, non-actionable reason — pinned-by-digest or a locally-built image — rather than a genuine check failure (registry unreachable, bad tag, etc.). Reporting layers should render these as informational, not warnings.
+	ContainerName    string `json:"container_name"`
+	Image            string `json:"image"` // full ref as configured, e.g. ghcr.io/immich-app/immich-server:release
+	CurrentTag       string `json:"current_tag"`
+	UpdateAvailable  bool   `json:"update_available"`
+	LocalDigest      string `json:"local_digest"`
+	RemoteDigest     string `json:"remote_digest"`
+	CurrentVersion   string `json:"current_version"`              // e.g. "2.7.5" — only set if CurrentTag itself is a semver tag
+	LatestVersion    string `json:"latest_version"`               // e.g. "3.0.1" — highest semver tag found in the registry, best-effort
+	SizeBytes        int64  `json:"size_bytes"`                   // best-effort compressed download size of the new image, 0 if not determined
+	CreatedDate      string `json:"created_date"`                 // best-effort remote image build date "YYYY-MM-DD", "" if not determined
+	Err              string `json:"err,omitempty"`                // non-empty if the check itself failed OR was skipped for a benign reason (see Skipped)
+	Skipped          bool   `json:"skipped,omitempty"`            // true when Err is set for a benign, non-actionable reason — pinned-by-digest or a locally-built image — rather than a genuine check failure (registry unreachable, bad tag, etc.). Reporting layers should render these as informational, not warnings.
+	WebURL           string `json:"web_url,omitempty"`            // best-effort link to the image's registry/package page ("" if the registry isn't recognized — Docker Hub, GHCR, Quay)
+	LocalCreatedDate string `json:"local_created_date,omitempty"` // build date of the image CURRENTLY RUNNING, "" if not determined — independent of CreatedDate (the new image's date), and populated even when no update exists
 }
 
 // CheckImageMeta checks c's image against its registry using the same
@@ -78,6 +80,10 @@ func CheckImageMeta(c ContainerInfo, force bool, cache map[string]ImageMeta) Ima
 	}
 
 	res := ImageMeta{ContainerName: c.Name, Image: image}
+	// Local-only, no network round trip — safe to always compute, even for
+	// images that turn out pinned-by-digest or locally-built below, so
+	// "Current: <date>" still shows up in those cases too.
+	res.LocalCreatedDate = localImageCreatedDate(image)
 
 	if strings.Contains(image, "@sha256:") {
 		res.Err = "image is pinned by digest, not a tag — nothing to compare against"
@@ -88,6 +94,7 @@ func CheckImageMeta(c ContainerInfo, force bool, cache map[string]ImageMeta) Ima
 
 	registry, repository, tag := parseImageRef(image)
 	res.CurrentTag = tag
+	res.WebURL = registryWebURL(registry, repository)
 	if sv, ok := parseSemverTag(tag); ok {
 		res.CurrentVersion = sv.raw
 	}
@@ -222,62 +229,6 @@ func fetchImageDetails(registry, repository, digest string) (sizeBytes int64, cr
 	return sizeBytes, createdDate, nil
 }
 
-// LocalImageCreatedDate returns the local image's build date (as recorded in
-// its own config) via `docker image inspect`, formatted "YYYY-MM-DD". Used by
-// the self-update digest-comparison panel, which — unlike the per-app check
-// path — has no ImageMeta struct of its own and needs this looked up
-// directly rather than via CheckImageMeta.
-func LocalImageCreatedDate(image string) (string, error) {
-	out, err := exec.Command("docker", "image", "inspect", "--format={{.Created}}", image).Output()
-	if err != nil {
-		return "", err
-	}
-	raw := strings.TrimSpace(string(out))
-	if t, err := time.Parse(time.RFC3339, raw); err == nil {
-		return t.Format("2006-01-02"), nil
-	}
-	return raw, nil
-}
-
-// RemoteImageCreatedDate returns the remote image's build date for a digest
-// already obtained via the self-updater's registry HEAD check (updater.go's
-// headRegistryDigest) — reusing fetchImageDetails' manifest-list-aware,
-// config-blob lookup rather than duplicating it. Best-effort: an error here
-// just means the digest-comparison panel omits that row's date, it never
-// blocks the update-available determination itself.
-// createdDateCache maps a manifest digest -> its remote-fetched created date.
-// Unlike updater.go's updateCacheEntry (which must expire, since "does a
-// newer digest exist" is a question whose answer changes over time), a
-// digest's own created date never changes once fetched — so this cache has
-// no TTL and just grows for the life of the process. In practice it's
-// bounded anyway: the self-update panel only ever tracks one image, so this
-// holds at most a handful of entries (one per digest PrestoBack has ever
-// checked), not one per click.
-var (
-	createdDateCacheMu sync.Mutex
-	createdDateCache   = map[string]string{}
-)
-
-func RemoteImageCreatedDate(image, remoteDigest string) (string, error) {
-	createdDateCacheMu.Lock()
-	if cached, ok := createdDateCache[remoteDigest]; ok {
-		createdDateCacheMu.Unlock()
-		return cached, nil
-	}
-	createdDateCacheMu.Unlock()
-
-	registry, repository, _ := parseImageRef(image)
-	_, created, err := fetchImageDetails(registry, repository, remoteDigest)
-	if err != nil {
-		return "", err
-	}
-
-	createdDateCacheMu.Lock()
-	createdDateCache[remoteDigest] = created
-	createdDateCacheMu.Unlock()
-	return created, nil
-}
-
 func getRegistryJSON(url, token, accept string) ([]byte, *http.Response, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -339,6 +290,57 @@ func hostPlatform() (arch, variant string) {
 		}
 	})
 	return platformArch, platformVariant
+}
+
+// ── Local image build date / registry web link ────────────────────────────────
+//
+// Both are purely cosmetic additions to the Telegram report (Docksentry-style
+// clickable image name + "Current: <date>"), and both fail soft — an error
+// or unrecognized registry just means the field stays "", never breaks the
+// check itself.
+
+// localImageCreatedDate returns the build date of the image reference as it
+// exists LOCALLY right now — a single local `docker image inspect`, no
+// registry round trip, so it's cheap enough to always compute, independent
+// of whether an update was found.
+func localImageCreatedDate(image string) string {
+	out, err := exec.Command("docker", "image", "inspect", "--format={{.Created}}", image).Output()
+	if err != nil {
+		return ""
+	}
+	if t, perr := time.Parse(time.RFC3339, strings.TrimSpace(string(out))); perr == nil {
+		return t.Format("2006-01-02")
+	}
+	return ""
+}
+
+// registryWebURL best-effort maps a registry+repository to a human-browsable
+// package page, for the handful of registries with a well-known URL scheme.
+// Returns "" for anything else (private registries, unrecognized hosts) —
+// callers render the plain image name with no link in that case.
+func registryWebURL(registry, repository string) string {
+	switch registry {
+	case "registry-1.docker.io", "docker.io", "index.docker.io":
+		if strings.HasPrefix(repository, "library/") {
+			return "https://hub.docker.com/_/" + strings.TrimPrefix(repository, "library/")
+		}
+		return "https://hub.docker.com/r/" + repository
+	case "ghcr.io":
+		// GHCR web URLs are keyed by org + package name, not by the source
+		// repo name (which can differ) — org/packages/container/package/<pkg>
+		// is stable regardless of what repo the package build comes from.
+		parts := strings.SplitN(repository, "/", 2)
+		if len(parts) == 2 {
+			pkg := parts[1]
+			if idx := strings.LastIndex(pkg, "/"); idx >= 0 {
+				pkg = pkg[idx+1:]
+			}
+			return "https://github.com/orgs/" + parts[0] + "/packages/container/package/" + pkg
+		}
+	case "quay.io":
+		return "https://quay.io/repository/" + repository
+	}
+	return ""
 }
 
 // ── Version tag lookup ────────────────────────────────────────────────────────
