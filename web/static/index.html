@@ -601,6 +601,34 @@ select.fi{cursor:pointer}
       <button class="btn btn-p" onclick="saveEncryption()">Save encryption settings</button>
     </div></div>
   </div>
+  <div class="sec">
+    <div class="card"><div class="ch"><div class="ct">Remote Backup Targets</div></div><div class="cb">
+      <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><path d="M20 16.58A5 5 0 0018 7h-1.26A8 8 0 104 15.25"/><polyline points="12 12 12 21"/><polyline points="9 18 12 21 15 18"/></svg><div class="info-t">Copies each finished backup to an off-box destination — the local copy on this Pi is <strong>never</strong> replaced or skipped, this is always an extra copy. <strong>Mount</strong> targets are a folder already inside this container (e.g. an SMB/NFS share mounted on the host and bind-mounted in). <strong>rclone</strong> targets use an installed <code>rclone</code> binary plus a remote already configured in rclone's own config — S3-compatible, SFTP, a real SMB remote, WebDAV, Backblaze B2. Google Drive/OneDrive/Dropbox aren't offered here since those need an interactive browser login rclone can't do headlessly — set those up as a "mount" via <code>rclone mount</code> on the host instead, if needed.</div></div>
+      <div class="fg"><div class="ftog" onclick="togRemote()"><div class="ftog-sw" id="tog-remote"><div class="ftog-kn"></div></div><div class="ftog-lbl">Push new backups to the targets below</div></div></div>
+
+      <div id="remote-target-list" style="margin:6px 0 4px"></div>
+
+      <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:8px">
+        <div class="fl" style="margin-bottom:8px">Add a target</div>
+        <div class="fg"><label class="fl">Name</label><input class="fi" id="rt-name" placeholder="e.g. Synology NAS"></div>
+        <div class="fg"><label class="fl">Kind</label>
+          <select class="fi" id="rt-kind" onchange="onRtKindChange()">
+            <option value="mount">Mount (folder already in this container)</option>
+            <option value="rclone">rclone remote</option>
+          </select>
+        </div>
+        <div class="fg" id="rt-mount-field"><label class="fl">Mount path</label><input class="fi" id="rt-mount-path" placeholder="/remote/nas"><div class="fh">A path inside THIS container, e.g. mounted with <code>-v /mnt/nas/presto-backups:/remote/nas</code>.</div></div>
+        <div class="fg" id="rt-rclone-field" style="display:none"><label class="fl">rclone remote</label><input class="fi" id="rt-rclone-remote" placeholder="nas-smb:presto-backups"><div class="fh">Exactly as it appears in <code>rclone listremotes</code> — configured once, outside PrestoBack, via <code>rclone config</code>.</div></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <button class="btn btn-g btn-sm" onclick="testRemoteTargetDraft()">Test connection</button>
+          <button class="btn btn-p btn-sm" onclick="addRemoteTarget()">+ Add target</button>
+          <span class="fh" id="rt-test-result" style="margin:0"></span>
+        </div>
+      </div>
+
+      <button class="btn btn-p" style="margin-top:18px" onclick="saveRemote()">Save remote backup settings</button>
+    </div></div>
+  </div>
 </div>
 
 <!-- UPDATES -->
@@ -1483,7 +1511,7 @@ function settingsTab(name) {
       tab.style.borderBottomColor = t===name ? 'var(--accent)' : 'transparent';
     }
   });
-  if (name==='sec') { loadStatus(); loadEncryption(); }
+  if (name==='sec') { loadStatus(); loadEncryption(); loadRemote(); }
 }
 
 // Mobile off-canvas sidebar
@@ -2478,7 +2506,7 @@ function renderBkPage() {
         ? '<span style="font-size:14px">⭐</span>'
         : '<svg width="14" height="14" fill="none" stroke="var(--accent)" stroke-width="1.8" viewBox="0 0 24 24"><path d="M20 7H4a1 1 0 00-1 1v11a1 1 0 001 1h16a1 1 0 001-1V8a1 1 0 00-1-1z"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg>'}</div>
       <div class="bm">
-        <div class="bid">${esc(m.id)} ${m.pre_restore?'<span class="pill pa" style="font-size:9px">safety snap</span>':''}</div>
+        <div class="bid">${esc(m.id)} ${m.pre_restore?'<span class="pill pa" style="font-size:9px">safety snap</span>':''}${m.remote&&m.remote.length?`<span class="pill pg" style="font-size:9px" title="${esc(m.remote.join(', '))}">☁ ${m.remote.length>1?m.remote.length+' remotes':'remote'}</span>`:''}</div>
         <div class="bif">${new Date(m.started_at).toLocaleString()}</div>
       </div>
       <span class="bsz">${missing?'<span style="color:var(--red)">corrupt/empty</span>':fmtBytes(m.size_bytes)}</span>
@@ -2837,6 +2865,108 @@ async function saveEncryption() {
     S_encPassSet = !!r.passphrase_is_set;
     document.getElementById('enc-passphrase').value = '';
     toast('Encryption settings saved','success');
+  } catch(e) { toast(e.message,'error'); }
+}
+
+// ════════════════════ Remote backup targets ════════════════════
+// S_remoteTargets mirrors config.RemoteConfig.targets exactly (name/kind/
+// mount_path/rclone_remote) — kept as a plain in-memory array and only
+// written back with saveRemote(); add/remove below just mutate this array
+// and re-render, same "edit locally, Save commits" shape as the rest of
+// this settings page (see saveEncryption above).
+let S_remoteTargets = [];
+async function loadRemote() {
+  try {
+    const r = await api('/api/remote');
+    setTog('tog-remote', !!r.enabled);
+    S_remoteTargets = r.targets || [];
+    renderRemoteTargets();
+  } catch {}
+}
+function togRemote() { setTog('tog-remote', !document.getElementById('tog-remote').classList.contains('on')); }
+
+function renderRemoteTargets() {
+  const el = document.getElementById('remote-target-list');
+  if (!S_remoteTargets.length) {
+    el.innerHTML = `<div style="color:var(--txt2);font-size:12.5px;padding:6px 0">No remote targets configured yet — add one below.</div>`;
+    return;
+  }
+  el.innerHTML = S_remoteTargets.map((t,i) => `
+    <div class="bi">
+      <div class="bic"><svg width="14" height="14" fill="none" stroke="var(--accent)" stroke-width="1.8" viewBox="0 0 24 24"><path d="M20 16.58A5 5 0 0018 7h-1.26A8 8 0 104 15.25"/></svg></div>
+      <div class="bm">
+        <div class="bid">${esc(t.name)} <span class="pill pb" style="font-size:9px">${t.kind}</span></div>
+        <div class="bif">${esc(t.kind==='mount' ? t.mount_path : t.rclone_remote)}</div>
+      </div>
+      <div style="display:flex;gap:6px">
+        <button class="btn btn-g btn-sm" onclick="testExistingRemoteTarget(${i})">Test</button>
+        <button class="btn btn-d btn-sm btn-ic" onclick="removeRemoteTarget(${i})">🗑</button>
+      </div>
+    </div>`).join('');
+}
+
+function onRtKindChange() {
+  document.getElementById('rt-mount-field').style.display = document.getElementById('rt-kind').value === 'mount' ? '' : 'none';
+  document.getElementById('rt-rclone-field').style.display = document.getElementById('rt-kind').value === 'rclone' ? '' : 'none';
+}
+
+function draftRemoteTarget() {
+  const kind = document.getElementById('rt-kind').value;
+  const t = { name: gv('rt-name'), kind };
+  if (kind === 'mount') t.mount_path = gv('rt-mount-path');
+  else t.rclone_remote = gv('rt-rclone-remote');
+  return t;
+}
+
+async function testRemoteTargetDraft() { await runRemoteTest(draftRemoteTarget(), 'rt-test-result'); }
+async function testExistingRemoteTarget(i) { await runRemoteTest(S_remoteTargets[i], null); }
+
+async function runRemoteTest(target, resultElId) {
+  if (!target.name || (target.kind==='mount' ? !target.mount_path : !target.rclone_remote)) {
+    toast('Fill in the target fields before testing','error');
+    return;
+  }
+  const resultEl = resultElId ? document.getElementById(resultElId) : null;
+  if (resultEl) resultEl.textContent = 'Testing…';
+  try {
+    const r = await api('/api/remote/test',{method:'POST',body:JSON.stringify(target)});
+    if (r.ok) {
+      toast(`"${target.name}" is reachable ✓`,'success');
+      if (resultEl) resultEl.textContent = '✓ reachable';
+    } else {
+      toast(`"${target.name}": ${r.error}`,'error');
+      if (resultEl) resultEl.textContent = '✗ ' + r.error;
+    }
+  } catch(e) {
+    toast(e.message,'error');
+    if (resultEl) resultEl.textContent = '✗ ' + e.message;
+  }
+}
+
+function addRemoteTarget() {
+  const t = draftRemoteTarget();
+  if (!t.name) { toast('Give the target a name','error'); return; }
+  if (t.kind==='mount' && !t.mount_path) { toast('Mount path is required','error'); return; }
+  if (t.kind==='rclone' && !t.rclone_remote) { toast('rclone remote is required','error'); return; }
+  S_remoteTargets.push(t);
+  renderRemoteTargets();
+  document.getElementById('rt-name').value = '';
+  document.getElementById('rt-mount-path').value = '';
+  document.getElementById('rt-rclone-remote').value = '';
+  document.getElementById('rt-test-result').textContent = '';
+  toast(`"${t.name}" added — click "Save remote backup settings" to persist it`,'success');
+}
+function removeRemoteTarget(i) {
+  S_remoteTargets.splice(i,1);
+  renderRemoteTargets();
+}
+async function saveRemote() {
+  const enabled = document.getElementById('tog-remote').classList.contains('on');
+  try {
+    const r = await api('/api/remote',{method:'PUT',body:JSON.stringify({enabled, targets:S_remoteTargets})});
+    S_remoteTargets = r.targets || [];
+    renderRemoteTargets();
+    toast('Remote backup settings saved','success');
   } catch(e) { toast(e.message,'error'); }
 }
 

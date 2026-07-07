@@ -1727,8 +1727,19 @@ func (s *Server) pushToRemotes(appID, appName string, metas []backup.BackupMeta,
 			RcloneRemote: t.RcloneRemote,
 		}
 		pushStart := time.Now()
-		_, pushErr := backup.PushAppBackup(appID, metas, manifestPath, target, emit)
+		pushed, pushErr := backup.PushAppBackup(appID, metas, manifestPath, target, emit)
 		pushDur := time.Since(pushStart).Milliseconds()
+
+		// Record whatever succeeded, even on a partial failure — a manifest
+		// silently missing remote status for a file that DID reach the
+		// target is worse than one that's simply quiet about a file that
+		// didn't. Best-effort: this is bookkeeping for the UI, never
+		// something that should undo or re-report the push itself.
+		if len(pushed) > 0 {
+			if updErr := s.engine.UpdateManifestRemoteStatus(manifestPath, pushed); updErr != nil {
+				log.Printf("[remote] could not record push status in manifest %s: %v", manifestPath, updErr)
+			}
+		}
 
 		if pushErr != nil {
 			emit(fmt.Sprintf("⚠  Remote push to %s had issues: %v", t.Name, pushErr))

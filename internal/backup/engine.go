@@ -43,8 +43,14 @@ type BackupMeta struct {
 	Status     Status     `json:"status"`
 	Error      string     `json:"error,omitempty"`
 	FilePath   string     `json:"file_path"`
-	Remote     string     `json:"remote,omitempty"`
-	PreRestore bool       `json:"pre_restore,omitempty"`
+	// Remote lists every configured target this specific archive has been
+	// successfully pushed to (see internal/backup/remote.go PushAppBackup
+	// and ManifestEntry.Remote below, which is the field actually persisted
+	// across restarts — ListBackups populates this one by reading manifests
+	// back off disk, same as it derives everything else about a listed
+	// archive from what's actually there).
+	Remote     []string `json:"remote,omitempty"`
+	PreRestore bool     `json:"pre_restore,omitempty"`
 	// Encrypted is true when this archive was written through EncryptStream
 	// (see backupcrypto.go). When true, SizeBytes and the manifest's SHA256
 	// both describe the CIPHERTEXT on disk, not the plaintext — restoring
@@ -580,6 +586,8 @@ func (e *Engine) ListBackups(appID string) ([]BackupMeta, error) {
 		return nil, err
 	}
 
+	remoteByFile := loadRemoteStatus(dir)
+
 	var metas []BackupMeta
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".tar.gz") {
@@ -602,12 +610,44 @@ func (e *Engine) ListBackups(appID string) ([]BackupMeta, error) {
 			StartedAt:  info.ModTime(),
 			Status:     StatusSuccess,
 			PreRestore: preRestore,
+			Remote:     remoteByFile[entry.Name()],
 		})
 	}
 	sort.Slice(metas, func(i, j int) bool {
 		return metas[i].StartedAt.After(metas[j].StartedAt)
 	})
 	return metas, nil
+}
+
+// loadRemoteStatus scans every *_manifest.json in dir ONCE and returns a
+// map of archive file name → the remote target paths/URIs it has reached,
+// so ListBackups can show "pushed to NAS ✓" without needing to know which
+// specific run-manifest a given archive belongs to — a listing spans many
+// runs, and manifests batch several volumes' archives from one run
+// together, so there's no single manifest filename to construct from an
+// archive ID alone. Best-effort throughout: an unreadable or unparsable
+// manifest is skipped, never fails the whole listing — a backup you can
+// already see and restore shouldn't disappear from the list just because
+// one manifest file went stale.
+func loadRemoteStatus(dir string) map[string][]string {
+	result := map[string][]string{}
+	matches, _ := filepath.Glob(filepath.Join(dir, "*_manifest.json"))
+	for _, mp := range matches {
+		data, err := os.ReadFile(mp)
+		if err != nil {
+			continue
+		}
+		var m Manifest
+		if json.Unmarshal(data, &m) != nil {
+			continue
+		}
+		for _, ent := range m.Entries {
+			if len(ent.Remote) > 0 {
+				result[ent.FileName] = ent.Remote
+			}
+		}
+	}
+	return result
 }
 
 // volumeSlugFromID extracts the volume slug from an archive ID.
@@ -780,6 +820,14 @@ type ManifestEntry struct {
 	// A restore flow reads this from the manifest to decide whether to
 	// prompt for a passphrase, without needing to guess from file content.
 	Encrypted bool `json:"encrypted,omitempty"`
+	// Remote lists every target (by remote path/URI) this archive has been
+	// successfully pushed to — see UpdateManifestRemoteStatus below.
+	// Written after the fact by a separate call, not by WriteManifest
+	// itself, because pushing happens AFTER the manifest is first written
+	// (a remote holding archives with no manifest describing them is a
+	// worse state than the reverse ordering — see pushToRemotes in
+	// internal/api/server.go for why).
+	Remote []string `json:"remote,omitempty"`
 }
 
 // Manifest is the full record for a single backup run (all volumes).
@@ -847,6 +895,75 @@ func (e *Engine) WriteManifest(appID, appName string, metas []BackupMeta, durati
 		return "", err
 	}
 	return manifestPath, nil
+}
+
+// UpdateManifestRemoteStatus records that pushedPaths (local archive file
+// path → remote path/URI, as returned by backup.PushAppBackup) succeeded,
+// by appending to each matching ManifestEntry.Remote in the manifest at
+// manifestPath.
+//
+// Called once per configured remote target (see pushToRemotes in
+// internal/api/server.go), so pushing the same archive to N targets over N
+// calls ACCUMULATES rather than overwrites — Remote ends up listing every
+// target a file reached, not just the most recent one. Best-effort: a
+// failure here (unreadable/unparsable manifest, disk write error) is
+// logged by the caller and never undoes or blocks the push itself — the
+// archive already safely landed on the remote target either way, this is
+// purely bookkeeping for the UI.
+func (e *Engine) UpdateManifestRemoteStatus(manifestPath string, pushedPaths map[string]string) error {
+	if len(pushedPaths) == 0 {
+		return nil
+	}
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return err
+	}
+	var m Manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+
+	// pushedPaths is keyed by the local FILE PATH (e.g.
+	// /data/backups/myapp/myapp_data_20260707_120000.tar.gz) but
+	// ManifestEntry only stores the base filename — index by that instead.
+	byBase := map[string]string{}
+	for localPath, remotePath := range pushedPaths {
+		byBase[filepath.Base(localPath)] = remotePath
+	}
+
+	changed := false
+	for i := range m.Entries {
+		remotePath, ok := byBase[m.Entries[i].FileName]
+		if !ok {
+			continue
+		}
+		if !containsString(m.Entries[i].Remote, remotePath) {
+			m.Entries[i].Remote = append(m.Entries[i].Remote, remotePath)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil // e.g. this manifest doesn't mention any of pushedPaths — the manifest for the archive's OWN run, not this one
+	}
+
+	out, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := manifestPath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, manifestPath)
+}
+
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // ── Archive encryption (wires backupcrypto.go's EncryptStream/DecryptStream
