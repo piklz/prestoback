@@ -159,6 +159,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/notify", s.adminForWrites(s.handleNotify))
 	s.mux.HandleFunc("/api/notify/test", s.adminForWrites(s.handleNotifyTest))
 	s.mux.HandleFunc("/api/encryption", s.adminForWrites(s.handleEncryption))
+	s.mux.HandleFunc("/api/remote", s.adminForWrites(s.handleRemote))
+	s.mux.HandleFunc("/api/remote/test", s.adminForWrites(s.handleRemoteTest))
 	s.mux.HandleFunc("/api/apikey/regenerate", s.adminForWrites(s.handleRegenKey))
 	s.mux.HandleFunc("/api/update/apply", s.adminForWrites(s.handleUpdateApply))
 	s.mux.HandleFunc("/api/maintenance", s.adminForWrites(s.handleMaintenance))
@@ -353,6 +355,75 @@ func (s *Server) handleEncryption(w http.ResponseWriter, r *http.Request) {
 	default:
 		errOut(w, 405, "method not allowed")
 	}
+}
+
+// handleRemote is the off-box push destinations settings endpoint. Unlike
+// encryption's passphrase, nothing in config.RemoteTarget is itself a
+// secret (an rclone remote name references credentials that live in
+// rclone.conf, outside PrestoBack entirely — see remote.go's package
+// comment) so, unlike handleEncryption, GET here echoes the full config
+// back with no redaction.
+func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		respond(w, 200, s.cfg.GetRemote())
+	case http.MethodPut:
+		var rc config.RemoteConfig
+		if err := parseJSON(r, &rc); err != nil {
+			errOut(w, 400, err.Error())
+			return
+		}
+		for i, t := range rc.Targets {
+			if t.Name == "" {
+				errOut(w, 400, fmt.Sprintf("target %d: name is required", i))
+				return
+			}
+			switch t.Kind {
+			case "mount":
+				if t.MountPath == "" {
+					errOut(w, 400, fmt.Sprintf("target %q: mount_path is required for kind=mount", t.Name))
+					return
+				}
+			case "rclone":
+				if t.RcloneRemote == "" {
+					errOut(w, 400, fmt.Sprintf("target %q: rclone_remote is required for kind=rclone", t.Name))
+					return
+				}
+			default:
+				errOut(w, 400, fmt.Sprintf("target %q: kind must be \"mount\" or \"rclone\", got %q", t.Name, t.Kind))
+				return
+			}
+		}
+		s.cfg.SetRemote(rc)
+		respond(w, 200, rc)
+	default:
+		errOut(w, 405, "method not allowed")
+	}
+}
+
+// handleRemoteTest checks one target's reachability without saving it —
+// lets the settings UI validate a NAS mount or rclone remote before the
+// user commits to it, the same "try before you save" shape
+// handleNotifyTest already gives Telegram/Discord/ntfy.
+func (s *Server) handleRemoteTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	var t config.RemoteTarget
+	if err := parseJSON(r, &t); err != nil {
+		errOut(w, 400, err.Error())
+		return
+	}
+	target := backup.RemoteTarget{
+		Name: t.Name, Kind: t.Kind,
+		MountPath: t.MountPath, RcloneRemote: t.RcloneRemote,
+	}
+	if err := backup.RemoteReachable(target); err != nil {
+		respond(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	respond(w, 200, map[string]any{"ok": true})
 }
 
 func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request) {
@@ -1624,9 +1695,59 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 		emit("⚠  Could not write backup manifest: " + mErr.Error())
 	} else {
 		emit("✓ Manifest written: " + filepath.Base(manifestPath))
+		// Gated on the manifest write succeeding: a remote holding archives
+		// with no manifest to describe them is a worse state than just not
+		// pushing this run at all — see pushToRemotes's doc comment.
+		s.pushToRemotes(app.ID, app.Name, metas, manifestPath, emit)
 	}
 
 	emit("━━━ Backup complete ━━━")
+}
+
+// pushToRemotes copies this run's archives (+ manifest) to every enabled
+// backup.RemoteConfig target, one target at a time, best-effort — a failed
+// push to one NAS/rclone remote doesn't stop the others from being tried,
+// same posture PushAppBackup itself takes across files within one target.
+//
+// Deliberately NOT gating this on the local backup having fully succeeded:
+// PushAppBackup already only pushes metas with StatusSuccess, so a partial
+// local failure just means a partial remote push, mirroring exactly what
+// happened locally — never "pretend nothing failed" and never "refuse to
+// push what did succeed."
+func (s *Server) pushToRemotes(appID, appName string, metas []backup.BackupMeta, manifestPath string, emit func(string)) {
+	rc := s.cfg.GetRemote()
+	if !rc.Enabled || len(rc.Targets) == 0 {
+		return
+	}
+	for _, t := range rc.Targets {
+		target := backup.RemoteTarget{
+			Name:         t.Name,
+			Kind:         t.Kind,
+			MountPath:    t.MountPath,
+			RcloneRemote: t.RcloneRemote,
+		}
+		pushStart := time.Now()
+		_, pushErr := backup.PushAppBackup(appID, metas, manifestPath, target, emit)
+		pushDur := time.Since(pushStart).Milliseconds()
+
+		if pushErr != nil {
+			emit(fmt.Sprintf("⚠  Remote push to %s had issues: %v", t.Name, pushErr))
+			s.hist.Append(history.Entry{
+				Event: history.EventPushFail, AppID: appID, AppName: appName,
+				Detail: fmt.Sprintf("%s: %v", t.Name, pushErr), DurationMs: pushDur,
+			})
+			s.dispatchNotify(notify.Event{Kind: "push_fail", AppName: appName,
+				Detail: fmt.Sprintf("%s: %v", t.Name, pushErr), IsError: true})
+			continue
+		}
+
+		emit(fmt.Sprintf("✓ Remote push to %s complete", t.Name))
+		s.hist.Append(history.Entry{
+			Event: history.EventPushSuccess, AppID: appID, AppName: appName,
+			Detail: t.Name, DurationMs: pushDur,
+		})
+		s.dispatchNotify(notify.Event{Kind: "push_success", AppName: appName, Detail: t.Name})
+	}
 }
 
 // volumeNames returns a comma-separated list of volume slugs for logging.
