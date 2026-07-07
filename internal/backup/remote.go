@@ -233,7 +233,11 @@ func ListRemoteFiles(t RemoteTarget, appID string) ([]RemoteFile, error) {
 		}
 		var out []RemoteFile
 		for _, e := range entries {
-			if e.IsDir() {
+			// Only archives are restorable "backups" — the manifest that
+			// PushAppBackup copies alongside them is metadata, not a
+			// second thing to restore, same distinction ListBackups draws
+			// locally (engine.go) by skipping non-.tar.gz files.
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".tar.gz") {
 				continue
 			}
 			info, err := e.Info()
@@ -272,7 +276,7 @@ func ListRemoteFiles(t RemoteTarget, appID string) ([]RemoteFile, error) {
 		}
 		var files []RemoteFile
 		for _, r := range raw {
-			if r.IsDir {
+			if r.IsDir || !strings.HasSuffix(r.Name, ".tar.gz") {
 				continue
 			}
 			files = append(files, RemoteFile{
