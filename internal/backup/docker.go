@@ -1003,6 +1003,121 @@ func standaloneRecreate(c ContainerInfo, newImage string, emit func(string)) (ro
 	return false, nil
 }
 
+// composeRecreateWithRollback recreates a single compose-managed service,
+// waits for it to reach "running", and rolls back to the previously-running
+// image on any failure — the compose-path counterpart to standaloneRecreate's
+// HostConfig-based rollback above.
+//
+// Compose exposes no HostConfig snapshot to fall back on the way a plain
+// container does, so the "previous state" this function preserves is
+// narrower and more specific: just the image that was running before the
+// pull. That's deliberate — everything else about the service (volumes,
+// networks, env) is defined by the compose file itself and isn't touched by
+// an update, so it's not this function's job to snapshot or restore it.
+//
+// 10 minutes for the recreate — long enough for a single heavy service
+// (e.g. immich_server) to pull-recreate without our own timeout killing
+// compose mid-sequence. 30s health-check window matches standaloneRecreate.
+func composeRecreateWithRollback(c ContainerInfo, image, service, project, composeFile string, emit func(string)) (rolled bool, err error) {
+	// stackFileArgs uses --project-directory so this single-container update
+	// sees the exact same project context as /stack commands and a manual
+	// "cd ~/presto && docker compose up -d" — same .env loading, same
+	// env_file resolution, same config hash.
+	fileArgs := stackFileArgs(composeFile)
+
+	// Capture the OLD image's content-addressed ID (a sha256 digest, distinct
+	// from the mutable "repo:tag" string in `image`) BEFORE compose pulls and
+	// recreates. `docker pull` moves what the tag points to locally, so once
+	// the pull has happened, the tag alone can no longer get us back to what
+	// was running a moment ago — the digest is the only handle left on it.
+	// Best-effort: if this can't be read, rollback below is simply skipped
+	// and the original error is surfaced as-is.
+	oldImageIDOut, _ := exec.Command("docker", "inspect", "--format={{.Image}}", c.ID).Output()
+	oldImageID := strings.TrimSpace(string(oldImageIDOut))
+
+	const composeUpTimeout = 10 * time.Minute
+	upCtx, upCancel := context.WithTimeout(context.Background(), composeUpTimeout)
+	defer upCancel()
+
+	emit(fmt.Sprintf("Recreating %s via compose (service: %s)…", c.Name, service))
+	// --force-recreate: recreate even if config hash looks unchanged — after
+	// a pull the image digest changed but compose's config hash may not have,
+	// causing it to leave the old container running. Docksentry uses this too.
+	// --no-deps: only recreate THIS service, not its dependencies.
+	upOut, upErr := composeCmd(upCtx, fileArgs, "up", "-d", "--no-deps", "--force-recreate", service).CombinedOutput()
+
+	var failure error
+	switch {
+	case upErr != nil:
+		failure = fmt.Errorf("compose up failed for %s: %s", service, stripDockerOutput(string(upOut)))
+	default:
+		newCi := findComposeService(project, service)
+		if newCi == nil {
+			failure = fmt.Errorf("could not locate recreated container for service %s after compose up", service)
+			break
+		}
+		if waitErr := waitRunning(newCi.ID, c.Name, 30*time.Second, emit); waitErr != nil {
+			failure = fmt.Errorf("health check: %v", waitErr)
+			break
+		}
+		emit(fmt.Sprintf("Container %s is running ✓", c.Name))
+		return false, nil
+	}
+
+	// Something above failed. Only attempt rollback if we actually captured
+	// a usable prior image ID — otherwise there's nothing to roll back to,
+	// and pretending otherwise would just replace one confusing error with
+	// another.
+	if oldImageID == "" {
+		return false, failure
+	}
+	return composeRollback(oldImageID, image, project, service, fileArgs, emit, failure)
+}
+
+// composeRollback restores the previously-running image for a compose
+// service after a failed recreate or failed health check.
+//
+// Compose has no "undo my last up" primitive the way a plain container's
+// HostConfig lets standaloneRecreate roll back — the compose file still
+// says `image: repo:tag`, and by this point that tag points at the new
+// (broken) image locally. So rollback here works by force-moving the tag
+// back: retag oldImageID onto `image` (the exact repo:tag compose reads),
+// then force-recreate once more with --pull=never, which guarantees compose
+// reuses the just-retagged local image rather than reaching out to the
+// registry again — which would just re-fetch the broken one.
+func composeRollback(oldImageID, image, project, service string, fileArgs []string, emit func(string), reason error) (rolled bool, err error) {
+	emit(fmt.Sprintf("⚠  %s failed — rolling back %s to previous image…", service, service))
+
+	if out, tagErr := exec.Command("docker", "tag", oldImageID, image).CombinedOutput(); tagErr != nil {
+		log.Printf("[compose-rollback] WARNING: could not retag %s back to %s: %s", oldImageID, image, stripDockerOutput(string(out)))
+		short := oldImageID
+		if len(short) > 19 { // "sha256:" + 12 = 19
+			short = short[:19]
+		}
+		emit(fmt.Sprintf("✗ Rollback failed for %s — old image %s no longer available, check manually", service, short))
+		return true, reason
+	}
+
+	rollCtx, rollCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer rollCancel()
+	if out, rollErr := composeCmd(rollCtx, fileArgs, "up", "-d", "--no-deps", "--force-recreate", "--pull", "never", service).CombinedOutput(); rollErr != nil {
+		log.Printf("[compose-rollback] WARNING: rollback recreate failed for %s: %s", service, stripDockerOutput(string(out)))
+		emit(fmt.Sprintf("✗ Rollback recreate failed for %s — check manually", service))
+		return true, reason
+	}
+
+	if newCi := findComposeService(project, service); newCi != nil {
+		if waitErr := waitRunning(newCi.ID, service, 30*time.Second, emit); waitErr != nil {
+			log.Printf("[compose-rollback] WARNING: rolled-back container for %s did not reach running: %v", service, waitErr)
+			emit(fmt.Sprintf("✗ Rolled-back %s did not come up healthy either — check manually", service))
+			return true, reason
+		}
+	}
+
+	emit(fmt.Sprintf("↩  %s rolled back to previous image", service))
+	return true, reason
+}
+
 // ansiEscape matches ANSI/VT100 terminal escape sequences that docker CLI
 // writes to output even when stdout is a pipe. These corrupt MarkdownV2.
 var ansiEscape = regexp.MustCompile(`\x1b(?:\[[0-9;]*[a-zA-Z]|\][^\x07]*\x07|[()][AB012])`)
@@ -1227,9 +1342,7 @@ func UpdateContainer(c ContainerInfo, composeFile string, emit func(string)) Con
 	//     automatic rollback. Safe because compose doesn't own these containers.
 	labels := inspectLabels(c.ID)
 	service := labels["com.docker.compose.service"]
-	// 10 minutes — long enough for a single heavy service (e.g. immich_server)
-	// to pull-recreate without our own timeout killing compose mid-sequence.
-	const composeUpTimeout = 10 * time.Minute
+	project := labels[composeProjectLabel]
 
 	if service != "" {
 		// This is a compose-managed container. Only compose may recreate it.
@@ -1254,23 +1367,10 @@ func UpdateContainer(c ContainerInfo, composeFile string, emit func(string)) Con
 		if issue := ProjectDirIssue(composeFile); issue != "" {
 			log.Printf("[docker] update %s: %s", c.Name, issue)
 		}
-		emit(fmt.Sprintf("Recreating %s via compose (service: %s)…", c.Name, service))
-		upCtx, upCancel := context.WithTimeout(context.Background(), composeUpTimeout)
-		defer upCancel()
-		// stackFileArgs uses --project-directory so this single-container
-		// update sees the exact same project context as /stack commands and
-		// as a manual "cd ~/presto && docker compose up -d" — same .env
-		// loading, same env_file resolution, same config hash.
-		fileArgs := stackFileArgs(composeFile)
-		// --force-recreate: recreate even if config hash looks unchanged — after
-		// a pull the image digest changed but compose's config hash may not have,
-		// causing it to leave the old container running. Docksentry uses this too.
-		// --no-deps: only recreate THIS service, not its dependencies.
-		upOut, upErr := composeCmd(upCtx, fileArgs,
-			"up", "-d", "--no-deps", "--force-recreate", service,
-		).CombinedOutput()
-		if upErr != nil {
-			res.Err = fmt.Sprintf("compose up failed for %s: %s", service, stripDockerOutput(string(upOut)))
+		rolled, recreateErr := composeRecreateWithRollback(c, res.Image, service, project, composeFile, emit)
+		if recreateErr != nil {
+			res.Err = recreateErr.Error()
+			res.Rolled = rolled
 			return res
 		}
 		res.Restarted = true

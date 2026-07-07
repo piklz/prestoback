@@ -198,6 +198,38 @@ type EncryptionConfig struct {
 	Passphrase string `json:"passphrase,omitempty"`
 }
 
+// RemoteTarget is one configured off-box backup destination. Mirrors
+// backup.RemoteTarget field-for-field deliberately — this is the persisted
+// shape, backup.RemoteTarget is the runtime shape internal/backup/remote.go
+// actually operates on. Kept as two separate types rather than one shared
+// struct because internal/config must not import internal/backup (backup
+// already imports config, and Go doesn't allow the cycle) — server.go,
+// which imports both, is the one place that translates between them.
+type RemoteTarget struct {
+	Name string `json:"name"` // display name, e.g. "Synology NAS"
+	Kind string `json:"kind"` // "mount" | "rclone"
+
+	// Kind == "mount": a directory already accessible inside this
+	// container (a bind-mounted SMB/CIFS or NFS share).
+	MountPath string `json:"mount_path,omitempty"`
+
+	// Kind == "rclone": a "remote:path" string exactly as it appears in
+	// `rclone listremotes` / rclone.conf. See remote.go's package comment
+	// for why only non-OAuth rclone backends (S3-compatible, SFTP, SMB,
+	// WebDAV) are supported — Google Drive/OneDrive/Dropbox are not.
+	RcloneRemote string `json:"rclone_remote,omitempty"`
+}
+
+// RemoteConfig holds every configured push destination. Push is additive to
+// the existing local backup, never a replacement for it — Enabled here
+// only controls whether PushAppBackup is attempted after a local backup
+// succeeds, the same relationship OnBackupSuccess etc. have to
+// notify.Dispatch.
+type RemoteConfig struct {
+	Enabled bool           `json:"enabled"`
+	Targets []RemoteTarget `json:"targets,omitempty"`
+}
+
 // User is a PrestoBack login account.
 type User struct {
 	Username string `json:"username"`
@@ -212,6 +244,7 @@ type disk struct {
 	Notify     NotifyConfig     `json:"notify"`
 	Users      []User           `json:"users,omitempty"`
 	Encryption EncryptionConfig `json:"encryption,omitempty"`
+	Remote     RemoteConfig     `json:"remote,omitempty"`
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -230,6 +263,7 @@ type Config struct {
 	apps          map[string]AppConfig
 	notify        NotifyConfig
 	encryption    EncryptionConfig
+	remote        RemoteConfig
 	users         map[string]User
 	revokedTokens map[string]struct{}
 }
@@ -303,6 +337,7 @@ func Load(dataDir string) (*Config, error) {
 	}
 	c.notify = d.Notify
 	c.encryption = d.Encryption
+	c.remote = d.Remote
 	for _, u := range d.Users {
 		c.users[u.Username] = u
 	}
@@ -323,6 +358,7 @@ func (c *Config) save() error {
 		APIKey:     c.apiKey,
 		Notify:     c.notify,
 		Encryption: c.encryption,
+		Remote:     c.remote,
 	}
 	for _, a := range c.apps {
 		d.Apps = append(d.Apps, a)
@@ -506,6 +542,21 @@ func (c *Config) GetEncryption() EncryptionConfig {
 func (c *Config) SetEncryption(e EncryptionConfig) {
 	c.mu.Lock()
 	c.encryption = e
+	c.mu.Unlock()
+	_ = c.Save()
+}
+
+// ── Remote ────────────────────────────────────────────────────────────────────
+
+func (c *Config) GetRemote() RemoteConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.remote
+}
+
+func (c *Config) SetRemote(r RemoteConfig) {
+	c.mu.Lock()
+	c.remote = r
 	c.mu.Unlock()
 	_ = c.Save()
 }
