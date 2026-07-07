@@ -158,6 +158,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/backups-import", s.adminForWrites(s.handleBackupsImport))
 	s.mux.HandleFunc("/api/notify", s.adminForWrites(s.handleNotify))
 	s.mux.HandleFunc("/api/notify/test", s.adminForWrites(s.handleNotifyTest))
+	s.mux.HandleFunc("/api/encryption", s.adminForWrites(s.handleEncryption))
 	s.mux.HandleFunc("/api/apikey/regenerate", s.adminForWrites(s.handleRegenKey))
 	s.mux.HandleFunc("/api/update/apply", s.adminForWrites(s.handleUpdateApply))
 	s.mux.HandleFunc("/api/maintenance", s.adminForWrites(s.handleMaintenance))
@@ -305,6 +306,50 @@ func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 		}
 		s.cfg.SetNotify(n)
 		respond(w, 200, n)
+	default:
+		errOut(w, 405, "method not allowed")
+	}
+}
+
+// EncryptionSettingsView is what GET /api/encryption returns. Unlike
+// handleNotify's GET (which sends TelegramToken etc. back unredacted — an
+// existing pattern this doesn't need to match), the passphrase itself is
+// never echoed back once set: a GET response can end up in browser history
+// or a dev-tools network tab, and this passphrase is the decryption key for
+// every encrypted archive on the box, not just a notification credential.
+type EncryptionSettingsView struct {
+	Enabled         bool `json:"enabled"`
+	PassphraseIsSet bool `json:"passphrase_is_set"`
+}
+
+// handleEncryption is the global encryption settings endpoint (on/off +
+// passphrase). Per-app overrides use the existing /api/apps/{id} update
+// path — AppConfig.Encrypted is just another field on that struct.
+func (s *Server) handleEncryption(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		e := s.cfg.GetEncryption()
+		respond(w, 200, EncryptionSettingsView{Enabled: e.Enabled, PassphraseIsSet: e.Passphrase != ""})
+	case http.MethodPut:
+		var req struct {
+			Enabled    bool   `json:"enabled"`
+			Passphrase string `json:"passphrase"` // empty = "leave the existing stored passphrase unchanged"
+		}
+		if err := parseJSON(r, &req); err != nil {
+			errOut(w, 400, err.Error())
+			return
+		}
+		cur := s.cfg.GetEncryption()
+		next := config.EncryptionConfig{Enabled: req.Enabled, Passphrase: cur.Passphrase}
+		if req.Passphrase != "" {
+			next.Passphrase = req.Passphrase
+		}
+		if next.Enabled && next.Passphrase == "" {
+			errOut(w, 400, "cannot enable encryption without setting a passphrase first")
+			return
+		}
+		s.cfg.SetEncryption(next)
+		respond(w, 200, EncryptionSettingsView{Enabled: next.Enabled, PassphraseIsSet: next.Passphrase != ""})
 	default:
 		errOut(w, 405, "method not allowed")
 	}
@@ -514,13 +559,37 @@ func (s *Server) handleDirSize(w http.ResponseWriter, r *http.Request) {
 			return nil
 		})
 	}
-	respond(w, 200, map[string]any{
+
+	resp := map[string]any{
 		"paths":      paths,
 		"bytes":      totalBytes,
 		"file_count": fileCount,
 		"human":      humanBytes(totalBytes),
-	})
+	}
+
+	// Optional duration estimate for the large-operation confirm modal
+	// (Goal 2). app_id is optional and additive — existing callers that
+	// don't pass it (or a UI still on an older cached bundle) keep getting
+	// exactly the response shape they always have; they just don't get a
+	// duration estimate.
+	if appID := r.URL.Query().Get("app_id"); appID != "" {
+		rate, ok := s.hist.AverageThroughput(appID, history.EventBackupSuccess)
+		if !ok || rate <= 0 {
+			rate = fallbackThroughputBytesPerMs
+		}
+		estMs := int64(float64(totalBytes) / rate)
+		resp["estimated_duration_ms"] = estMs
+		resp["is_large"] = isLargeOp(totalBytes, estMs)
+	}
+
+	respond(w, 200, resp)
 }
+
+// fallbackThroughputBytesPerMs is used for the very first backup of an app,
+// before any real history exists to estimate from — deliberately
+// conservative (~5 MB/s) so a first run is more likely to over-warn than to
+// silently under-warn on hardware that turns out to be slower than guessed.
+const fallbackThroughputBytesPerMs = 5.0 * 1024 * 1024 / 1000.0
 
 func humanBytes(b int64) string {
 	const unit = 1024
@@ -1488,6 +1557,16 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 	// containers stopped/paused, or (b) crashes the entire PrestoBack process.
 	var metas []backup.BackupMeta
 	var err error
+	// Resolve encryption for this run: per-app override wins, else the
+	// global default. Passphrase is only read here (never over HTTP) — see
+	// EncryptionConfig's doc comment in internal/config/config.go for why
+	// the write path uses the stored passphrase automatically while restore
+	// never does.
+	encCfg := s.cfg.GetEncryption()
+	passphrase := ""
+	if app.EffectiveEncrypted(encCfg.Enabled) {
+		passphrase = encCfg.Passphrase
+	}
 	func() {
 		defer backup.ResumeContainers(toResume, app.ContainerStrategy, emit)
 		defer func() {
@@ -1497,7 +1576,7 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 				log.Printf("[backup] panic recovered for app %s: %v", app.ID, rec)
 			}
 		}()
-		metas, err = s.engine.BackupVolumes(app.ID, app.Name, targets)
+		metas, err = s.engine.BackupVolumes(app.ID, app.Name, targets, passphrase)
 	}()
 
 	dur := time.Since(start).Milliseconds()
@@ -1519,7 +1598,8 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 			Event: history.EventBackupFail, AppID: app.ID, AppName: app.Name,
 			Detail: detail, DurationMs: dur,
 		})
-		s.dispatchNotify(notify.Event{Kind: "backup_fail", AppName: app.Name, Detail: detail, IsError: true})
+		s.dispatchNotify(notify.Event{Kind: "backup_fail", AppName: app.Name, Detail: detail, IsError: true,
+			Force: isLargeOp(totalSize, dur)})
 		// Still prune what succeeded
 		_ = s.engine.PruneBackups(app.ID, app.Retain)
 	} else {
@@ -1532,7 +1612,8 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 			Event: history.EventBackupSuccess, AppID: app.ID, AppName: app.Name,
 			Detail: detail, SizeBytes: totalSize, DurationMs: dur,
 		})
-		s.dispatchNotify(notify.Event{Kind: "backup_success", AppName: app.Name, Detail: detail})
+		s.dispatchNotify(notify.Event{Kind: "backup_success", AppName: app.Name, Detail: detail,
+			Force: isLargeOp(totalSize, dur)})
 		_ = s.engine.PruneBackups(app.ID, app.Retain)
 	}
 
@@ -1650,6 +1731,35 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, ba
 		}
 	}
 
+	// Look up whether this specific archive was written encrypted (manifest
+	// records this per volume; RestoreVolume must never guess from file
+	// bytes) and, if so, require a passphrase on THIS request — restore
+	// never falls back to the auto-stored global passphrase (see
+	// EncryptionConfig's doc comment in internal/config/config.go).
+	archiveIsEncrypted := false
+	if manifestData, mErr := os.ReadFile(filepath.Join(s.cfg.BackupDir(), appID, backupID+"_manifest.json")); mErr == nil {
+		var mf backup.Manifest
+		if json.Unmarshal(manifestData, &mf) == nil {
+			for _, ent := range mf.Entries {
+				if ent.VolumeSlug == volumeSlug {
+					archiveIsEncrypted = ent.Encrypted
+					break
+				}
+			}
+		}
+	}
+
+	var restoreReq struct {
+		Passphrase string `json:"passphrase"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&restoreReq) // optional — absent/empty body is fine for unencrypted archives
+	}
+	if archiveIsEncrypted && restoreReq.Passphrase == "" {
+		errOut(w, 400, `this archive is encrypted — supply {"passphrase": "..."} in the request body`)
+		return
+	}
+
 	respond(w, 202, map[string]string{"status": "accepted", "backup_id": backupID, "volume": volumeSlug, "dest": destPath})
 
 	go func() {
@@ -1675,17 +1785,39 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, ba
 					log.Printf("[restore] panic recovered for app %s: %v", app.ID, rec)
 				}
 			}()
-			err = s.engine.RestoreVolume(app.ID, app.Name, volumeSlug, archivePath, destPath)
+			opts := backup.RestoreOptions{
+				ArchiveEncrypted:  archiveIsEncrypted,
+				RestorePassphrase: restoreReq.Passphrase,
+			}
+			// The pre-restore snapshot RestoreVolume takes internally is a
+			// write like any other backup, so it follows the same
+			// global/per-app encryption default as a normal scheduled backup
+			// — not the passphrase supplied for THIS restore, which decrypts
+			// the archive being restored FROM, a different file entirely.
+			encCfg := s.cfg.GetEncryption()
+			if app.EffectiveEncrypted(encCfg.Enabled) {
+				opts.SnapshotPassphrase = encCfg.Passphrase
+			}
+			err = s.engine.RestoreVolume(app.ID, app.Name, volumeSlug, archivePath, destPath, opts)
 		}()
 
 		dur := time.Since(start).Milliseconds()
+		// Best-effort size for the large-op check — the on-disk archive size
+		// being restored FROM is a reasonable proxy for how much data this
+		// restore is moving (stat failure just means "treat as not large by
+		// size", duration alone still applies).
+		var archiveSize int64
+		if fi, statErr := os.Stat(archivePath); statErr == nil {
+			archiveSize = fi.Size()
+		}
 		if err != nil {
 			emit("✗ Restore failed: " + err.Error())
 			s.hist.Append(history.Entry{
 				Event: history.EventRestoreFail, AppID: app.ID, AppName: app.Name,
 				Detail: err.Error(), DurationMs: dur,
 			})
-			s.dispatchNotify(notify.Event{Kind: "restore_fail", AppName: app.Name, Detail: err.Error(), IsError: true})
+			s.dispatchNotify(notify.Event{Kind: "restore_fail", AppName: app.Name, Detail: err.Error(), IsError: true,
+				Force: isLargeOp(archiveSize, dur)})
 			return
 		}
 		detail := fmt.Sprintf("Restored %s from %s (%dms)", volumeSlug, backupID, dur)
@@ -1693,7 +1825,8 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, ba
 			Event: history.EventRestoreSuccess, AppID: app.ID, AppName: app.Name,
 			Detail: detail, DurationMs: dur,
 		})
-		s.dispatchNotify(notify.Event{Kind: "restore_success", AppName: app.Name, Detail: detail})
+		s.dispatchNotify(notify.Event{Kind: "restore_success", AppName: app.Name, Detail: detail,
+			Force: isLargeOp(archiveSize, dur)})
 		emit("━━━ Restore complete ━━━")
 	}()
 }
@@ -3470,6 +3603,23 @@ func (s *Server) findAppByNameFragment(fragment string) *config.AppConfig {
 		}
 	}
 	return nil
+}
+
+// ── Large-operation thresholds (Goal 2: warn/confirm before big/slow runs) ───
+//
+// A run counts as "large" if it crosses EITHER line — size alone isn't
+// enough on its own, since a slow remote push of a modest number of bytes
+// can leave someone waiting just as long as a big local copy. Both numbers
+// intentionally live in one place so the confirm-modal estimate
+// (handleEstimate) and the post-run notification gate (isLargeOp, used by
+// runBackup/handleRestore) never drift apart.
+const (
+	largeOpSizeBytes  int64 = 200 * 1024 * 1024 // 200MB
+	largeOpDurationMs int64 = 60 * 1000         // 1 minute
+)
+
+func isLargeOp(sizeBytes, durationMs int64) bool {
+	return sizeBytes >= largeOpSizeBytes || durationMs >= largeOpDurationMs
 }
 
 // ── Notify dispatch ───────────────────────────────────────────────────────────

@@ -17,6 +17,13 @@ type Event struct {
 	AppName string
 	Detail  string // backup ID, error message, archive size, etc.
 	IsError bool
+	// Force bypasses the per-event on_backup_success/fail-style toggle below
+	// (channel-enabled checks — TelegramEnabled, DiscordEnabled, etc. — still
+	// apply; Force isn't "ignore whether the user configured Telegram at
+	// all"). Set by callers for "large operation" runs: the user shouldn't
+	// have to keep the toggle on for every routine backup just to hear about
+	// the rare one that took long enough that they probably walked away.
+	Force bool
 }
 
 func (e Event) Emoji() string {
@@ -304,7 +311,7 @@ func Dispatch(cfg Config, ev Event) {
 		default:
 			wantsNotify = true
 		}
-		if !wantsNotify {
+		if !ev.Force && !wantsNotify {
 			return
 		}
 		if cfg.TelegramEnabled && cfg.TelegramToken != "" {

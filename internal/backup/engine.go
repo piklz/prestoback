@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -44,13 +45,32 @@ type BackupMeta struct {
 	FilePath   string     `json:"file_path"`
 	Remote     string     `json:"remote,omitempty"`
 	PreRestore bool       `json:"pre_restore,omitempty"`
+	// Encrypted is true when this archive was written through EncryptStream
+	// (see backupcrypto.go). When true, SizeBytes and the manifest's SHA256
+	// both describe the CIPHERTEXT on disk, not the plaintext — restoring
+	// requires the passphrase, and any archive re-hash for tamper-detection
+	// is naturally comparing ciphertext bytes too.
+	Encrypted bool `json:"encrypted,omitempty"`
+}
+
+// ProgressInfo is a throttled byte-progress sample for a running job. Not
+// every JobUpdate carries one — see emitProgress's time-based throttle.
+type ProgressInfo struct {
+	BytesDone  int64   `json:"bytes_done"`
+	BytesTotal int64   `json:"bytes_total"`
+	Percent    float64 `json:"percent"`
+	// CurrentVolume names which volume is being processed right now, so a
+	// single aggregate bar can still show "3/5 — plex_data" alongside the
+	// overall percentage, rather than resetting to 0% per volume.
+	CurrentVolume string `json:"current_volume,omitempty"`
 }
 
 type JobUpdate struct {
-	AppID  string        `json:"app_id"`
-	Backup BackupMeta    `json:"backup"`
-	Log    string        `json:"log"`
-	Update *UpdateResult `json:"update,omitempty"`
+	AppID    string        `json:"app_id"`
+	Backup   BackupMeta    `json:"backup"`
+	Log      string        `json:"log"`
+	Update   *UpdateResult `json:"update,omitempty"`
+	Progress *ProgressInfo `json:"progress,omitempty"`
 }
 
 type Engine struct {
@@ -117,23 +137,32 @@ type VolumeTarget struct {
 // This is intentionally separate from the per-volume checkDiskSpace done
 // later inside backupVolumes (which remains as a defense-in-depth check in
 // case free space changes between the pre-flight and the actual write).
+// EstimateVolumesSize sums the regular-file size of every volume's source
+// directory. Shared by CheckAllDiskSpace (pre-flight free-space check) and
+// the /api/estimate endpoint (pre-flight size+duration estimate for the
+// large-operation confirm modal) and backupVolumes (so the aggregate
+// progress bar knows a total to divide by) — one walk implementation, three
+// callers, rather than three slightly different ones drifting apart.
+func EstimateVolumesSize(volumes []VolumeTarget) int64 {
+	var total int64
+	for _, vol := range volumes {
+		_ = filepath.Walk(vol.Path, func(_ string, info os.FileInfo, err error) error {
+			if err == nil && info != nil && info.Mode().IsRegular() {
+				total += info.Size()
+			}
+			return nil
+		})
+	}
+	return total
+}
+
 func (e *Engine) CheckAllDiskSpace(appID string, volumes []VolumeTarget, emit func(string)) error {
 	destDir := filepath.Join(e.backupDir, appID)
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return fmt.Errorf("cannot prepare backup directory: %w", err)
 	}
 
-	var totalSrcBytes int64
-	for _, vol := range volumes {
-		var srcBytes int64
-		_ = filepath.Walk(vol.Path, func(_ string, info os.FileInfo, err error) error {
-			if err == nil && info != nil && info.Mode().IsRegular() {
-				srcBytes += info.Size()
-			}
-			return nil
-		})
-		totalSrcBytes += srcBytes
-	}
+	totalSrcBytes := EstimateVolumesSize(volumes)
 
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(destDir, &stat); err != nil {
@@ -220,11 +249,16 @@ func (e *Engine) RunPreBackupCmd(appID, cmdStr string, emit func(string)) error 
 // BackupVolumes archives each supplied volume into the app's backup directory.
 // Returns one BackupMeta per volume (in the same order), plus the first error encountered.
 // On error the remaining volumes are still attempted; caller gets all results.
-func (e *Engine) BackupVolumes(appID, appName string, volumes []VolumeTarget) ([]BackupMeta, error) {
-	return e.backupVolumes(appID, appName, volumes, false)
+// BackupVolumes archives each supplied volume. passphrase enables archive
+// encryption for this run when non-empty (resolved by the caller from
+// config.EncryptionConfig + the app's per-app override — see
+// AppConfig.EffectiveEncrypted in internal/config/config.go); pass "" to
+// write plaintext archives as before.
+func (e *Engine) BackupVolumes(appID, appName string, volumes []VolumeTarget, passphrase string) ([]BackupMeta, error) {
+	return e.backupVolumes(appID, appName, volumes, false, passphrase)
 }
 
-func (e *Engine) backupVolumes(appID, appName string, volumes []VolumeTarget, preRestore bool) ([]BackupMeta, error) {
+func (e *Engine) backupVolumes(appID, appName string, volumes []VolumeTarget, preRestore bool, passphrase string) ([]BackupMeta, error) {
 	e.mu.Lock()
 	if e.running[appID] {
 		e.mu.Unlock()
@@ -253,9 +287,19 @@ func (e *Engine) backupVolumes(appID, appName string, volumes []VolumeTarget, pr
 	var results []BackupMeta
 	var firstErr error
 
+	// Aggregate progress across the whole run, not per-volume — see
+	// progressEmitter's doc comment above. Sizing this against plaintext
+	// source bytes (not the eventual, slightly-different, on-disk archive
+	// size) is intentional: it's the only total known before any volume has
+	// actually been archived yet.
+	totalBytes := EstimateVolumesSize(volumes)
+	progressMeta := &BackupMeta{AppID: appID, AppName: appName, Status: StatusRunning}
+	prog := newProgressEmitter(e, progressMeta, totalBytes)
+
 	for _, vol := range volumes {
 		id := archiveID(appID, vol.Slug, timestamp, preRestore)
 		destFile := filepath.Join(destDir, id+".tar.gz")
+		prog.startVolume(vol.Slug)
 
 		meta := BackupMeta{
 			ID:         id,
@@ -290,7 +334,7 @@ func (e *Engine) backupVolumes(appID, appName string, volumes []VolumeTarget, pr
 			continue
 		}
 
-		size, err := tarGz(vol.Path, destFile, vol.Excludes)
+		size, err := tarGz(vol.Path, destFile, vol.Excludes, prog.onBytes)
 		fin := time.Now()
 		meta.FinishedAt = &fin
 
@@ -325,10 +369,34 @@ func (e *Engine) backupVolumes(appID, appName string, volumes []VolumeTarget, pr
 			continue
 		}
 
-		meta.SizeBytes = size
+		finalSize := size
+		if passphrase != "" {
+			e.emit(&meta, fmt.Sprintf("Encrypting archive: %s", id))
+			encSize, encErr := encryptArchiveInPlace(destFile, passphrase, prog.onBytes)
+			if encErr != nil {
+				_ = os.Remove(destFile)
+				meta.Status = StatusFailed
+				meta.Error = fmt.Sprintf("encryption failed: %v", encErr)
+				e.emit(&meta, fmt.Sprintf("%s FAILED encryption (%s): %v — archive discarded", label, vol.Slug, encErr))
+				if firstErr == nil {
+					firstErr = fmt.Errorf("encryption failed for %s: %w", vol.Slug, encErr)
+				}
+				results = append(results, meta)
+				continue
+			}
+			meta.Encrypted = true
+			finalSize = encSize
+		}
+
+		meta.SizeBytes = finalSize
 		meta.Status = StatusSuccess
-		e.emit(&meta, fmt.Sprintf("%s complete (%s, %.1f MB, verified ✓): %s",
-			label, vol.Slug, float64(size)/1e6, id))
+		prog.flush() // make sure the final sample reads 100% for this volume, not whatever the last throttled tick left it at
+		encNote := ""
+		if meta.Encrypted {
+			encNote = ", encrypted 🔒"
+		}
+		e.emit(&meta, fmt.Sprintf("%s complete (%s, %.1f MB, verified ✓%s): %s",
+			label, vol.Slug, float64(finalSize)/1e6, encNote, id))
 		results = append(results, meta)
 	}
 	return results, firstErr
@@ -336,11 +404,14 @@ func (e *Engine) backupVolumes(appID, appName string, volumes []VolumeTarget, pr
 
 // ── Legacy single-volume shim (keeps server.go compile-clean during transition) ─
 
-// BackupApp is kept for callers that still pass a single path.
-// Internally it becomes a single-volume BackupVolumes call.
+// BackupApp is kept for callers that still pass a single path. Not currently
+// called anywhere in server.go (multi-volume BackupVolumes replaced it) —
+// kept only so it still compiles for any external caller. Always writes
+// plaintext; nothing currently exercises this path so there's no passphrase
+// to wire through.
 func (e *Engine) BackupApp(appID, appName, srcPath string, excludes []string) (*BackupMeta, error) {
 	slug := slugFromPath(srcPath)
-	metas, err := e.backupVolumes(appID, appName, []VolumeTarget{{Slug: slug, Path: srcPath, Excludes: excludes}}, false)
+	metas, err := e.backupVolumes(appID, appName, []VolumeTarget{{Slug: slug, Path: srcPath, Excludes: excludes}}, false, "")
 	if len(metas) > 0 {
 		return &metas[0], err
 	}
@@ -349,8 +420,30 @@ func (e *Engine) BackupApp(appID, appName, srcPath string, excludes []string) (*
 
 // ── Restore ───────────────────────────────────────────────────────────────────
 
+// RestoreOptions controls how RestoreVolume handles encryption on both sides
+// of a restore: decrypting the archive being restored FROM, and (optionally)
+// encrypting the pre-restore safety snapshot taken of what's currently on
+// disk before it gets overwritten.
+type RestoreOptions struct {
+	// ArchiveEncrypted must be set from the manifest's ManifestEntry.Encrypted
+	// for the specific archive being restored — RestoreVolume does not try to
+	// guess this from file content.
+	ArchiveEncrypted bool
+	// RestorePassphrase decrypts the archive above. Required (and never
+	// silently substituted from config) when ArchiveEncrypted is true — see
+	// EncryptionConfig's doc comment in internal/config/config.go for why
+	// restore never uses the auto-stored passphrase on its own.
+	RestorePassphrase string
+	// SnapshotPassphrase optionally encrypts the pre-restore safety snapshot
+	// this function takes automatically in Step 1. Empty means "don't
+	// encrypt the snapshot" — typically the caller passes the same
+	// auto-stored global passphrase used for scheduled backups, since taking
+	// a snapshot is a write-path operation like any other backup.
+	SnapshotPassphrase string
+}
+
 // RestoreVolume restores a single archive into destPath, taking a pre-restore snapshot first.
-func (e *Engine) RestoreVolume(appID, appName, volumeSlug, archivePath, destPath string) error {
+func (e *Engine) RestoreVolume(appID, appName, volumeSlug, archivePath, destPath string, opts RestoreOptions) error {
 	e.mu.Lock()
 	if e.running[appID] {
 		e.mu.Unlock()
@@ -369,18 +462,45 @@ func (e *Engine) RestoreVolume(appID, appName, volumeSlug, archivePath, destPath
 
 	// Step 1 — pre-restore safety snapshot
 	e.emit(sentinel, fmt.Sprintf("Taking pre-restore snapshot of %s [%s]…", appName, volumeSlug))
-	if _, snapErr := e.backupVolumeLocked(appID, appName, VolumeTarget{Slug: volumeSlug, Path: destPath}, true); snapErr != nil {
+	if _, snapErr := e.backupVolumeLocked(appID, appName, VolumeTarget{Slug: volumeSlug, Path: destPath}, true, opts.SnapshotPassphrase); snapErr != nil {
 		e.emit(sentinel, fmt.Sprintf("Warning: could not snapshot %s: %v — continuing", volumeSlug, snapErr))
 	}
 
-	// Step 2 — extract archive
+	// Step 2 — decrypt (if needed), then extract
+	extractSrc := archivePath
+	if opts.ArchiveEncrypted {
+		e.emit(sentinel, "Verifying archive authenticity and decrypting…")
+		decPath, decErr := decryptArchiveToTemp(archivePath, opts.RestorePassphrase)
+		if decErr != nil {
+			sentinel.Status = StatusFailed
+			if errors.Is(decErr, ErrAuthenticationFailed) {
+				sentinel.Error = "wrong passphrase or corrupted archive"
+			} else {
+				sentinel.Error = decErr.Error()
+			}
+			e.emit(sentinel, "Restore FAILED: "+sentinel.Error)
+			return decErr
+		}
+		defer os.Remove(decPath)
+		extractSrc = decPath
+	}
+
+	prog := newProgressEmitter(e, sentinel, EstimateVolumesSize([]VolumeTarget{{Path: destPath}}))
+	// destPath doesn't hold the NEW content's size yet (that's what we're
+	// about to write) — this estimate is necessarily approximate, based on
+	// whatever's there now (e.g. the old data being replaced, similar order
+	// of magnitude in the common case). Good enough for a progress bar;
+	// not used for anything that needs to be exact.
+	prog.startVolume(volumeSlug)
+
 	e.emit(sentinel, fmt.Sprintf("Extracting %s → %s", filepath.Base(archivePath), destPath))
-	if err := extractTarGz(archivePath, destPath); err != nil {
+	if err := extractTarGz(extractSrc, destPath, prog.onBytes); err != nil {
 		sentinel.Status = StatusFailed
 		sentinel.Error = err.Error()
 		e.emit(sentinel, "Restore FAILED: "+err.Error())
 		return err
 	}
+	prog.flush()
 
 	fin := time.Now()
 	sentinel.FinishedAt = &fin
@@ -389,14 +509,19 @@ func (e *Engine) RestoreVolume(appID, appName, volumeSlug, archivePath, destPath
 	return nil
 }
 
-// RestoreApp is the legacy single-path shim.
+// RestoreApp is the legacy single-path shim. Not currently called anywhere
+// (multi-volume RestoreVolume replaced it) — kept for compile-safety only,
+// always unencrypted since nothing exercises this path.
 func (e *Engine) RestoreApp(appID, appName, archivePath, destPath string) error {
 	slug := slugFromPath(destPath)
-	return e.RestoreVolume(appID, appName, slug, archivePath, destPath)
+	return e.RestoreVolume(appID, appName, slug, archivePath, destPath, RestoreOptions{})
 }
 
 // backupVolumeLocked backs up a single volume while the engine lock is held.
-func (e *Engine) backupVolumeLocked(appID, appName string, vol VolumeTarget, preRestore bool) (*BackupMeta, error) {
+// passphrase encrypts the result when non-empty — used by RestoreVolume for
+// the pre-restore snapshot, which is a real archive on disk like any other
+// and gets the same at-rest protection when encryption is configured.
+func (e *Engine) backupVolumeLocked(appID, appName string, vol VolumeTarget, preRestore bool, passphrase string) (*BackupMeta, error) {
 	destDir := filepath.Join(e.backupDir, appID)
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return nil, err
@@ -415,7 +540,7 @@ func (e *Engine) backupVolumeLocked(appID, appName string, vol VolumeTarget, pre
 		FilePath:   destFile,
 		PreRestore: preRestore,
 	}
-	size, err := tarGz(vol.Path, destFile, vol.Excludes)
+	size, err := tarGz(vol.Path, destFile, vol.Excludes, nil)
 	fin := time.Now()
 	meta.FinishedAt = &fin
 	if err != nil {
@@ -424,7 +549,19 @@ func (e *Engine) backupVolumeLocked(appID, appName string, vol VolumeTarget, pre
 		meta.Error = err.Error()
 		return meta, err
 	}
-	meta.SizeBytes = size
+	finalSize := size
+	if passphrase != "" {
+		encSize, encErr := encryptArchiveInPlace(destFile, passphrase, nil)
+		if encErr != nil {
+			_ = os.Remove(destFile)
+			meta.Status = StatusFailed
+			meta.Error = fmt.Sprintf("encryption failed: %v", encErr)
+			return meta, encErr
+		}
+		meta.Encrypted = true
+		finalSize = encSize
+	}
+	meta.SizeBytes = finalSize
 	meta.Status = StatusSuccess
 	return meta, nil
 }
@@ -639,6 +776,10 @@ type ManifestEntry struct {
 	// volume paths exactly as they were, without needing the original config.json.
 	// Example: /home/pi/presto/volumes/plex/Library/Application Support/Plex Media Server/Plug-in Support/Databases
 	SourcePath string `json:"source_path,omitempty"`
+	// Encrypted mirrors BackupMeta.Encrypted — see that field's comment.
+	// A restore flow reads this from the manifest to decide whether to
+	// prompt for a passphrase, without needing to guess from file content.
+	Encrypted bool `json:"encrypted,omitempty"`
 }
 
 // Manifest is the full record for a single backup run (all volumes).
@@ -674,8 +815,17 @@ func (e *Engine) WriteManifest(appID, appName string, metas []BackupMeta, durati
 			SizeBytes:  meta.SizeBytes,
 			Status:     meta.Status,
 			Error:      meta.Error,
+			Encrypted:  meta.Encrypted,
 		}
 		if meta.Status == StatusSuccess {
+			// meta.FilePath already points at whatever is actually on disk by
+			// this point — ciphertext if Encrypted, plaintext otherwise —
+			// because encryption (see encryptArchiveInPlace) runs and renames
+			// over the file inside backupVolumes, before WriteManifest is
+			// ever called. So this hash is always "hash of what's on disk",
+			// which is the ciphertext for encrypted archives — deliberately,
+			// see EncryptionConfig's doc comment in internal/config/config.go
+			// for why that's the right checksum semantics here.
 			sum, err := sha256File(meta.FilePath)
 			if err != nil {
 				entry.Error = fmt.Sprintf("manifest hash failed: %v", err)
@@ -697,6 +847,95 @@ func (e *Engine) WriteManifest(appID, appName string, metas []BackupMeta, durati
 		return "", err
 	}
 	return manifestPath, nil
+}
+
+// ── Archive encryption (wires backupcrypto.go's EncryptStream/DecryptStream
+// into the actual backup-write and restore-read paths) ───────────────────────
+
+// encryptArchiveInPlace re-encrypts a freshly written, already-verified
+// plaintext .tar.gz using backupcrypto.go's EncryptStream, then renames the
+// ciphertext over the original path — so every other piece of code that
+// refers to a BackupMeta.FilePath keeps working unchanged; it just finds
+// ciphertext there instead of plaintext from this point on.
+//
+// Runs AFTER verifyArchive succeeds, deliberately: verifyArchive's tar/gzip
+// structural check is only meaningful against plaintext — encrypting first
+// would make every archive "look the same" (opaque ciphertext) to that
+// check, silently defeating it.
+func encryptArchiveInPlace(path, passphrase string, onBytes func(int64)) (int64, error) {
+	src, err := os.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("open for encryption: %w", err)
+	}
+	tmpPath := path + ".enc.tmp"
+	dst, err := os.Create(tmpPath)
+	if err != nil {
+		src.Close()
+		return 0, fmt.Errorf("create ciphertext temp file: %w", err)
+	}
+
+	encErr := EncryptStream(dst, &countingReader{r: src, onBytes: onBytes}, passphrase)
+	src.Close()
+	closeErr := dst.Close()
+
+	if encErr != nil {
+		_ = os.Remove(tmpPath)
+		return 0, fmt.Errorf("encrypt archive: %w", encErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpPath)
+		return 0, fmt.Errorf("close ciphertext temp file: %w", closeErr)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return 0, fmt.Errorf("replace archive with encrypted version: %w", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
+// decryptArchiveToTemp decrypts an encrypted archive into a sibling temp
+// file (same directory, so the later os.Rename-free extractTarGz read is on
+// the same filesystem) and returns its path. The caller is responsible for
+// removing it once extraction is done — RestoreVolume does this via defer.
+//
+// No byte-progress callback here — see countingReader's doc comment above
+// for why DecryptStream's two-pass read (verify-then-decrypt) makes a naive
+// percentage misleading rather than useful.
+func decryptArchiveToTemp(archivePath, passphrase string) (string, error) {
+	src, err := os.Open(archivePath)
+	if err != nil {
+		return "", fmt.Errorf("open encrypted archive: %w", err)
+	}
+	defer src.Close()
+
+	tmp, err := os.CreateTemp(filepath.Dir(archivePath), "prestoback-decrypt-*.tar.gz")
+	if err != nil {
+		return "", fmt.Errorf("create decrypt temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+
+	decErr := DecryptStream(tmp, src, passphrase)
+	closeErr := tmp.Close()
+
+	if decErr != nil {
+		_ = os.Remove(tmpPath)
+		// ErrAuthenticationFailed is returned as-is (not wrapped) so callers
+		// can errors.Is() against it to show "wrong passphrase or corrupted
+		// archive" instead of a generic decrypt error.
+		if errors.Is(decErr, ErrAuthenticationFailed) {
+			return "", ErrAuthenticationFailed
+		}
+		return "", fmt.Errorf("decrypt archive: %w", decErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("close decrypt temp file: %w", closeErr)
+	}
+	return tmpPath, nil
 }
 
 // sha256File computes the hex-encoded SHA-256 digest of a file's contents
@@ -846,6 +1085,130 @@ func (e *Engine) emit(m *BackupMeta, msg string) {
 	case e.updates <- JobUpdate{AppID: m.AppID, Backup: *m, Log: msg}:
 	default:
 	}
+}
+
+// emitProgress sends a byte-progress sample the same non-blocking way emit
+// does — a slow consumer just misses a sample, it never blocks the backup
+// itself. Called from progressEmitter, throttled by time, not by every
+// single Write.
+func (e *Engine) emitProgress(m *BackupMeta, p ProgressInfo) {
+	select {
+	case e.updates <- JobUpdate{AppID: m.AppID, Backup: *m, Progress: &p}:
+	default:
+	}
+}
+
+// ── Byte-level progress ───────────────────────────────────────────────────────
+//
+// There's no OS-level "percent copied" hook for a tar/gzip stream — the same
+// constraint tools like Portainer run into (its own volume backup is a
+// browser-native file download with the browser's own progress bar; it
+// doesn't compute a server-side percentage for the copy itself). The pattern
+// used here is the same one those tools fall back to: wrap the destination
+// writer to count bytes as they're actually written, and sample that counter
+// on a timer rather than on every single Write — so a fast local disk
+// doesn't flood the SSE channel with one event per megabyte, and a slow
+// remote target still gets at least one update per tick.
+//
+// progressEmitter owns the running total across an entire multi-volume
+// backup run (not just the current volume) so the bar reported to the UI is
+// one aggregate percentage for the whole app run, with CurrentVolume as a
+// label alongside it — e.g. "42% — plex_data (2/3)" — rather than resetting
+// to 0% every time a new volume starts.
+const progressEmitInterval = 500 * time.Millisecond
+
+type progressEmitter struct {
+	e          *Engine
+	meta       *BackupMeta
+	totalBytes int64 // across ALL volumes in this run; 0 disables percent (still reports raw bytes)
+
+	doneBeforeCurrent int64 // bytes already accounted for by previously finished volumes
+	currentVolume     string
+	currentBytes      int64
+	lastEmit          time.Time
+}
+
+func newProgressEmitter(e *Engine, meta *BackupMeta, totalBytes int64) *progressEmitter {
+	return &progressEmitter{e: e, meta: meta, totalBytes: totalBytes}
+}
+
+// startVolume resets the per-volume counter and folds the just-finished
+// volume's bytes into doneBeforeCurrent, so the aggregate total keeps moving
+// forward across volume boundaries instead of dipping back down.
+func (p *progressEmitter) startVolume(slug string) {
+	p.doneBeforeCurrent += p.currentBytes
+	p.currentBytes = 0
+	p.currentVolume = slug
+}
+
+// onBytes is passed as the callback to tarGz/extractTarGz/encryptArchiveInPlace.
+func (p *progressEmitter) onBytes(n int64) {
+	p.currentBytes += n
+	if time.Since(p.lastEmit) < progressEmitInterval {
+		return
+	}
+	p.lastEmit = time.Now()
+	p.flush()
+}
+
+// flush emits immediately regardless of the time throttle — used for the
+// final 100% sample so the UI doesn't sit at "97%" after the operation has
+// actually finished.
+func (p *progressEmitter) flush() {
+	done := p.doneBeforeCurrent + p.currentBytes
+	var pct float64
+	if p.totalBytes > 0 {
+		pct = float64(done) / float64(p.totalBytes) * 100
+		if pct > 100 {
+			pct = 100
+		}
+	}
+	p.e.emitProgress(p.meta, ProgressInfo{
+		BytesDone:     done,
+		BytesTotal:    p.totalBytes,
+		Percent:       pct,
+		CurrentVolume: p.currentVolume,
+	})
+}
+
+// countingWriter wraps an io.Writer and reports every successful Write's
+// byte count to onBytes. Used to instrument tarGz's and extractTarGz's
+// existing io.Copy calls without changing their control flow.
+type countingWriter struct {
+	w       io.Writer
+	onBytes func(int64)
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	if n > 0 && c.onBytes != nil {
+		c.onBytes(int64(n))
+	}
+	return n, err
+}
+
+// countingReader is the read-side equivalent, used to report progress
+// through encryptArchiveInPlace's single streaming pass (EncryptStream reads
+// plaintext from this and writes ciphertext out — counting the read side
+// tracks "how much of the plaintext has been processed so far").
+//
+// Deliberately NOT used for decryptArchiveToTemp: DecryptStream (see
+// backupcrypto.go, unmodified here) reads the source archive twice — once to
+// verify the HMAC, once to actually decrypt — so a naive byte counter would
+// run to ~200% and reset, which is more misleading than no percentage at
+// all. Restore-side decryption gets a log line ("Verifying archive
+// authenticity…", "Decrypting…") instead of a bar; see RestoreVolume.
+type countingReader struct {
+	r       io.Reader
+	onBytes func(int64)
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n > 0 && c.onBytes != nil {
+		c.onBytes(int64(n))
+	}
+	return n, err
 }
 
 func (e *Engine) EmitLog(appID, msg string) {
@@ -1064,7 +1427,7 @@ func checkDiskSpace(srcDir, destDir string, e *Engine, meta *BackupMeta) error {
 	return nil
 }
 
-func tarGz(srcDir, destFile string, excludes []string) (int64, error) {
+func tarGz(srcDir, destFile string, excludes []string, onBytes func(int64)) (int64, error) {
 	srcDir = filepath.Clean(srcDir)
 	if _, err := os.Stat(srcDir); err != nil {
 		return 0, fmt.Errorf("source path %q: %w", srcDir, err)
@@ -1135,7 +1498,7 @@ func tarGz(srcDir, destFile string, excludes []string) (int64, error) {
 			log.Printf("warn: cannot open %s: %v — skipping", path, err)
 			return nil
 		}
-		_, copyErr := io.Copy(tw, src)
+		_, copyErr := io.Copy(&countingWriter{w: tw, onBytes: onBytes}, src)
 		src.Close()
 		if copyErr != nil {
 			return copyErr
@@ -1211,7 +1574,7 @@ func verifyArchive(path string) error {
 	return nil
 }
 
-func extractTarGz(archivePath, destPath string) error {
+func extractTarGz(archivePath, destPath string, onBytes func(int64)) error {
 	if _, err := os.Stat(destPath); err != nil {
 		if err := os.MkdirAll(destPath, 0755); err != nil {
 			return fmt.Errorf("destination path %s does not exist and could not be created: %w", destPath, err)
@@ -1273,7 +1636,7 @@ func extractTarGz(archivePath, destPath string) error {
 			if err != nil {
 				return fmt.Errorf("create %s: %w", target, err)
 			}
-			if _, err := io.Copy(out, tr); err != nil {
+			if _, err := io.Copy(&countingWriter{w: out, onBytes: onBytes}, tr); err != nil {
 				out.Close()
 				return fmt.Errorf("write %s: %w", target, err)
 			}

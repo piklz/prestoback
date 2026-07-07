@@ -111,6 +111,22 @@ type AppConfig struct {
 	// Excludes is the legacy top-level excludes list (old single-path schema).
 	// Read during migration only; never written after that.
 	Excludes []string `json:"excludes,omitempty"`
+
+	// Encrypted overrides the global encryption default for this app's
+	// backups. nil means "inherit the global default" — most apps should
+	// leave this unset. A non-nil value is an explicit per-app choice made
+	// in the Edit App UI (e.g. "never encrypt this one, it's already public
+	// data" or "always encrypt this one even if the global default is off").
+	Encrypted *bool `json:"encrypted,omitempty"`
+}
+
+// EffectiveEncrypted resolves whether this app's backups should be
+// encrypted, given the global default. Per-app override always wins when set.
+func (a AppConfig) EffectiveEncrypted(globalDefault bool) bool {
+	if a.Encrypted != nil {
+		return *a.Encrypted
+	}
+	return globalDefault
 }
 
 // PrimaryPath returns the path of the first enabled volume, for display.
@@ -159,6 +175,29 @@ type NotifyConfig struct {
 	OnRestoreFail    bool `json:"on_restore_fail"`
 }
 
+// EncryptionConfig holds the global default for backup-archive encryption.
+//
+// Passphrase storage tradeoff (deliberate, not accidental): the passphrase
+// is stored here so *scheduled/unattended* backups can encrypt automatically
+// — a cron-triggered backup can't pause and wait for someone to type a
+// passphrase at 3am. This means anyone with filesystem access to config.json
+// (0600, same host) can also decrypt any archive on that same host — at-rest
+// encryption here protects an archive that LEAVES the host (stolen backup
+// drive, a copied file, a future remote push) more than it protects against
+// full host compromise, which no config-stored secret can fix anyway.
+//
+// To keep restores honest despite that: the stored passphrase is used only
+// for the WRITE path (new backups). The READ path (restore) never uses it
+// silently — internal/api/server.go's restore handler always requires the
+// passphrase to be supplied explicitly in the request, even when one is
+// stored here. That way "restore succeeded" always means a human typed the
+// right passphrase for that specific action, not "the config file happened
+// to still have it."
+type EncryptionConfig struct {
+	Enabled    bool   `json:"enabled"`
+	Passphrase string `json:"passphrase,omitempty"`
+}
+
 // User is a PrestoBack login account.
 type User struct {
 	Username string `json:"username"`
@@ -168,10 +207,11 @@ type User struct {
 
 // disk is the on-disk JSON shape.
 type disk struct {
-	APIKey string       `json:"api_key"`
-	Apps   []AppConfig  `json:"apps"`
-	Notify NotifyConfig `json:"notify"`
-	Users  []User       `json:"users,omitempty"`
+	APIKey     string           `json:"api_key"`
+	Apps       []AppConfig      `json:"apps"`
+	Notify     NotifyConfig     `json:"notify"`
+	Users      []User           `json:"users,omitempty"`
+	Encryption EncryptionConfig `json:"encryption,omitempty"`
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -189,6 +229,7 @@ type Config struct {
 	apiKey        string
 	apps          map[string]AppConfig
 	notify        NotifyConfig
+	encryption    EncryptionConfig
 	users         map[string]User
 	revokedTokens map[string]struct{}
 }
@@ -261,6 +302,7 @@ func Load(dataDir string) (*Config, error) {
 		c.apps[a.ID] = a
 	}
 	c.notify = d.Notify
+	c.encryption = d.Encryption
 	for _, u := range d.Users {
 		c.users[u.Username] = u
 	}
@@ -278,8 +320,9 @@ func (c *Config) Save() error {
 // save is the internal (lock-free) version, called when the caller already holds a lock.
 func (c *Config) save() error {
 	d := disk{
-		APIKey: c.apiKey,
-		Notify: c.notify,
+		APIKey:     c.apiKey,
+		Notify:     c.notify,
+		Encryption: c.encryption,
 	}
 	for _, a := range c.apps {
 		d.Apps = append(d.Apps, a)
@@ -442,6 +485,27 @@ func (c *Config) GetNotify() NotifyConfig {
 func (c *Config) SetNotify(n NotifyConfig) {
 	c.mu.Lock()
 	c.notify = n
+	c.mu.Unlock()
+	_ = c.Save()
+}
+
+// ── Encryption ────────────────────────────────────────────────────────────────
+
+// GetEncryption returns the global encryption settings. The passphrase IS
+// included here deliberately (unlike a "safe to expose" getter) — the one
+// caller that needs it (the backup write path) needs the real value, and
+// this is an internal Go API, not the HTTP layer. internal/api/server.go's
+// HTTP handler for this settings screen must redact Passphrase before
+// sending it to the browser (see server.go's handleGetEncryption).
+func (c *Config) GetEncryption() EncryptionConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.encryption
+}
+
+func (c *Config) SetEncryption(e EncryptionConfig) {
+	c.mu.Lock()
+	c.encryption = e
 	c.mu.Unlock()
 	_ = c.Save()
 }

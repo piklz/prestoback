@@ -174,6 +174,7 @@ select.fi{cursor:pointer}
 /* prog */
 .pw{background:var(--bg4);border-radius:4px;height:4px;overflow:hidden;margin-top:8px}
 .pb2{height:100%;background:var(--accent);border-radius:4px;animation:prog 1.5s ease-in-out infinite}
+.pb3{height:100%;background:var(--accent);border-radius:4px;transition:width .3s ease;width:0%}
 @keyframes prog{0%,100%{opacity:1}50%{opacity:.5}}
 /* toast */
 #toasts{position:fixed;bottom:22px;right:22px;display:flex;flex-direction:column;gap:7px;z-index:200}
@@ -427,6 +428,13 @@ select.fi{cursor:pointer}
     </div>
     <div class="card">
       <div class="ch"><div class="ct">Live activity</div><span class="pill pg"><span class="pd"></span>SSE</span></div>
+      <div id="live-progress" style="display:none;padding:10px 18px 0 18px">
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--txt2);margin-bottom:4px">
+          <span id="live-progress-label">—</span>
+          <span id="live-progress-pct" style="font-family:var(--mono)">0%</span>
+        </div>
+        <div class="pw"><div id="live-progress-bar" class="pb3"></div></div>
+      </div>
       <div style="padding:12px 18px"><div class="log" id="activity-log"><div class="ll info">Connecting…</div></div></div>
     </div>
   </div>
@@ -582,6 +590,15 @@ select.fi{cursor:pointer}
       </div>
       <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">Regenerating invalidates the old key immediately and revokes all active browser sessions. You will be logged out.</div></div>
       <button class="btn btn-d btn-sm" onclick="regenKey()">⚠ Regenerate API Key</button>
+    </div></div>
+  </div>
+  <div class="sec">
+    <div class="card"><div class="ch"><div class="ct">Backup Encryption</div></div><div class="cb">
+      <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">Encrypts new backup archives at rest (AES-256-CTR + HMAC-SHA256). The passphrase below is used automatically for scheduled backups — but <strong>restoring always asks for it again</strong>, never uses this stored copy silently. Per-app overrides are on each app's Edit screen.</div></div>
+      <div class="fg"><div class="ftog" onclick="togEncryption()"><div class="ftog-sw" id="tog-encryption"><div class="ftog-kn"></div></div><div class="ftog-lbl">Encrypt new backups by default</div></div></div>
+      <div class="fg"><label class="fl">Passphrase</label><input class="fi" type="password" id="enc-passphrase" placeholder="Leave blank to keep the existing passphrase"><div class="fh" id="enc-passphrase-hint"></div></div>
+      <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">There's no recovery if you lose this passphrase — encrypted archives become permanently unreadable. Store it somewhere other than this Pi.</div></div>
+      <button class="btn btn-p" onclick="saveEncryption()">Save encryption settings</button>
     </div></div>
   </div>
 </div>
@@ -743,6 +760,15 @@ select.fi{cursor:pointer}
         </select>
         <div class="fh" id="ea-strategy-hint"></div>
       </div>
+      <div class="fg">
+        <label class="fl">Backup encryption</label>
+        <select class="fi" id="ea-encrypted">
+          <option value="">Use global default</option>
+          <option value="true">Always encrypt this app's backups</option>
+          <option value="false">Never encrypt this app's backups</option>
+        </select>
+        <div class="fh">Overrides the global on/off default (set in Settings → Security) for this app only.</div>
+      </div>
       <div class="fg" id="ea-linked-wrap" style="display:none">
         <label class="fl">Detected dependencies</label>
         <div id="ea-linked-list" style="display:flex;flex-direction:column;gap:6px"></div>
@@ -828,6 +854,13 @@ select.fi{cursor:pointer}
       </div>
       <div id="bk-prog" style="display:none"><div style="font-size:12px;color:var(--txt2);margin-bottom:6px">Running — watch the activity log</div><div class="pw"><div class="pb2"></div></div></div>
       <div id="bk-size-warn" style="font-size:12px;margin-top:8px"></div>
+      <div id="bk-large-confirm" style="display:none;margin-top:12px;padding:10px 14px;background:var(--ad);border:1px solid rgba(240,168,95,.3);border-radius:var(--rs)">
+        <div style="font-size:12.5px;color:var(--txt);margin-bottom:8px" id="bk-large-text"></div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer">
+          <input type="checkbox" id="bk-large-ack" onchange="document.getElementById('bk-run').disabled=!this.checked">
+          I understand this may take a while — proceed anyway
+        </label>
+      </div>
     </div>
     <div class="mf"><button class="btn btn-g" onclick="CM('m-bk')">Cancel</button><button class="btn btn-p" id="bk-run" onclick="runBackup()">▶ Start Backup</button></div>
   </div>
@@ -848,6 +881,17 @@ select.fi{cursor:pointer}
       <div style="margin-top:14px;padding:10px 14px;background:var(--bg3);border-radius:var(--rs)"><div style="font-size:10px;color:var(--txt3);font-family:var(--mono);margin-bottom:4px">RESTORING ARCHIVE</div><div style="font-family:var(--mono);font-size:12px;color:var(--txt)" id="rs-id">—</div></div>
       <div id="rs-size-warn" style="margin-top:10px;font-size:12px"></div>
       <div id="rs-postrestore-hint"></div>
+      <div id="rs-passphrase-box" style="display:none;margin-top:12px">
+        <label style="font-size:12px;color:var(--txt2);display:block;margin-bottom:6px">🔒 This archive is encrypted — enter the passphrase to restore it</label>
+        <input type="password" id="rs-passphrase" class="fi" placeholder="Passphrase" style="width:100%" oninput="updateRsRunEnabled()">
+      </div>
+      <div id="rs-large-confirm" style="display:none;margin-top:12px;padding:10px 14px;background:var(--ad);border:1px solid rgba(240,168,95,.3);border-radius:var(--rs)">
+        <div style="font-size:12.5px;color:var(--txt);margin-bottom:8px" id="rs-large-text"></div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer">
+          <input type="checkbox" id="rs-large-ack" onchange="updateRsRunEnabled()">
+          I understand this may take a while — proceed anyway
+        </label>
+      </div>
     </div>
     <div class="mf"><button class="btn btn-g" onclick="CM('m-rs')">Cancel</button><button class="btn btn-d" id="rs-run" onclick="runRestore()">↺ Restore Now</button></div>
   </div>
@@ -1439,7 +1483,7 @@ function settingsTab(name) {
       tab.style.borderBottomColor = t===name ? 'var(--accent)' : 'transparent';
     }
   });
-  if (name==='sec') loadStatus();
+  if (name==='sec') { loadStatus(); loadEncryption(); }
 }
 
 // Mobile off-canvas sidebar
@@ -1700,6 +1744,7 @@ function openEditApp(id) {
   document.getElementById('ea-id').value=a.id;
   document.getElementById('ea-strategy').value=a.container_strategy||'stop';
   updateStrategyHint('ea');
+  document.getElementById('ea-encrypted').value = a.encrypted===true ? 'true' : a.encrypted===false ? 'false' : '';
   document.getElementById('ea-cron').value=a.schedule?.cron_expr||'';
   // The preview div/desc/runs below are singleton elements reused across
   // every open of this modal, and previewCron only ever fired on user
@@ -1749,12 +1794,14 @@ async function submitEditApp() {
   const excludesRaw = (document.getElementById('ea-excludes').value||'')
     .split('\n').map(s=>s.trim()).filter(Boolean);
   const linkedContainers = [...document.querySelectorAll('.ea-linked-chk:checked')].map(el => el.value);
+  const encVal = gv('ea-encrypted'); // '' = inherit global (send null), 'true'/'false' = explicit override
   const a = {
     ...S.editApp,
     name:gv('ea-name'), path:gv('ea-path'),
     retain:parseInt(gv('ea-retain'))||5,
     pinned:S.editPinOn,
     container_strategy:gv('ea-strategy'),
+    encrypted: encVal==='' ? null : encVal==='true',
     linked_containers: linkedContainers,
     linked_containers_set: true,
     schedule:{enabled:S.editSchedOn, cron_expr:gv('ea-cron')},
@@ -2167,14 +2214,23 @@ function openBkModal(id,name) {
   document.getElementById('bk-run').disabled=false;
   const warn = document.getElementById('bk-size-warn');
   warn.innerHTML='';
+  const largeBox = document.getElementById('bk-large-confirm');
+  largeBox.style.display='none';
+  document.getElementById('bk-large-ack').checked=false;
   OM('m-bk');
-  // Async size check — shows after modal opens
+  // Async size+duration check — shows after modal opens. Small/fast backups
+  // stay a single click (bk-run starts enabled above); only once this
+  // resolves AND crosses the large-operation line does the button get
+  // gated behind the explicit checkbox above. There's an inherent race for
+  // a user who clicks Start before this resolves — acceptable for a
+  // homelab tool; the estimate call is normally fast (a local stat walk).
   const app = S.apps.find(a=>a.id===id);
   const vols = (app?.volumes||[]).filter(v=>v.enabled!==false && v.path);
   if (!vols.length) return;
   const params = new URLSearchParams();
   vols.forEach(v => params.append('path', v.path));
   vols.forEach(v => (v.excludes||[]).forEach(e => params.append('exclude', e)));
+  params.append('app_id', id);
   api('/api/dir-size?'+params.toString()).then(sz => {
     if (!sz || !sz.bytes) return;
     const gb = sz.bytes/(1024*1024*1024);
@@ -2182,17 +2238,25 @@ function openBkModal(id,name) {
     if (gb < 1) {
       warn.innerHTML = `Source: <strong>${sz.human}</strong> (${sz.file_count.toLocaleString()} files)`;
       warn.style.color = 'var(--txt2)';
-      return;
+    } else {
+      // ≥1GB — call out the real consequence, not just the number
+      const strategy = app.container_strategy || 'stop';
+      const impact = strategy === 'none'
+        ? 'the container is left running, but compressing this much data is still real job time'
+        : strategy === 'pause'
+          ? 'the app will be frozen (paused) for the whole archive step — proportional to this size on slower hardware (e.g. a Raspberry Pi)'
+          : 'the app will be stopped for the whole archive step — proportional to this size on slower hardware (e.g. a Raspberry Pi)';
+      warn.innerHTML = `⚠ <strong>${sz.human}</strong> to archive (${sz.file_count.toLocaleString()} files) — ${impact}.`;
+      warn.style.color = 'var(--amber)';
     }
-    // ≥1GB — call out the real consequence, not just the number
-    const strategy = app.container_strategy || 'stop';
-    const impact = strategy === 'none'
-      ? 'the container is left running, but compressing this much data is still real job time'
-      : strategy === 'pause'
-        ? 'the app will be frozen (paused) for the whole archive step — proportional to this size on slower hardware (e.g. a Raspberry Pi)'
-        : 'the app will be stopped for the whole archive step — proportional to this size on slower hardware (e.g. a Raspberry Pi)';
-    warn.innerHTML = `⚠ <strong>${sz.human}</strong> to archive (${sz.file_count.toLocaleString()} files) — ${impact}.`;
-    warn.style.color = 'var(--amber)';
+    if (sz.is_large) {
+      const mins = Math.round((sz.estimated_duration_ms||0)/60000);
+      const durText = mins >= 1 ? `~${mins} minute${mins===1?'':'s'}` : 'under a minute';
+      document.getElementById('bk-large-text').innerHTML =
+        `⚠ This will back up <strong>${sz.human}</strong> and may take <strong>${durText}</strong> — you'll want to leave this running rather than wait on it.`;
+      largeBox.style.display='';
+      document.getElementById('bk-run').disabled = !document.getElementById('bk-large-ack').checked;
+    }
   }).catch(()=>{});
 }
 async function runBackup() {
@@ -2201,7 +2265,14 @@ async function runBackup() {
   try {
     await api('/api/apps/'+S.bkAppID+'/backup',{method:'POST'});
     toast('Backup started — watch activity log','info'); CM('m-bk');
-  } catch(e) { toast(e.message,'error'); document.getElementById('bk-run').disabled=false; document.getElementById('bk-prog').style.display='none'; }
+  } catch(e) {
+    toast(e.message,'error');
+    document.getElementById('bk-prog').style.display='none';
+    // Re-enable respecting the large-op checkbox — a failed attempt on a
+    // large op shouldn't silently drop back to "one click starts it".
+    const largeShown = document.getElementById('bk-large-confirm').style.display !== 'none';
+    document.getElementById('bk-run').disabled = largeShown && !document.getElementById('bk-large-ack').checked;
+  }
 }
 
 // ════════════════════ Restore modal ════════════════════
@@ -2211,6 +2282,12 @@ function openRsModal(appID,backupID) {
   document.getElementById('rs-run').disabled=false;
   const warn = document.getElementById('rs-size-warn');
   warn.innerHTML='';
+
+  const passBox = document.getElementById('rs-passphrase-box');
+  document.getElementById('rs-passphrase').value='';
+  const largeBox = document.getElementById('rs-large-confirm');
+  largeBox.style.display='none';
+  document.getElementById('rs-large-ack').checked=false;
 
   // Show post-restore hint if this app uses a pre-backup dump command
   const app = S.apps.find(a=>a.id===appID);
@@ -2234,6 +2311,11 @@ function openRsModal(appID,backupID) {
   const meta = (S.bkAll||[]).find(m => m.id === backupID);
   const vol = app && meta ? (app.volumes||[]).find(v => v.slug === meta.volume_slug) : null;
 
+  // Encrypted archives (see internal/backup/engine.go's ManifestEntry.Encrypted,
+  // surfaced here as meta.encrypted) need a passphrase on THIS request —
+  // restore never falls back to a stored passphrase automatically.
+  passBox.style.display = meta && meta.encrypted ? '' : 'none';
+
   const archiveGB = meta ? meta.size_bytes/(1024*1024*1024) : 0;
   const showWarn = (liveHuman) => {
     const strategy = app?.container_strategy || 'stop';
@@ -2245,20 +2327,49 @@ function openRsModal(appID,backupID) {
     warn.innerHTML = `⚠ Restore ${parts.join(' + ')} — the app will be ${verb} for both steps. Expect real downtime on slower hardware (e.g. a Raspberry Pi), roughly proportional to the combined size.`;
     warn.style.color = 'var(--amber)';
   };
+  // Same 200MB/1-minute large-operation line as the backup confirm modal
+  // (see isLargeOp in internal/api/server.go) — checked synchronously
+  // against the archive's own known size first (no round-trip needed for
+  // the common case), then refined once the live-volume size (for the
+  // pre-restore snapshot) comes back.
+  const applyLarge = (totalBytes) => {
+    if (totalBytes < 200*1024*1024) return;
+    largeBox.style.display='';
+    document.getElementById('rs-large-text').textContent =
+      `⚠ This restore involves ${fmtBytes(totalBytes)} total and may take a while — you'll want to leave this running rather than wait on it.`;
+    updateRsRunEnabled();
+  };
 
   if (archiveGB >= 1) showWarn(null); // show something immediately, refine once live size is known
+  applyLarge(meta ? meta.size_bytes : 0);
   if (vol && vol.path) {
     api('/api/dir-size?'+new URLSearchParams([['path', vol.path], ...(vol.excludes||[]).map(e=>['exclude',e])]).toString())
-      .then(sz => { if (sz && sz.bytes) showWarn(sz.human); })
+      .then(sz => {
+        if (sz && sz.bytes) {
+          showWarn(sz.human);
+          applyLarge((meta ? meta.size_bytes : 0) + sz.bytes);
+        }
+      })
       .catch(()=>{});
   }
+  updateRsRunEnabled();
+}
+function updateRsRunEnabled() {
+  const btn = document.getElementById('rs-run');
+  if (!btn) return;
+  const needsPass = document.getElementById('rs-passphrase-box').style.display !== 'none';
+  const passOk = !needsPass || document.getElementById('rs-passphrase').value.length > 0;
+  const needsAck = document.getElementById('rs-large-confirm').style.display !== 'none';
+  const ackOk = !needsAck || document.getElementById('rs-large-ack').checked;
+  btn.disabled = !(passOk && ackOk);
 }
 async function runRestore() {
   document.getElementById('rs-run').disabled=true;
   try {
-    await api('/api/apps/'+S.rsAppID+'/restore/'+S.rsID,{method:'POST'});
+    const passphrase = document.getElementById('rs-passphrase').value;
+    await api('/api/apps/'+S.rsAppID+'/restore/'+S.rsID,{method:'POST', body: JSON.stringify({passphrase})});
     toast('Restore started — watch activity log','info'); CM('m-rs');
-  } catch(e) { toast(e.message,'error'); document.getElementById('rs-run').disabled=false; }
+  } catch(e) { toast(e.message,'error'); updateRsRunEnabled(); }
 }
 
 // ════════════════════ Backups view — reality-aware ════════════════════
@@ -2696,6 +2807,39 @@ async function testNotify() {
   } catch(e) { toast(e.message,'error'); }
 }
 
+// ════════════════════ Encryption ════════════════════
+// GET /api/encryption never sends the passphrase itself back (see
+// EncryptionSettingsView in internal/api/server.go) — only whether one is
+// already set — so the field starts empty either way; leaving it blank on
+// save means "keep whatever's already stored."
+let S_encPassSet = false;
+async function loadEncryption() {
+  try {
+    const e = await api('/api/encryption');
+    setTog('tog-encryption', e.enabled);
+    S_encPassSet = !!e.passphrase_is_set;
+    document.getElementById('enc-passphrase').value = '';
+    document.getElementById('enc-passphrase-hint').textContent = S_encPassSet
+      ? 'A passphrase is already set. Leave blank to keep it, or enter a new one to replace it.'
+      : 'No passphrase set yet — required before turning encryption on.';
+  } catch {}
+}
+function togEncryption() { setTog('tog-encryption', !document.getElementById('tog-encryption').classList.contains('on')); }
+async function saveEncryption() {
+  const enabled = document.getElementById('tog-encryption').classList.contains('on');
+  const passphrase = gv('enc-passphrase');
+  if (enabled && !S_encPassSet && !passphrase) {
+    toast('Set a passphrase before enabling encryption','error');
+    return;
+  }
+  try {
+    const r = await api('/api/encryption',{method:'PUT',body:JSON.stringify({enabled,passphrase})});
+    S_encPassSet = !!r.passphrase_is_set;
+    document.getElementById('enc-passphrase').value = '';
+    toast('Encryption settings saved','success');
+  } catch(e) { toast(e.message,'error'); }
+}
+
 // ════════════════════ Security ════════════════════
 function setApiKeyDisplay(text, copyEnabled) {
   const el = document.getElementById('api-key-display');
@@ -2830,16 +2974,49 @@ function connectSSE() {
             : log.includes('⚠')||log.includes('Warning')||log.includes('warn') ? 'warn'
             : log.includes('━━━') ? 'info' : '';
       if (log) addLog(appID, log, cls);
+      // Byte-level progress — see internal/backup/engine.go's progressEmitter.
+      // Not every job produces one (e.g. a job with no size estimate), so
+      // this box only appears once a real sample arrives, rather than
+      // showing an empty/indeterminate bar for every run.
+      const prog = u.progress || u.Progress;
+      if (prog) showLiveProgress(appID, prog);
       if (status==='success') {
         loadApps(); loadHistory();
         // re-probe counts so chips update
         probeAllApps();
         if (S.selAppID === appID) loadBackups();
+        hideLiveProgressSoon();
       }
-      if (status==='failed') { loadHistory(); probeAllApps(); }
+      if (status==='failed') { loadHistory(); probeAllApps(); hideLiveProgressSoon(); }
     } catch {}
   };
   es.onerror=()=>addLog('_sys','SSE disconnected — retrying…','warn');
+}
+// Persistent (survives the trigger modal closing) percentage bar for the
+// currently running large operation, shown above the activity log — see
+// internal/backup/engine.go's progressEmitter for where these samples come
+// from and why they're throttled rather than one-per-write.
+function showLiveProgress(appID, prog) {
+  const box = document.getElementById('live-progress');
+  const label = document.getElementById('live-progress-label');
+  const pct = document.getElementById('live-progress-pct');
+  const bar = document.getElementById('live-progress-bar');
+  if (!box) return;
+  const app = (S.apps||[]).find(a=>a.id===appID);
+  const name = app ? app.name : appID;
+  label.textContent = name + (prog.current_volume ? ' — '+prog.current_volume : '');
+  const p = Math.max(0, Math.min(100, prog.percent||0));
+  pct.textContent = p.toFixed(0)+'%';
+  bar.style.width = p+'%';
+  box.style.display = '';
+}
+function hideLiveProgressSoon() {
+  // Small delay so a finish that lands right after a 97% sample still shows
+  // "100%" for a moment instead of just vanishing.
+  setTimeout(() => {
+    const box = document.getElementById('live-progress');
+    if (box) box.style.display = 'none';
+  }, 1500);
 }
 function addLog(appID,msg,cls='') {
   const log=document.getElementById('activity-log');
