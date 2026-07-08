@@ -357,22 +357,111 @@ func (s *Server) handleEncryption(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleRemote is the off-box push destinations settings endpoint. Unlike
-// encryption's passphrase, nothing in config.RemoteTarget is itself a
-// secret (an rclone remote name references credentials that live in
-// rclone.conf, outside PrestoBack entirely — see remote.go's package
-// comment) so, unlike handleEncryption, GET here echoes the full config
-// back with no redaction.
+// RemoteTargetView is what GET /api/remote returns for one target. Secrets
+// (sftp_password, sftp_private_key_pass, s3_secret_key) are never echoed
+// back — same posture as handleEncryption's passphrase, and for the same
+// reason: these are the credentials themselves, not a reference to one
+// stored elsewhere (the old rclone-remote-name design this replaced was
+// the reason the original no-redaction comment below was ever true; it
+// stopped being true the moment SFTP/S3 held real secrets directly, and
+// this was never updated to match). Each secret gets a companion
+// *_is_set bool so the UI can show "already configured" without ever
+// receiving the value.
+type RemoteTargetView struct {
+	Name string `json:"name"`
+	Kind string `json:"kind"`
+
+	MountPath string `json:"mount_path,omitempty"`
+
+	SFTPHost                string `json:"sftp_host,omitempty"`
+	SFTPPort                int    `json:"sftp_port,omitempty"`
+	SFTPUser                string `json:"sftp_user,omitempty"`
+	SFTPPasswordIsSet       bool   `json:"sftp_password_is_set"`
+	SFTPPrivateKeyPath      string `json:"sftp_private_key_path,omitempty"`
+	SFTPPrivateKeyPassIsSet bool   `json:"sftp_private_key_pass_is_set"`
+	SFTPKnownHostsPath      string `json:"sftp_known_hosts_path,omitempty"`
+	SFTPBaseDir             string `json:"sftp_base_dir,omitempty"`
+
+	S3Endpoint       string `json:"s3_endpoint,omitempty"`
+	S3Bucket         string `json:"s3_bucket,omitempty"`
+	S3AccessKey      string `json:"s3_access_key,omitempty"`
+	S3SecretKeyIsSet bool   `json:"s3_secret_key_is_set"`
+	S3Region         string `json:"s3_region,omitempty"`
+	S3BaseDir        string `json:"s3_base_dir,omitempty"`
+}
+
+type RemoteConfigView struct {
+	Enabled bool               `json:"enabled"`
+	Targets []RemoteTargetView `json:"targets,omitempty"`
+}
+
+func redactRemoteConfig(rc config.RemoteConfig) RemoteConfigView {
+	view := RemoteConfigView{Enabled: rc.Enabled}
+	for _, t := range rc.Targets {
+		view.Targets = append(view.Targets, RemoteTargetView{
+			Name: t.Name, Kind: t.Kind,
+			MountPath: t.MountPath,
+			SFTPHost:  t.SFTPHost, SFTPPort: t.SFTPPort, SFTPUser: t.SFTPUser,
+			SFTPPasswordIsSet:       t.SFTPPassword != "",
+			SFTPPrivateKeyPath:      t.SFTPPrivateKeyPath,
+			SFTPPrivateKeyPassIsSet: t.SFTPPrivateKeyPass != "",
+			SFTPKnownHostsPath:      t.SFTPKnownHostsPath,
+			SFTPBaseDir:             t.SFTPBaseDir,
+			S3Endpoint:              t.S3Endpoint, S3Bucket: t.S3Bucket, S3AccessKey: t.S3AccessKey,
+			S3SecretKeyIsSet: t.S3SecretKey != "",
+			S3Region:         t.S3Region, S3BaseDir: t.S3BaseDir,
+		})
+	}
+	return view
+}
+
+// mergeRemoteSecrets preserves each target's previously-stored secret
+// fields when the incoming request resends them blank — the same "blank
+// means unchanged" contract handleEncryption already uses for its
+// passphrase. Matched by Name (the target's stable identity in the
+// settings UI's edit form). A target whose Name doesn't match any
+// existing one is new and keeps whatever it arrived with — validation
+// below still requires a real secret for a genuinely new sftp/s3 target.
+func mergeRemoteSecrets(incoming, existing []config.RemoteTarget) []config.RemoteTarget {
+	byName := make(map[string]config.RemoteTarget, len(existing))
+	for _, t := range existing {
+		byName[t.Name] = t
+	}
+	for i, t := range incoming {
+		old, ok := byName[t.Name]
+		if !ok {
+			continue
+		}
+		if t.SFTPPassword == "" {
+			incoming[i].SFTPPassword = old.SFTPPassword
+		}
+		if t.SFTPPrivateKeyPass == "" {
+			incoming[i].SFTPPrivateKeyPass = old.SFTPPrivateKeyPass
+		}
+		if t.S3SecretKey == "" {
+			incoming[i].S3SecretKey = old.S3SecretKey
+		}
+	}
+	return incoming
+}
+
+// handleRemote is the off-box push destinations settings endpoint. GET
+// returns a redacted view (see RemoteTargetView); PUT accepts blank
+// secret fields on a target whose Name matches an existing one as "leave
+// unchanged" (see mergeRemoteSecrets) so the settings UI can round-trip a
+// target it only ever received redacted, without clobbering the stored
+// credential with an empty string.
 func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		respond(w, 200, s.cfg.GetRemote())
+		respond(w, 200, redactRemoteConfig(s.cfg.GetRemote()))
 	case http.MethodPut:
 		var rc config.RemoteConfig
 		if err := parseJSON(r, &rc); err != nil {
 			errOut(w, 400, err.Error())
 			return
 		}
+		rc.Targets = mergeRemoteSecrets(rc.Targets, s.cfg.GetRemote().Targets)
 		for i, t := range rc.Targets {
 			if t.Name == "" {
 				errOut(w, 400, fmt.Sprintf("target %d: name is required", i))
@@ -404,7 +493,7 @@ func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		s.cfg.SetRemote(rc)
-		respond(w, 200, rc)
+		respond(w, 200, redactRemoteConfig(rc))
 	default:
 		errOut(w, 405, "method not allowed")
 	}
@@ -443,7 +532,11 @@ func (s *Server) handleRemoteTest(w http.ResponseWriter, r *http.Request) {
 		errOut(w, 400, err.Error())
 		return
 	}
-	target := toBackupTarget(t)
+	// Same "blank secret = unchanged" merge as PUT /api/remote — the
+	// settings UI's Test button fires against a target it may only have
+	// in redacted form (see handleRemote).
+	merged := mergeRemoteSecrets([]config.RemoteTarget{t}, s.cfg.GetRemote().Targets)
+	target := toBackupTarget(merged[0])
 	if err := backup.RemoteReachable(target); err != nil {
 		respond(w, 200, map[string]any{"ok": false, "error": err.Error()})
 		return
