@@ -2884,11 +2884,15 @@ async function saveEncryption() {
 }
 
 // ════════════════════ Remote backup targets ════════════════════
-// S_remoteTargets mirrors config.RemoteConfig.targets exactly (name/kind
-// plus the kind-specific fields) — kept as a plain in-memory array and
-// only written back with saveRemote(); add/remove below just mutate this
-// array and re-render, same "edit locally, Save commits" shape as the
-// rest of this settings page (see saveEncryption above).
+// S_remoteTargets mirrors RemoteTargetView (server.go) — name/kind plus the
+// kind-specific fields, EXCEPT secrets: sftp_password, sftp_private_key_pass,
+// and s3_secret_key are never sent by GET /api/remote, replaced by
+// *_is_set booleans. Kept as a plain in-memory array and only written back
+// with saveRemote(); add/remove below just mutate this array and re-render,
+// same "edit locally, Save commits" shape as the rest of this settings page
+// (see saveEncryption above). Blank secret fields on an existing target are
+// fine to send back on PUT — the server preserves the previously-saved
+// secret for any target matched by name (see mergeRemoteSecrets).
 let S_remoteTargets = [];
 async function loadRemote() {
   try {
@@ -2957,10 +2961,16 @@ function draftRemoteTarget() {
 }
 
 function remoteTargetIsComplete(t) {
+  // For a target freshly drafted in the add-target form, the real secret
+  // is on t.sftp_password / t.s3_secret_key. For a target loaded from GET
+  // /api/remote (now redacted server-side — see RemoteTargetView in
+  // server.go), the real value is never sent back; t.sftp_password_is_set /
+  // t.s3_secret_key_is_set tell us one is already saved without revealing
+  // it. Either counts as "this target has a credential."
   if (!t.name) return false;
   if (t.kind === 'mount') return !!t.mount_path;
-  if (t.kind === 'sftp') return !!(t.sftp_host && t.sftp_user && (t.sftp_password || t.sftp_private_key_path));
-  if (t.kind === 's3') return !!(t.s3_endpoint && t.s3_bucket && t.s3_access_key && t.s3_secret_key);
+  if (t.kind === 'sftp') return !!(t.sftp_host && t.sftp_user && (t.sftp_password || t.sftp_password_is_set || t.sftp_private_key_path));
+  if (t.kind === 's3') return !!(t.s3_endpoint && t.s3_bucket && t.s3_access_key && (t.s3_secret_key || t.s3_secret_key_is_set));
   return false;
 }
 
