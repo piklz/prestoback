@@ -207,17 +207,32 @@ type EncryptionConfig struct {
 // which imports both, is the one place that translates between them.
 type RemoteTarget struct {
 	Name string `json:"name"` // display name, e.g. "Synology NAS"
-	Kind string `json:"kind"` // "mount" | "rclone"
+	Kind string `json:"kind"` // "mount" | "sftp" | "s3"
 
 	// Kind == "mount": a directory already accessible inside this
 	// container (a bind-mounted SMB/CIFS or NFS share).
 	MountPath string `json:"mount_path,omitempty"`
 
-	// Kind == "rclone": a "remote:path" string exactly as it appears in
-	// `rclone listremotes` / rclone.conf. See remote.go's package comment
-	// for why only non-OAuth rclone backends (S3-compatible, SFTP, SMB,
-	// WebDAV) are supported — Google Drive/OneDrive/Dropbox are not.
-	RcloneRemote string `json:"rclone_remote,omitempty"`
+	// Kind == "sftp": direct SSH/SFTP, no external binary — see
+	// internal/backup/sftpconn.go for exactly how each field is used.
+	SFTPHost           string `json:"sftp_host,omitempty"`
+	SFTPPort           int    `json:"sftp_port,omitempty"` // 0 defaults to 22
+	SFTPUser           string `json:"sftp_user,omitempty"`
+	SFTPPassword       string `json:"sftp_password,omitempty"`         // either this or a private key
+	SFTPPrivateKeyPath string `json:"sftp_private_key_path,omitempty"` // path INSIDE this container to a mounted private key file
+	SFTPPrivateKeyPass string `json:"sftp_private_key_pass,omitempty"` // passphrase for the private key, if it has one
+	SFTPKnownHostsPath string `json:"sftp_known_hosts_path,omitempty"` // optional — blank means accept any host key
+	SFTPBaseDir        string `json:"sftp_base_dir,omitempty"`         // remote directory backups live under
+
+	// Kind == "s3": S3-compatible object storage (AWS S3, MinIO, Backblaze
+	// B2's S3-compatible endpoint, Wasabi, ...) — a hand-rolled SigV4
+	// client, no SDK. See internal/backup/s3.go.
+	S3Endpoint  string `json:"s3_endpoint,omitempty"` // full URL including scheme
+	S3Bucket    string `json:"s3_bucket,omitempty"`
+	S3AccessKey string `json:"s3_access_key,omitempty"`
+	S3SecretKey string `json:"s3_secret_key,omitempty"`
+	S3Region    string `json:"s3_region,omitempty"`   // optional, defaults to "us-east-1"
+	S3BaseDir   string `json:"s3_base_dir,omitempty"` // optional key prefix
 }
 
 // RemoteConfig holds every configured push destination. Push is additive to

@@ -384,13 +384,22 @@ func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
 					errOut(w, 400, fmt.Sprintf("target %q: mount_path is required for kind=mount", t.Name))
 					return
 				}
-			case "rclone":
-				if t.RcloneRemote == "" {
-					errOut(w, 400, fmt.Sprintf("target %q: rclone_remote is required for kind=rclone", t.Name))
+			case "sftp":
+				if t.SFTPHost == "" || t.SFTPUser == "" {
+					errOut(w, 400, fmt.Sprintf("target %q: sftp_host and sftp_user are required for kind=sftp", t.Name))
+					return
+				}
+				if t.SFTPPassword == "" && t.SFTPPrivateKeyPath == "" {
+					errOut(w, 400, fmt.Sprintf("target %q: sftp_password or sftp_private_key_path is required for kind=sftp", t.Name))
+					return
+				}
+			case "s3":
+				if t.S3Endpoint == "" || t.S3Bucket == "" || t.S3AccessKey == "" || t.S3SecretKey == "" {
+					errOut(w, 400, fmt.Sprintf("target %q: s3_endpoint, s3_bucket, s3_access_key, and s3_secret_key are required for kind=s3", t.Name))
 					return
 				}
 			default:
-				errOut(w, 400, fmt.Sprintf("target %q: kind must be \"mount\" or \"rclone\", got %q", t.Name, t.Kind))
+				errOut(w, 400, fmt.Sprintf("target %q: kind must be \"mount\", \"sftp\", or \"s3\", got %q", t.Name, t.Kind))
 				return
 			}
 		}
@@ -401,9 +410,28 @@ func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// toBackupTarget converts the persisted config.RemoteTarget shape into the
+// runtime backup.RemoteTarget shape internal/backup/remote.go operates on.
+// The two are kept as separate types (config can't import backup — see
+// config.go's RemoteTarget doc comment) but their fields are deliberately
+// identical, so this is a straight 1:1 copy.
+func toBackupTarget(t config.RemoteTarget) backup.RemoteTarget {
+	return backup.RemoteTarget{
+		Name: t.Name, Kind: t.Kind,
+		MountPath: t.MountPath,
+		SFTPHost:  t.SFTPHost, SFTPPort: t.SFTPPort, SFTPUser: t.SFTPUser,
+		SFTPPassword: t.SFTPPassword, SFTPPrivateKeyPath: t.SFTPPrivateKeyPath,
+		SFTPPrivateKeyPass: t.SFTPPrivateKeyPass, SFTPKnownHostsPath: t.SFTPKnownHostsPath,
+		SFTPBaseDir: t.SFTPBaseDir,
+		S3Endpoint:  t.S3Endpoint, S3Bucket: t.S3Bucket,
+		S3AccessKey: t.S3AccessKey, S3SecretKey: t.S3SecretKey,
+		S3Region: t.S3Region, S3BaseDir: t.S3BaseDir,
+	}
+}
+
 // handleRemoteTest checks one target's reachability without saving it —
-// lets the settings UI validate a NAS mount or rclone remote before the
-// user commits to it, the same "try before you save" shape
+// lets the settings UI validate a NAS mount, SFTP login, or S3 bucket
+// before the user commits to it, the same "try before you save" shape
 // handleNotifyTest already gives Telegram/Discord/ntfy.
 func (s *Server) handleRemoteTest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -415,10 +443,7 @@ func (s *Server) handleRemoteTest(w http.ResponseWriter, r *http.Request) {
 		errOut(w, 400, err.Error())
 		return
 	}
-	target := backup.RemoteTarget{
-		Name: t.Name, Kind: t.Kind,
-		MountPath: t.MountPath, RcloneRemote: t.RcloneRemote,
-	}
+	target := toBackupTarget(t)
 	if err := backup.RemoteReachable(target); err != nil {
 		respond(w, 200, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -1720,12 +1745,7 @@ func (s *Server) pushToRemotes(appID, appName string, metas []backup.BackupMeta,
 		return
 	}
 	for _, t := range rc.Targets {
-		target := backup.RemoteTarget{
-			Name:         t.Name,
-			Kind:         t.Kind,
-			MountPath:    t.MountPath,
-			RcloneRemote: t.RcloneRemote,
-		}
+		target := toBackupTarget(t)
 		pushStart := time.Now()
 		pushed, pushErr := backup.PushAppBackup(appID, metas, manifestPath, target, emit)
 		pushDur := time.Since(pushStart).Milliseconds()

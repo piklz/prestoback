@@ -603,7 +603,7 @@ select.fi{cursor:pointer}
   </div>
   <div class="sec">
     <div class="card"><div class="ch"><div class="ct">Remote Backup Targets</div></div><div class="cb">
-      <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><path d="M20 16.58A5 5 0 0018 7h-1.26A8 8 0 104 15.25"/><polyline points="12 12 12 21"/><polyline points="9 18 12 21 15 18"/></svg><div class="info-t">Copies each finished backup to an off-box destination — the local copy on this Pi is <strong>never</strong> replaced or skipped, this is always an extra copy. <strong>Mount</strong> targets are a folder already inside this container (e.g. an SMB/NFS share mounted on the host and bind-mounted in). <strong>rclone</strong> targets use an installed <code>rclone</code> binary plus a remote already configured in rclone's own config — S3-compatible, SFTP, a real SMB remote, WebDAV, Backblaze B2. Google Drive/OneDrive/Dropbox aren't offered here since those need an interactive browser login rclone can't do headlessly — set those up as a "mount" via <code>rclone mount</code> on the host instead, if needed.</div></div>
+      <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><path d="M20 16.58A5 5 0 0018 7h-1.26A8 8 0 104 15.25"/><polyline points="12 12 12 21"/><polyline points="9 18 12 21 15 18"/></svg><div class="info-t">Copies each finished backup to an off-box destination — the local copy on this Pi is <strong>never</strong> replaced or skipped, this is always an extra copy. Everything runs inside PrestoBack itself — no external tool to install. <strong>Mount</strong> is a folder already inside this container (e.g. an SMB/NFS share mounted on the host and bind-mounted in). <strong>SFTP</strong> connects directly over SSH to any NAS or Linux box that supports it (Synology, TrueNAS, QNAP, a plain server) — just a host, username, and password or key. <strong>S3-compatible</strong> connects directly to AWS S3, MinIO, Backblaze B2, Wasabi, or anything else speaking the S3 API. Google Drive/OneDrive/Dropbox aren't offered since those need an interactive browser login that doesn't fit a headless container.</div></div>
       <div class="fg"><div class="ftog" onclick="togRemote()"><div class="ftog-sw" id="tog-remote"><div class="ftog-kn"></div></div><div class="ftog-lbl">Push new backups to the targets below</div></div></div>
 
       <div id="remote-target-list" style="margin:6px 0 4px"></div>
@@ -614,11 +614,26 @@ select.fi{cursor:pointer}
         <div class="fg"><label class="fl">Kind</label>
           <select class="fi" id="rt-kind" onchange="onRtKindChange()">
             <option value="mount">Mount (folder already in this container)</option>
-            <option value="rclone">rclone remote</option>
+            <option value="sftp">SFTP (NAS / Linux server over SSH)</option>
+            <option value="s3">S3-compatible (AWS S3, MinIO, Backblaze B2, Wasabi...)</option>
           </select>
         </div>
         <div class="fg" id="rt-mount-field"><label class="fl">Mount path</label><input class="fi" id="rt-mount-path" placeholder="/remote/nas"><div class="fh">A path inside THIS container, e.g. mounted with <code>-v /mnt/nas/presto-backups:/remote/nas</code>.</div></div>
-        <div class="fg" id="rt-rclone-field" style="display:none"><label class="fl">rclone remote</label><input class="fi" id="rt-rclone-remote" placeholder="nas-smb:presto-backups"><div class="fh">Exactly as it appears in <code>rclone listremotes</code> — configured once, outside PrestoBack, via <code>rclone config</code>.</div></div>
+        <div id="rt-sftp-field" style="display:none">
+          <div class="fg"><label class="fl">Host</label><input class="fi" id="rt-sftp-host" placeholder="192.168.1.50 or nas.local"></div>
+          <div class="fg"><label class="fl">Port</label><input class="fi" id="rt-sftp-port" placeholder="22"></div>
+          <div class="fg"><label class="fl">Username</label><input class="fi" id="rt-sftp-user" placeholder="backup-user"></div>
+          <div class="fg"><label class="fl">Password</label><input class="fi" type="password" id="rt-sftp-password" placeholder="leave blank if using a private key"></div>
+          <div class="fg"><label class="fl">Private key path (optional)</label><input class="fi" id="rt-sftp-keypath" placeholder="/data/ssh/nas_key"><div class="fh">A key file mounted INTO this container — used instead of a password if set.</div></div>
+          <div class="fg"><label class="fl">Remote base directory</label><input class="fi" id="rt-sftp-basedir" placeholder="/volume1/backups/presto"></div>
+        </div>
+        <div id="rt-s3-field" style="display:none">
+          <div class="fg"><label class="fl">Endpoint URL</label><input class="fi" id="rt-s3-endpoint" placeholder="https://s3.us-west-002.backblazeb2.com"></div>
+          <div class="fg"><label class="fl">Bucket</label><input class="fi" id="rt-s3-bucket" placeholder="my-presto-backups"></div>
+          <div class="fg"><label class="fl">Access key</label><input class="fi" id="rt-s3-accesskey"></div>
+          <div class="fg"><label class="fl">Secret key</label><input class="fi" type="password" id="rt-s3-secretkey"></div>
+          <div class="fg"><label class="fl">Region (optional)</label><input class="fi" id="rt-s3-region" placeholder="us-east-1"></div>
+        </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           <button class="btn btn-g btn-sm" onclick="testRemoteTargetDraft()">Test connection</button>
           <button class="btn btn-p btn-sm" onclick="addRemoteTarget()">+ Add target</button>
@@ -2869,11 +2884,11 @@ async function saveEncryption() {
 }
 
 // ════════════════════ Remote backup targets ════════════════════
-// S_remoteTargets mirrors config.RemoteConfig.targets exactly (name/kind/
-// mount_path/rclone_remote) — kept as a plain in-memory array and only
-// written back with saveRemote(); add/remove below just mutate this array
-// and re-render, same "edit locally, Save commits" shape as the rest of
-// this settings page (see saveEncryption above).
+// S_remoteTargets mirrors config.RemoteConfig.targets exactly (name/kind
+// plus the kind-specific fields) — kept as a plain in-memory array and
+// only written back with saveRemote(); add/remove below just mutate this
+// array and re-render, same "edit locally, Save commits" shape as the
+// rest of this settings page (see saveEncryption above).
 let S_remoteTargets = [];
 async function loadRemote() {
   try {
@@ -2885,6 +2900,13 @@ async function loadRemote() {
 }
 function togRemote() { setTog('tog-remote', !document.getElementById('tog-remote').classList.contains('on')); }
 
+function remoteTargetSummary(t) {
+  if (t.kind === 'mount') return t.mount_path;
+  if (t.kind === 'sftp') return `${t.sftp_user}@${t.sftp_host}:${t.sftp_port||22}${t.sftp_base_dir?(' '+t.sftp_base_dir):''}`;
+  if (t.kind === 's3') return `${t.s3_bucket} @ ${t.s3_endpoint}`;
+  return '';
+}
+
 function renderRemoteTargets() {
   const el = document.getElementById('remote-target-list');
   if (!S_remoteTargets.length) {
@@ -2895,8 +2917,8 @@ function renderRemoteTargets() {
     <div class="bi">
       <div class="bic"><svg width="14" height="14" fill="none" stroke="var(--accent)" stroke-width="1.8" viewBox="0 0 24 24"><path d="M20 16.58A5 5 0 0018 7h-1.26A8 8 0 104 15.25"/></svg></div>
       <div class="bm">
-        <div class="bid">${esc(t.name)} <span class="pill pb" style="font-size:9px">${t.kind}</span></div>
-        <div class="bif">${esc(t.kind==='mount' ? t.mount_path : t.rclone_remote)}</div>
+        <div class="bid">${esc(t.name)} <span class="pill pb" style="font-size:9px">${esc(t.kind)}</span></div>
+        <div class="bif">${esc(remoteTargetSummary(t))}</div>
       </div>
       <div style="display:flex;gap:6px">
         <button class="btn btn-g btn-sm" onclick="testExistingRemoteTarget(${i})">Test</button>
@@ -2906,23 +2928,47 @@ function renderRemoteTargets() {
 }
 
 function onRtKindChange() {
-  document.getElementById('rt-mount-field').style.display = document.getElementById('rt-kind').value === 'mount' ? '' : 'none';
-  document.getElementById('rt-rclone-field').style.display = document.getElementById('rt-kind').value === 'rclone' ? '' : 'none';
+  const kind = document.getElementById('rt-kind').value;
+  document.getElementById('rt-mount-field').style.display = kind === 'mount' ? '' : 'none';
+  document.getElementById('rt-sftp-field').style.display = kind === 'sftp' ? '' : 'none';
+  document.getElementById('rt-s3-field').style.display = kind === 's3' ? '' : 'none';
 }
 
 function draftRemoteTarget() {
   const kind = document.getElementById('rt-kind').value;
   const t = { name: gv('rt-name'), kind };
-  if (kind === 'mount') t.mount_path = gv('rt-mount-path');
-  else t.rclone_remote = gv('rt-rclone-remote');
+  if (kind === 'mount') {
+    t.mount_path = gv('rt-mount-path');
+  } else if (kind === 'sftp') {
+    t.sftp_host = gv('rt-sftp-host');
+    t.sftp_port = parseInt(gv('rt-sftp-port'),10) || 0;
+    t.sftp_user = gv('rt-sftp-user');
+    t.sftp_password = gv('rt-sftp-password');
+    t.sftp_private_key_path = gv('rt-sftp-keypath');
+    t.sftp_base_dir = gv('rt-sftp-basedir');
+  } else if (kind === 's3') {
+    t.s3_endpoint = gv('rt-s3-endpoint');
+    t.s3_bucket = gv('rt-s3-bucket');
+    t.s3_access_key = gv('rt-s3-accesskey');
+    t.s3_secret_key = gv('rt-s3-secretkey');
+    t.s3_region = gv('rt-s3-region');
+  }
   return t;
+}
+
+function remoteTargetIsComplete(t) {
+  if (!t.name) return false;
+  if (t.kind === 'mount') return !!t.mount_path;
+  if (t.kind === 'sftp') return !!(t.sftp_host && t.sftp_user && (t.sftp_password || t.sftp_private_key_path));
+  if (t.kind === 's3') return !!(t.s3_endpoint && t.s3_bucket && t.s3_access_key && t.s3_secret_key);
+  return false;
 }
 
 async function testRemoteTargetDraft() { await runRemoteTest(draftRemoteTarget(), 'rt-test-result'); }
 async function testExistingRemoteTarget(i) { await runRemoteTest(S_remoteTargets[i], null); }
 
 async function runRemoteTest(target, resultElId) {
-  if (!target.name || (target.kind==='mount' ? !target.mount_path : !target.rclone_remote)) {
+  if (!remoteTargetIsComplete(target)) {
     toast('Fill in the target fields before testing','error');
     return;
   }
@@ -2946,13 +2992,11 @@ async function runRemoteTest(target, resultElId) {
 function addRemoteTarget() {
   const t = draftRemoteTarget();
   if (!t.name) { toast('Give the target a name','error'); return; }
-  if (t.kind==='mount' && !t.mount_path) { toast('Mount path is required','error'); return; }
-  if (t.kind==='rclone' && !t.rclone_remote) { toast('rclone remote is required','error'); return; }
+  if (!remoteTargetIsComplete(t)) { toast('Fill in all required fields for this target kind','error'); return; }
   S_remoteTargets.push(t);
   renderRemoteTargets();
-  document.getElementById('rt-name').value = '';
-  document.getElementById('rt-mount-path').value = '';
-  document.getElementById('rt-rclone-remote').value = '';
+  ['rt-name','rt-mount-path','rt-sftp-host','rt-sftp-port','rt-sftp-user','rt-sftp-password','rt-sftp-keypath','rt-sftp-basedir','rt-s3-endpoint','rt-s3-bucket','rt-s3-accesskey','rt-s3-secretkey','rt-s3-region']
+    .forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
   document.getElementById('rt-test-result').textContent = '';
   toast(`"${t.name}" added — click "Save remote backup settings" to persist it`,'success');
 }

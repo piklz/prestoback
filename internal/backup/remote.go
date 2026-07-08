@@ -1,33 +1,49 @@
 package backup
 
 // remote.go — pushes finished backup archives to an off-box destination and
-// pulls them back again for restore. Two backend kinds, chosen per target:
+// pulls them back again for restore. Three backend kinds, chosen per
+// target, ALL implemented in-process — no external binary is shelled out
+// to anywhere in this file:
 //
-//   "mount"  — the remote is already a filesystem path inside this
-//              container: a bind-mounted SMB/CIFS or NFS share, e.g. a
-//              Synology/TrueNAS box mounted on the HOST and passed through
-//              with `-v /mnt/nas/presto-backups:/remote/nas`. Zero new
-//              dependencies — just a streaming copy + hash verify, the
-//              same "don't trust it, verify it" posture EncryptStream/
-//              DecryptStream already use in backupcrypto.go.
+//   "mount" — the remote is already a filesystem path inside this
+//             container: a bind-mounted SMB/CIFS or NFS share, e.g. a
+//             Synology/TrueNAS box mounted on the HOST and passed through
+//             with `-v /mnt/nas/presto-backups:/remote/nas`. Zero
+//             dependencies — a streaming copy + hash verify, the same
+//             "don't trust it, verify it" posture EncryptStream/
+//             DecryptStream already use in backupcrypto.go.
 //
-//   "rclone" — anything rclone supports with non-interactive credentials:
-//              S3-compatible (AWS, MinIO, Backblaze B2, Wasabi...), SFTP,
-//              a genuine SMB *remote* (rclone's own smb: backend — handy
-//              when you'd rather hand PrestoBack a host/user/pass than
-//              manage a container bind-mount), and WebDAV. Deliberately NOT
-//              wiring up rclone's OAuth-based backends (Google Drive,
-//              OneDrive, Dropbox) here — those need an interactive browser
-//              consent flow that doesn't fit a headless container. Every
-//              kind this file supports authenticates with a plain
-//              key/secret or user/password, configured once, outside
-//              PrestoBack, via `rclone config` (or by mounting an existing
-//              rclone.conf into the container). rclone itself is invoked
-//              exactly like `docker` and `docker compose` are shelled out
-//              to elsewhere in this codebase — an external binary, not a
-//              vendored library.
+//   "sftp"  — a direct SSH/SFTP connection (sftpconn.go, built on
+//             golang.org/x/crypto/ssh + github.com/pkg/sftp) — the native
+//             equivalent of what Duplicati, Restic, Kopia, and Borg all
+//             support directly. Every NAS that speaks SFTP works here
+//             (Synology, TrueNAS, QNAP, a plain Linux box) with nothing
+//             more than the credentials already in hand — no client-side
+//             mount, no host-level setup at all.
 //
-// Both kinds operate on an ALREADY-FINISHED local archive
+//   "s3"    — S3-compatible object storage (s3.go, a hand-rolled AWS
+//             SigV4 client over stdlib net/http — see that file's
+//             comment for why not an SDK). Covers AWS S3 itself, MinIO,
+//             Backblaze B2 (S3-compatible endpoint), Wasabi, and anything
+//             else speaking the same API.
+//
+// An earlier version of this file shelled out to the `rclone` binary
+// instead. That's a reasonable design (many tools do exactly this), but
+// it made "no external app to install" impossible, and on reflection it
+// isn't actually what purpose-built backup tools do: Restic, Kopia, and
+// Duplicati all embed their SFTP/S3 clients directly rather than
+// depending on an external data-mover, and only reach for something like
+// rclone as a bridge for backends they don't support natively (Borg's
+// well-documented gap for S3/B2, for instance). SFTP and S3-compatible
+// storage between them cover the overwhelming majority of self-hosted
+// "back up to my NAS or my own bucket" use cases, so embedding both
+// directly — matching that same-standard behavior — beats requiring a
+// separate binary just to reach either one. OAuth-only services (Google
+// Drive, OneDrive, Dropbox) are still out of scope, unchanged from
+// before: they need an interactive browser consent flow that doesn't fit
+// a headless container, native or not.
+//
+// Every kind operates on an ALREADY-FINISHED local archive
 // (BackupMeta.FilePath). Remote push is always a second step after a
 // normal local backup completes, never a replacement for it — if the
 // remote is unreachable or the push fails, the local backup still exists
@@ -35,19 +51,17 @@ package backup
 //
 // Layout mirrors the local one on purpose: archives live under
 // "<remote root>/<appID>/<file>.tar.gz", exactly like ListBackups
-// (engine.go) expects under e.backupDir/<appID>/ — so PullArchive can drop
-// a file straight into the local backups dir and every existing restore
-// code path (RestoreVolume, RestoreApp) works completely unchanged. A
-// remote-sourced restore and a local-disk restore are indistinguishable to
-// the rest of the codebase from that point on.
+// (engine.go) expects under e.backupDir/<appID>/ — so PullArchive can
+// drop a file straight into the local backups dir and every existing
+// restore code path (RestoreVolume, RestoreApp) works completely
+// unchanged. A remote-sourced restore and a local-disk restore are
+// indistinguishable to the rest of the codebase from that point on.
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -57,36 +71,46 @@ import (
 // RemoteConfig for how a list of these is persisted.
 type RemoteTarget struct {
 	Name string `json:"name"` // display name, e.g. "Synology NAS"
-	Kind string `json:"kind"` // "mount" | "rclone"
+	Kind string `json:"kind"` // "mount" | "sftp" | "s3"
 
-	// Kind == "mount": MountPath is a directory already accessible inside
-	// this container.
+	// Kind == "mount": a directory already accessible inside this container.
 	MountPath string `json:"mount_path,omitempty"`
 
-	// Kind == "rclone": RcloneRemote is exactly what appears in
-	// `rclone listremotes` / rclone.conf, e.g. "nas-smb:presto-backups" or
-	// "b2:my-bucket/presto". PrestoBack never writes or reads rclone.conf
-	// itself — that file is managed outside PrestoBack entirely, the same
-	// division of responsibility docker-compose.yml already has.
-	RcloneRemote string `json:"rclone_remote,omitempty"`
+	// Kind == "sftp": see sftpconn.go for exactly how each field is used.
+	SFTPHost           string `json:"sftp_host,omitempty"`
+	SFTPPort           int    `json:"sftp_port,omitempty"` // 0 defaults to 22
+	SFTPUser           string `json:"sftp_user,omitempty"`
+	SFTPPassword       string `json:"sftp_password,omitempty"`         // either this or a private key
+	SFTPPrivateKeyPath string `json:"sftp_private_key_path,omitempty"` // path INSIDE this container to a mounted private key file
+	SFTPPrivateKeyPass string `json:"sftp_private_key_pass,omitempty"` // passphrase for the private key, if it has one
+	SFTPKnownHostsPath string `json:"sftp_known_hosts_path,omitempty"` // optional — blank means accept any host key, see sftpconn.go
+	SFTPBaseDir        string `json:"sftp_base_dir,omitempty"`         // remote directory backups live under, e.g. "/backups/presto"
+
+	// Kind == "s3": see s3.go for exactly how each field is used.
+	S3Endpoint  string `json:"s3_endpoint,omitempty"` // full URL including scheme, e.g. "https://s3.us-west-002.backblazeb2.com"
+	S3Bucket    string `json:"s3_bucket,omitempty"`
+	S3AccessKey string `json:"s3_access_key,omitempty"`
+	S3SecretKey string `json:"s3_secret_key,omitempty"`
+	S3Region    string `json:"s3_region,omitempty"`   // optional — defaults to "us-east-1", many S3-compatible services ignore it entirely
+	S3BaseDir   string `json:"s3_base_dir,omitempty"` // optional key prefix, e.g. "presto-backups"
 }
 
 // RemoteFile describes one archive found on a remote target.
 type RemoteFile struct {
 	Name      string    `json:"name"`
-	Path      string    `json:"path"` // full remote path/URI as the backend understands it
+	Path      string    `json:"path"` // full remote path/key as the backend understands it
 	SizeBytes int64     `json:"size_bytes"`
 	ModTime   time.Time `json:"mod_time"`
 }
 
-const rcloneTimeout = 2 * time.Hour // large archives over slow uplinks — matches pullTimeout's spirit in docker.go
+const remoteOpTimeout = 2 * time.Hour // large archives, slow uplinks
 
 // ── Reachability ─────────────────────────────────────────────────────────────
 
 // RemoteReachable does a fast pre-flight check before a push/list/pull is
 // attempted, so callers can surface a clear "NAS unreachable"/"remote
-// misconfigured" error instead of a slow copy timing out or a wall of
-// rclone error output.
+// misconfigured" error instead of a slow copy timing out deep inside a
+// push.
 func RemoteReachable(t RemoteTarget) error {
 	switch t.Kind {
 	case "mount":
@@ -97,8 +121,6 @@ func RemoteReachable(t RemoteTarget) error {
 		if !info.IsDir() {
 			return fmt.Errorf("mount path %q is not a directory", t.MountPath)
 		}
-		// Write-test: a stale or read-only SMB/NFS mount often stats fine
-		// but rejects writes — catch that here rather than mid-copy.
 		probe := filepath.Join(t.MountPath, ".prestoback_write_test")
 		if err := os.WriteFile(probe, []byte("ok"), 0644); err != nil {
 			return fmt.Errorf("mount path %q is not writable: %w", t.MountPath, err)
@@ -106,20 +128,33 @@ func RemoteReachable(t RemoteTarget) error {
 		_ = os.Remove(probe)
 		return nil
 
-	case "rclone":
-		if _, err := exec.LookPath("rclone"); err != nil {
-			return fmt.Errorf("rclone binary not found in PATH — install it or use a \"mount\" remote instead")
-		}
+	case "sftp":
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		out, err := exec.CommandContext(ctx, "rclone", "lsd", t.RcloneRemote).CombinedOutput()
+		client, closeFn, err := sftpDial(ctx, t)
 		if err != nil {
-			return fmt.Errorf("rclone remote %q not reachable: %s", t.RcloneRemote, stripANSIRemote(string(out)))
+			return err
+		}
+		defer closeFn()
+		dir := t.SFTPBaseDir
+		if dir == "" {
+			dir = "."
+		}
+		if _, err := client.ReadDir(dir); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("cannot list %q on %s: %w", dir, t.SFTPHost, err)
 		}
 		return nil
 
+	case "s3":
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if t.S3Endpoint == "" || t.S3Bucket == "" {
+			return fmt.Errorf("s3_endpoint and s3_bucket are required")
+		}
+		return newS3Client(t).reachable(ctx)
+
 	default:
-		return fmt.Errorf("unknown remote kind %q (expected \"mount\" or \"rclone\")", t.Kind)
+		return fmt.Errorf("unknown remote kind %q (expected \"mount\", \"sftp\", or \"s3\")", t.Kind)
 	}
 }
 
@@ -127,13 +162,18 @@ func RemoteReachable(t RemoteTarget) error {
 
 // PushFile copies one already-finished local file (an archive or a
 // manifest) into "<remote root>/<appID>/" on t, verifying the copy landed
-// intact before reporting success. Returns the remote-side path/URI to
-// store in BackupMeta.Remote.
+// intact before reporting success. Returns the remote-side path/key to
+// store in the manifest (see UpdateManifestRemoteStatus in engine.go).
 func PushFile(localPath, appID string, t RemoteTarget, emit func(string)) (string, error) {
 	if err := RemoteReachable(t); err != nil {
 		return "", err
 	}
 	name := filepath.Base(localPath)
+
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return "", fmt.Errorf("stat local file: %w", err)
+	}
 
 	switch t.Kind {
 	case "mount":
@@ -149,26 +189,51 @@ func PushFile(localPath, appID string, t RemoteTarget, emit func(string)) (strin
 		emit(fmt.Sprintf("✓ %s pushed to %s", name, t.Name))
 		return destPath, nil
 
-	case "rclone":
-		destDir := strings.TrimRight(t.RcloneRemote, "/") + "/" + appID
-		// Best-effort — most rclone backends (S3, B2) have no real
-		// directories and don't need this; SFTP/SMB-style ones do. Ignored
-		// on failure since copyto below will surface any real problem.
-		_ = exec.Command("rclone", "mkdir", destDir).Run()
-
-		dest := destDir + "/" + name
-		emit(fmt.Sprintf("Uploading %s to %s (rclone)…", name, t.Name))
-		ctx, cancel := context.WithTimeout(context.Background(), rcloneTimeout)
+	case "sftp":
+		ctx, cancel := context.WithTimeout(context.Background(), remoteOpTimeout)
 		defer cancel()
-		// --checksum: rclone verifies with its own hash comparison rather
-		// than trusting size+modtime alone — the network-transfer analogue
-		// of copyFileVerified's local sha256File check below.
-		out, err := exec.CommandContext(ctx, "rclone", "copyto", localPath, dest, "--checksum").CombinedOutput()
+		client, closeFn, err := sftpDial(ctx, t)
 		if err != nil {
-			return "", fmt.Errorf("rclone upload failed: %s", stripANSIRemote(string(out)))
+			return "", err
+		}
+		defer closeFn()
+
+		destPath := sftpJoin(t.SFTPBaseDir, appID, name)
+		emit(fmt.Sprintf("Uploading %s to %s (sftp)…", name, t.Name))
+		f, err := os.Open(localPath)
+		if err != nil {
+			return "", err
+		}
+		defer f.Close()
+		if err := sftpPut(client, destPath, f); err != nil {
+			return "", fmt.Errorf("sftp upload failed: %w", err)
+		}
+		// Size sanity check — SFTP has no built-in content-hash verify the
+		// way copyFileVerified's local sha256File comparison gives us for
+		// "mount"; comparing the remote file's resulting size against what
+		// we meant to send is the cheap check that's actually available
+		// here without downloading the whole thing back to hash it.
+		if remoteInfo, statErr := client.Stat(destPath); statErr == nil && remoteInfo.Size() != info.Size() {
+			return "", fmt.Errorf("sftp upload size mismatch: sent %d bytes, remote shows %d", info.Size(), remoteInfo.Size())
 		}
 		emit(fmt.Sprintf("✓ %s pushed to %s", name, t.Name))
-		return dest, nil
+		return destPath, nil
+
+	case "s3":
+		ctx, cancel := context.WithTimeout(context.Background(), remoteOpTimeout)
+		defer cancel()
+		key := s3Join(t.S3BaseDir, appID, name)
+		emit(fmt.Sprintf("Uploading %s to %s (s3)…", name, t.Name))
+		f, err := os.Open(localPath)
+		if err != nil {
+			return "", err
+		}
+		defer f.Close()
+		if err := newS3Client(t).putObject(ctx, key, f, info.Size()); err != nil {
+			return "", fmt.Errorf("s3 upload failed: %w", err)
+		}
+		emit(fmt.Sprintf("✓ %s pushed to %s", name, t.Name))
+		return key, nil
 
 	default:
 		return "", fmt.Errorf("unknown remote kind %q", t.Kind)
@@ -177,20 +242,19 @@ func PushFile(localPath, appID string, t RemoteTarget, emit func(string)) (strin
 
 // PushAppBackup pushes every successful archive from one backup run (plus
 // its manifest) to t, and is the intended call site right after
-// Engine.WriteManifest succeeds. Best-effort per file — matches this
-// codebase's existing posture elsewhere (safeRemove, disconnectAllNetworks)
-// of not letting one non-critical failure abort everything else: a NAS
-// hiccup on one volume's archive shouldn't stop the other volumes' archives
-// from reaching the remote too. Returns the local→remote path map for
-// whatever succeeded, plus a combined error listing anything that didn't
-// (nil if everything succeeded).
+// Engine.WriteManifest succeeds (see pushToRemotes in internal/api/
+// server.go). Best-effort per file — a NAS hiccup on one volume's archive
+// shouldn't stop the other volumes' archives from reaching the remote
+// too. Returns the local→remote path map for whatever succeeded, plus a
+// combined error listing anything that didn't (nil if everything
+// succeeded).
 func PushAppBackup(appID string, metas []BackupMeta, manifestPath string, t RemoteTarget, emit func(string)) (map[string]string, error) {
 	pushed := map[string]string{}
 	var failures []string
 
 	for _, m := range metas {
 		if m.Status != StatusSuccess {
-			continue // nothing to push — this volume's local backup didn't succeed either
+			continue
 		}
 		remotePath, err := PushFile(m.FilePath, appID, t, emit)
 		if err != nil {
@@ -216,10 +280,10 @@ func PushAppBackup(appID string, metas []BackupMeta, manifestPath string, t Remo
 
 // ── List (for restore) ───────────────────────────────────────────────────────
 
-// ListRemoteFiles lists archives for appID under "<remote root>/<appID>/" on
-// t — mirrors ListBackups's local directory scan (engine.go) so a "restore
-// from NAS" picker can use the same app-scoped listing shape the local
-// restore UI already has.
+// ListRemoteFiles lists archives for appID under "<remote root>/<appID>/"
+// on t — mirrors ListBackups's local directory scan (engine.go) so a
+// "restore from NAS" picker can use the same app-scoped listing shape the
+// local restore UI already has.
 func ListRemoteFiles(t RemoteTarget, appID string) ([]RemoteFile, error) {
 	switch t.Kind {
 	case "mount":
@@ -233,10 +297,6 @@ func ListRemoteFiles(t RemoteTarget, appID string) ([]RemoteFile, error) {
 		}
 		var out []RemoteFile
 		for _, e := range entries {
-			// Only archives are restorable "backups" — the manifest that
-			// PushAppBackup copies alongside them is metadata, not a
-			// second thing to restore, same distinction ListBackups draws
-			// locally (engine.go) by skipping non-.tar.gz files.
 			if e.IsDir() || !strings.HasSuffix(e.Name(), ".tar.gz") {
 				continue
 			}
@@ -251,40 +311,52 @@ func ListRemoteFiles(t RemoteTarget, appID string) ([]RemoteFile, error) {
 		}
 		return out, nil
 
-	case "rclone":
-		dir := strings.TrimRight(t.RcloneRemote, "/") + "/" + appID
+	case "sftp":
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		out, err := exec.CommandContext(ctx, "rclone", "lsjson", dir).CombinedOutput()
+		client, closeFn, err := sftpDial(ctx, t)
 		if err != nil {
-			// A brand-new app with nothing pushed yet looks like "path not
-			// found" to most rclone backends — treat that as "no files"
-			// rather than an error, matching os.IsNotExist(err) above.
-			if strings.Contains(string(out), "directory not found") {
+			return nil, err
+		}
+		defer closeFn()
+
+		dir := sftpJoin(t.SFTPBaseDir, appID)
+		entries, err := client.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
 				return nil, nil
 			}
-			return nil, fmt.Errorf("rclone list failed: %s", stripANSIRemote(string(out)))
+			return nil, err
 		}
-		var raw []struct {
-			Name    string    `json:"Name"`
-			Size    int64     `json:"Size"`
-			ModTime time.Time `json:"ModTime"`
-			IsDir   bool      `json:"IsDir"`
-		}
-		if err := json.Unmarshal(out, &raw); err != nil {
-			return nil, fmt.Errorf("rclone list: unexpected output: %w", err)
-		}
-		var files []RemoteFile
-		for _, r := range raw {
-			if r.IsDir || !strings.HasSuffix(r.Name, ".tar.gz") {
+		var out []RemoteFile
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".tar.gz") {
 				continue
 			}
-			files = append(files, RemoteFile{
-				Name: r.Name, Path: dir + "/" + r.Name,
-				SizeBytes: r.Size, ModTime: r.ModTime,
+			out = append(out, RemoteFile{
+				Name: e.Name(), Path: dir + "/" + e.Name(),
+				SizeBytes: e.Size(), ModTime: e.ModTime(),
 			})
 		}
-		return files, nil
+		return out, nil
+
+	case "s3":
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		prefix := s3Join(t.S3BaseDir, appID) + "/"
+		objs, err := newS3Client(t).listObjects(ctx, prefix)
+		if err != nil {
+			return nil, err
+		}
+		var out []RemoteFile
+		for _, o := range objs {
+			name := strings.TrimPrefix(o.Key, prefix)
+			if strings.Contains(name, "/") || !strings.HasSuffix(name, ".tar.gz") {
+				continue // nested "directory" or the manifest, not a restorable archive
+			}
+			out = append(out, RemoteFile{Name: name, Path: o.Key, SizeBytes: o.SizeBytes, ModTime: o.LastModified})
+		}
+		return out, nil
 
 	default:
 		return nil, fmt.Errorf("unknown remote kind %q", t.Kind)
@@ -295,9 +367,9 @@ func ListRemoteFiles(t RemoteTarget, appID string) ([]RemoteFile, error) {
 
 // PullArchive copies a remote archive back into localDestDir — normally
 // Engine.backupDir/<appID>, i.e. exactly where ListBackups/RestoreVolume
-// already look — and returns the local path. This is deliberately the ONLY
-// thing remote.go does for restore: once the file is local, the existing
-// restore code path takes over completely unchanged.
+// already look — and returns the local path. This is deliberately the
+// ONLY thing remote.go does for restore: once the file is local, the
+// existing restore code path takes over completely unchanged.
 func PullArchive(rf RemoteFile, t RemoteTarget, localDestDir string, emit func(string)) (string, error) {
 	if err := os.MkdirAll(localDestDir, 0755); err != nil {
 		return "", fmt.Errorf("create local dest dir: %w", err)
@@ -311,13 +383,64 @@ func PullArchive(rf RemoteFile, t RemoteTarget, localDestDir string, emit func(s
 			return "", err
 		}
 
-	case "rclone":
-		emit(fmt.Sprintf("Downloading %s from %s (rclone)…", rf.Name, t.Name))
-		ctx, cancel := context.WithTimeout(context.Background(), rcloneTimeout)
+	case "sftp":
+		ctx, cancel := context.WithTimeout(context.Background(), remoteOpTimeout)
 		defer cancel()
-		out, err := exec.CommandContext(ctx, "rclone", "copyto", rf.Path, destPath, "--checksum").CombinedOutput()
+		client, closeFn, err := sftpDial(ctx, t)
 		if err != nil {
-			return "", fmt.Errorf("rclone download failed: %s", stripANSIRemote(string(out)))
+			return "", err
+		}
+		defer closeFn()
+
+		emit(fmt.Sprintf("Downloading %s from %s (sftp)…", rf.Name, t.Name))
+		src, err := client.Open(rf.Path)
+		if err != nil {
+			return "", fmt.Errorf("sftp download failed: %w", err)
+		}
+		defer src.Close()
+		tmp := destPath + ".partial"
+		out, err := os.Create(tmp)
+		if err != nil {
+			return "", err
+		}
+		if _, err := io.Copy(out, src); err != nil {
+			out.Close()
+			_ = os.Remove(tmp)
+			return "", fmt.Errorf("sftp download failed: %w", err)
+		}
+		if err := out.Close(); err != nil {
+			_ = os.Remove(tmp)
+			return "", err
+		}
+		if err := os.Rename(tmp, destPath); err != nil {
+			return "", err
+		}
+
+	case "s3":
+		ctx, cancel := context.WithTimeout(context.Background(), remoteOpTimeout)
+		defer cancel()
+		emit(fmt.Sprintf("Downloading %s from %s (s3)…", rf.Name, t.Name))
+		body, err := newS3Client(t).getObject(ctx, rf.Path)
+		if err != nil {
+			return "", fmt.Errorf("s3 download failed: %w", err)
+		}
+		defer body.Close()
+		tmp := destPath + ".partial"
+		out, err := os.Create(tmp)
+		if err != nil {
+			return "", err
+		}
+		if _, err := io.Copy(out, body); err != nil {
+			out.Close()
+			_ = os.Remove(tmp)
+			return "", fmt.Errorf("s3 download failed: %w", err)
+		}
+		if err := out.Close(); err != nil {
+			_ = os.Remove(tmp)
+			return "", err
+		}
+		if err := os.Rename(tmp, destPath); err != nil {
+			return "", err
 		}
 
 	default:
@@ -378,15 +501,22 @@ func copyFileVerified(src, dst string) error {
 	return os.Rename(tmp, dst)
 }
 
-// stripANSIRemote strips escape/control noise from rclone's CLI output so
-// errors surfaced to the user or Telegram stay clean — same motivation as
-// stripDockerOutput in docker.go, kept separate since this package doesn't
-// import that one.
-func stripANSIRemote(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r == '\x1b' {
-			return -1
+// sftpJoin builds a remote SFTP path from parts, always using "/" (SFTP
+// paths are POSIX-style regardless of what OS the client runs on — using
+// filepath.Join here would be wrong on a Windows build of this binary).
+func sftpJoin(parts ...string) string {
+	var clean []string
+	for _, p := range parts {
+		p = strings.Trim(p, "/")
+		if p != "" {
+			clean = append(clean, p)
 		}
-		return r
-	}, strings.TrimSpace(s))
+	}
+	return strings.Join(clean, "/")
+}
+
+// s3Join builds an S3 object key from parts the same way sftpJoin does —
+// S3 keys are always "/"-delimited strings, not filesystem paths.
+func s3Join(parts ...string) string {
+	return sftpJoin(parts...)
 }
