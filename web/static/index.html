@@ -609,7 +609,7 @@ select.fi{cursor:pointer}
       <div id="remote-target-list" style="margin:6px 0 4px"></div>
 
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:8px">
-        <div class="fl" style="margin-bottom:8px">Add a target</div>
+        <div class="fl" style="margin-bottom:8px" id="rt-form-title">Add a target</div>
         <div class="fg"><label class="fl">Name</label><input class="fi" id="rt-name" placeholder="e.g. Synology NAS"></div>
         <div class="fg"><label class="fl">Kind</label>
           <select class="fi" id="rt-kind" onchange="onRtKindChange()">
@@ -625,6 +625,8 @@ select.fi{cursor:pointer}
           <div class="fg"><label class="fl">Username</label><input class="fi" id="rt-sftp-user" placeholder="backup-user"></div>
           <div class="fg"><label class="fl">Password</label><input class="fi" type="password" id="rt-sftp-password" placeholder="leave blank if using a private key"></div>
           <div class="fg"><label class="fl">Private key path (optional)</label><input class="fi" id="rt-sftp-keypath" placeholder="/data/ssh/nas_key"><div class="fh">A key file mounted INTO this container — used instead of a password if set.</div></div>
+          <div class="fg"><label class="fl">Private key passphrase (optional)</label><input class="fi" type="password" id="rt-sftp-keypass" placeholder="leave blank if the key isn't encrypted"></div>
+          <div class="fg"><label class="fl">Known hosts path (optional)</label><input class="fi" id="rt-sftp-knownhosts" placeholder="/data/ssh/known_hosts"><div class="fh">Pins the server's host key — mount the output of <code>ssh-keyscan your-nas</code> here. Left blank, any host key is accepted (fine on a trusted home LAN).</div></div>
           <div class="fg"><label class="fl">Remote base directory</label><input class="fi" id="rt-sftp-basedir" placeholder="/volume1/backups/presto"></div>
         </div>
         <div id="rt-s3-field" style="display:none">
@@ -633,15 +635,20 @@ select.fi{cursor:pointer}
           <div class="fg"><label class="fl">Access key</label><input class="fi" id="rt-s3-accesskey"></div>
           <div class="fg"><label class="fl">Secret key</label><input class="fi" type="password" id="rt-s3-secretkey"></div>
           <div class="fg"><label class="fl">Region (optional)</label><input class="fi" id="rt-s3-region" placeholder="us-east-1"></div>
+          <div class="fg"><label class="fl">Remote base directory / key prefix (optional)</label><input class="fi" id="rt-s3-basedir" placeholder="presto"></div>
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           <button class="btn btn-g btn-sm" onclick="testRemoteTargetDraft()">Test connection</button>
-          <button class="btn btn-p btn-sm" onclick="addRemoteTarget()">+ Add target</button>
+          <button class="btn btn-p btn-sm" id="rt-submit-btn" onclick="saveRtForm()">+ Add target</button>
+          <button class="btn btn-g btn-sm" id="rt-cancel-btn" style="display:none" onclick="cancelRtEdit()">Cancel</button>
           <span class="fh" id="rt-test-result" style="margin:0"></span>
         </div>
       </div>
 
-      <button class="btn btn-p" style="margin-top:18px" onclick="saveRemote()">Save remote backup settings</button>
+      <div style="display:flex;align-items:center;gap:12px;margin-top:18px;flex-wrap:wrap">
+        <button class="btn btn-p" onclick="saveRemote()">Save remote backup settings</button>
+        <span class="fh" id="rt-dirty-note" style="display:none;color:#e0a030">● Unsaved changes below — click Save to persist them</span>
+      </div>
     </div></div>
   </div>
 </div>
@@ -2887,22 +2894,38 @@ async function saveEncryption() {
 // S_remoteTargets mirrors RemoteTargetView (server.go) — name/kind plus the
 // kind-specific fields, EXCEPT secrets: sftp_password, sftp_private_key_pass,
 // and s3_secret_key are never sent by GET /api/remote, replaced by
-// *_is_set booleans. Kept as a plain in-memory array and only written back
-// with saveRemote(); add/remove below just mutate this array and re-render,
-// same "edit locally, Save commits" shape as the rest of this settings page
-// (see saveEncryption above). Blank secret fields on an existing target are
-// fine to send back on PUT — the server preserves the previously-saved
-// secret for any target matched by name (see mergeRemoteSecrets).
+// *_is_set booleans. Kept as a plain in-memory array; add/edit/duplicate/
+// remove below just mutate this array and re-render — nothing reaches the
+// server until "Save remote backup settings" is clicked (see saveRemote).
+// S_rtDirty tracks whether the in-memory array has diverged from what's
+// actually saved, so the "unsaved changes" note and the page-leave guard
+// both reflect reality instead of "was anything clicked" state.
 let S_remoteTargets = [];
+let S_rtEditIndex = null; // null = "Add a target" mode; otherwise index into S_remoteTargets being edited
+let S_rtDirty = false;
+
 async function loadRemote() {
   try {
     const r = await api('/api/remote');
     setTog('tog-remote', !!r.enabled);
     S_remoteTargets = r.targets || [];
+    S_rtEditIndex = null;
+    setRtDirty(false);
+    resetRtForm();
     renderRemoteTargets();
   } catch {}
 }
-function togRemote() { setTog('tog-remote', !document.getElementById('tog-remote').classList.contains('on')); }
+function togRemote() { setTog('tog-remote', !document.getElementById('tog-remote').classList.contains('on')); setRtDirty(true); }
+
+function setRtDirty(v) {
+  S_rtDirty = v;
+  const note = document.getElementById('rt-dirty-note');
+  if (note) note.style.display = v ? '' : 'none';
+  // Scoped beforeunload guard — only active while there's actually
+  // something unsaved, and removed the moment it's saved or reloaded, so
+  // it never interferes with navigation the rest of the app relies on.
+  window.onbeforeunload = v ? () => 'You have unsaved remote backup target changes.' : null;
+}
 
 function remoteTargetSummary(t) {
   if (t.kind === 'mount') return t.mount_path;
@@ -2918,14 +2941,17 @@ function renderRemoteTargets() {
     return;
   }
   el.innerHTML = S_remoteTargets.map((t,i) => `
-    <div class="bi">
+    <div class="bi" style="${i===S_rtEditIndex?'outline:1px solid var(--accent);border-radius:8px':''}">
       <div class="bic"><svg width="14" height="14" fill="none" stroke="var(--accent)" stroke-width="1.8" viewBox="0 0 24 24"><path d="M20 16.58A5 5 0 0018 7h-1.26A8 8 0 104 15.25"/></svg></div>
       <div class="bm">
-        <div class="bid">${esc(t.name)} <span class="pill pb" style="font-size:9px">${esc(t.kind)}</span></div>
+        <div class="bid">${esc(t.name)} <span class="pill pb" style="font-size:9px">${esc(t.kind)}</span>${i===S_rtEditIndex?' <span class="pill" style="font-size:9px">editing</span>':''}</div>
         <div class="bif">${esc(remoteTargetSummary(t))}</div>
+        <div class="fh" id="rt-row-result-${i}" style="margin:2px 0 0"></div>
       </div>
-      <div style="display:flex;gap:6px">
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn btn-g btn-sm" onclick="testExistingRemoteTarget(${i})">Test</button>
+        <button class="btn btn-g btn-sm" onclick="editRemoteTarget(${i})">Edit</button>
+        <button class="btn btn-g btn-sm" onclick="duplicateRemoteTarget(${i})">Duplicate</button>
         <button class="btn btn-d btn-sm btn-ic" onclick="removeRemoteTarget(${i})">🗑</button>
       </div>
     </div>`).join('');
@@ -2938,6 +2964,8 @@ function onRtKindChange() {
   document.getElementById('rt-s3-field').style.display = kind === 's3' ? '' : 'none';
 }
 
+const RT_FIELD_IDS = ['rt-name','rt-mount-path','rt-sftp-host','rt-sftp-port','rt-sftp-user','rt-sftp-password','rt-sftp-keypath','rt-sftp-keypass','rt-sftp-knownhosts','rt-sftp-basedir','rt-s3-endpoint','rt-s3-bucket','rt-s3-accesskey','rt-s3-secretkey','rt-s3-region','rt-s3-basedir'];
+
 function draftRemoteTarget() {
   const kind = document.getElementById('rt-kind').value;
   const t = { name: gv('rt-name'), kind };
@@ -2949,6 +2977,8 @@ function draftRemoteTarget() {
     t.sftp_user = gv('rt-sftp-user');
     t.sftp_password = gv('rt-sftp-password');
     t.sftp_private_key_path = gv('rt-sftp-keypath');
+    t.sftp_private_key_pass = gv('rt-sftp-keypass');
+    t.sftp_known_hosts_path = gv('rt-sftp-knownhosts');
     t.sftp_base_dir = gv('rt-sftp-basedir');
   } else if (kind === 's3') {
     t.s3_endpoint = gv('rt-s3-endpoint');
@@ -2956,6 +2986,25 @@ function draftRemoteTarget() {
     t.s3_access_key = gv('rt-s3-accesskey');
     t.s3_secret_key = gv('rt-s3-secretkey');
     t.s3_region = gv('rt-s3-region');
+    t.s3_base_dir = gv('rt-s3-basedir');
+  }
+  // Editing an existing (already-saved) target: a blank secret field means
+  // "leave it as-is", not "clear it" — carry the original's *_is_set flag
+  // forward so remoteTargetIsComplete still treats this as complete and
+  // the PUT preserves the stored secret server-side (see mergeRemoteSecrets
+  // in server.go). Only applies when the kind wasn't changed underneath
+  // the edit — switching kind on an existing target is treated as a fresh
+  // credential entry, same as duplicating.
+  if (S_rtEditIndex !== null) {
+    const orig = S_remoteTargets[S_rtEditIndex];
+    if (orig && orig.kind === kind) {
+      if (kind === 'sftp') {
+        if (!t.sftp_password) t.sftp_password_is_set = !!orig.sftp_password_is_set;
+        if (!t.sftp_private_key_pass) t.sftp_private_key_pass_is_set = !!orig.sftp_private_key_pass_is_set;
+      } else if (kind === 's3') {
+        if (!t.s3_secret_key) t.s3_secret_key_is_set = !!orig.s3_secret_key_is_set;
+      }
+    }
   }
   return t;
 }
@@ -2964,7 +3013,8 @@ function remoteTargetIsComplete(t) {
   // For a target freshly drafted in the add-target form, the real secret
   // is on t.sftp_password / t.s3_secret_key. For a target loaded from GET
   // /api/remote (now redacted server-side — see RemoteTargetView in
-  // server.go), the real value is never sent back; t.sftp_password_is_set /
+  // server.go), or an edit-in-progress that didn't touch the secret field,
+  // the real value is never sent back; t.sftp_password_is_set /
   // t.s3_secret_key_is_set tell us one is already saved without revealing
   // it. Either counts as "this target has a credential."
   if (!t.name) return false;
@@ -2975,7 +3025,7 @@ function remoteTargetIsComplete(t) {
 }
 
 async function testRemoteTargetDraft() { await runRemoteTest(draftRemoteTarget(), 'rt-test-result'); }
-async function testExistingRemoteTarget(i) { await runRemoteTest(S_remoteTargets[i], null); }
+async function testExistingRemoteTarget(i) { await runRemoteTest(S_remoteTargets[i], `rt-row-result-${i}`); }
 
 async function runRemoteTest(target, resultElId) {
   if (!remoteTargetIsComplete(target)) {
@@ -2999,26 +3049,121 @@ async function runRemoteTest(target, resultElId) {
   }
 }
 
-function addRemoteTarget() {
+// populateRtForm fills the form from an existing target — used by both
+// Edit (values as-is) and Duplicate (values as-is, but name gets a " (copy)"
+// suffix and secrets are never carried over, real or otherwise — a
+// duplicate is a distinct target as far as the server's concerned, and
+// silently reusing credentials the user can't currently see would be an
+// easy way to end up trusting the wrong password to the wrong host).
+function populateRtForm(t, { forDuplicate } = {}) {
+  document.getElementById('rt-name').value = forDuplicate ? (t.name + ' (copy)') : t.name;
+  document.getElementById('rt-kind').value = t.kind;
+  onRtKindChange();
+  if (t.kind === 'mount') {
+    document.getElementById('rt-mount-path').value = t.mount_path || '';
+  } else if (t.kind === 'sftp') {
+    document.getElementById('rt-sftp-host').value = t.sftp_host || '';
+    document.getElementById('rt-sftp-port').value = t.sftp_port || '';
+    document.getElementById('rt-sftp-user').value = t.sftp_user || '';
+    document.getElementById('rt-sftp-password').value = '';
+    document.getElementById('rt-sftp-password').placeholder = (!forDuplicate && t.sftp_password_is_set) ? '•••••••• (unchanged — leave blank to keep)' : 'leave blank if using a private key';
+    document.getElementById('rt-sftp-keypath').value = t.sftp_private_key_path || '';
+    document.getElementById('rt-sftp-keypass').value = '';
+    document.getElementById('rt-sftp-keypass').placeholder = (!forDuplicate && t.sftp_private_key_pass_is_set) ? '•••••••• (unchanged — leave blank to keep)' : "leave blank if the key isn't encrypted";
+    document.getElementById('rt-sftp-knownhosts').value = t.sftp_known_hosts_path || '';
+    document.getElementById('rt-sftp-basedir').value = t.sftp_base_dir || '';
+  } else if (t.kind === 's3') {
+    document.getElementById('rt-s3-endpoint').value = t.s3_endpoint || '';
+    document.getElementById('rt-s3-bucket').value = t.s3_bucket || '';
+    document.getElementById('rt-s3-accesskey').value = t.s3_access_key || '';
+    document.getElementById('rt-s3-secretkey').value = '';
+    document.getElementById('rt-s3-secretkey').placeholder = (!forDuplicate && t.s3_secret_key_is_set) ? '•••••••• (unchanged — leave blank to keep)' : '';
+    document.getElementById('rt-s3-region').value = t.s3_region || '';
+    document.getElementById('rt-s3-basedir').value = t.s3_base_dir || '';
+  }
+  document.getElementById('rt-test-result').textContent = '';
+}
+
+function resetRtForm() {
+  S_rtEditIndex = null;
+  RT_FIELD_IDS.forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  document.getElementById('rt-sftp-password').placeholder = 'leave blank if using a private key';
+  document.getElementById('rt-sftp-keypass').placeholder = "leave blank if the key isn't encrypted";
+  document.getElementById('rt-s3-secretkey').placeholder = '';
+  document.getElementById('rt-kind').value = 'mount';
+  onRtKindChange();
+  document.getElementById('rt-test-result').textContent = '';
+  document.getElementById('rt-form-title').textContent = 'Add a target';
+  document.getElementById('rt-submit-btn').textContent = '+ Add target';
+  document.getElementById('rt-cancel-btn').style.display = 'none';
+}
+
+function editRemoteTarget(i) {
+  S_rtEditIndex = i;
+  populateRtForm(S_remoteTargets[i]);
+  document.getElementById('rt-form-title').textContent = `Editing "${S_remoteTargets[i].name}"`;
+  document.getElementById('rt-submit-btn').textContent = 'Update target';
+  document.getElementById('rt-cancel-btn').style.display = '';
+  renderRemoteTargets();
+  document.getElementById('rt-form-title').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function duplicateRemoteTarget(i) {
+  const src = S_remoteTargets[i];
+  S_rtEditIndex = null; // duplicate is always a brand-new entry, never overwrites i
+  populateRtForm(src, { forDuplicate: true });
+  document.getElementById('rt-form-title').textContent = `Duplicate of "${src.name}"`;
+  document.getElementById('rt-submit-btn').textContent = '+ Add target';
+  document.getElementById('rt-cancel-btn').style.display = '';
+  renderRemoteTargets();
+  document.getElementById('rt-form-title').scrollIntoView({ behavior: 'smooth', block: 'center' });
+  if (src.kind !== 'mount') {
+    toast('Credentials aren\'t copied — enter a password/secret for this new target before saving','info');
+  }
+}
+
+function cancelRtEdit() {
+  resetRtForm();
+  renderRemoteTargets();
+}
+
+function saveRtForm() {
   const t = draftRemoteTarget();
   if (!t.name) { toast('Give the target a name','error'); return; }
   if (!remoteTargetIsComplete(t)) { toast('Fill in all required fields for this target kind','error'); return; }
-  S_remoteTargets.push(t);
+  const dupIdx = S_remoteTargets.findIndex((x,idx) => x.name === t.name && idx !== S_rtEditIndex);
+  if (dupIdx !== -1) { toast(`A target named "${t.name}" already exists — choose a different name`,'error'); return; }
+
+  if (S_rtEditIndex !== null) {
+    S_remoteTargets[S_rtEditIndex] = t;
+    toast(`"${t.name}" updated — click "Save remote backup settings" to persist it`,'success');
+  } else {
+    S_remoteTargets.push(t);
+    toast(`"${t.name}" added — click "Save remote backup settings" to persist it`,'success');
+  }
+  setRtDirty(true);
+  resetRtForm();
   renderRemoteTargets();
-  ['rt-name','rt-mount-path','rt-sftp-host','rt-sftp-port','rt-sftp-user','rt-sftp-password','rt-sftp-keypath','rt-sftp-basedir','rt-s3-endpoint','rt-s3-bucket','rt-s3-accesskey','rt-s3-secretkey','rt-s3-region']
-    .forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
-  document.getElementById('rt-test-result').textContent = '';
-  toast(`"${t.name}" added — click "Save remote backup settings" to persist it`,'success');
 }
+
 function removeRemoteTarget(i) {
+  const name = S_remoteTargets[i].name;
+  if (!confirm(`Remove "${name}"? This only takes effect once you click "Save remote backup settings".`)) return;
   S_remoteTargets.splice(i,1);
+  if (S_rtEditIndex === i) resetRtForm();
+  else if (S_rtEditIndex !== null && S_rtEditIndex > i) S_rtEditIndex--; // keep pointing at the same logical row after the splice
+  setRtDirty(true);
   renderRemoteTargets();
 }
+
 async function saveRemote() {
   const enabled = document.getElementById('tog-remote').classList.contains('on');
   try {
     const r = await api('/api/remote',{method:'PUT',body:JSON.stringify({enabled, targets:S_remoteTargets})});
     S_remoteTargets = r.targets || [];
+    S_rtEditIndex = null;
+    setRtDirty(false);
+    resetRtForm();
     renderRemoteTargets();
     toast('Remote backup settings saved','success');
   } catch(e) { toast(e.message,'error'); }
