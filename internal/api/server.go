@@ -296,29 +296,100 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 
 // ── Notifications ─────────────────────────────────────────────────────────────
 
+// NotifyConfigView is the redacted shape returned by GET/PUT /api/notify.
+//
+// This was the other half of the bug fixed in RemoteTargetView above:
+// TelegramToken, NtfyToken, DiscordURL, and WebhookURL were all being
+// echoed back in plaintext on every load of Settings → Notifications.
+// TelegramToken gives full control of the bot (read/send any message, hit
+// any Bot API method); DiscordURL and WebhookURL are themselves
+// bearer-token-equivalent — anyone with the URL can post to that channel
+// with no further auth. Same redact-with-*_is_set-flags treatment as
+// everywhere else secrets live in this file.
+type NotifyConfigView struct {
+	TelegramTokenIsSet bool   `json:"telegram_token_is_set"`
+	TelegramChatID     string `json:"telegram_chat_id,omitempty"`
+	TelegramEnabled    bool   `json:"telegram_enabled"`
+
+	DiscordURLIsSet bool `json:"discord_url_is_set"`
+	DiscordEnabled  bool `json:"discord_enabled"`
+
+	NtfyURL        string `json:"ntfy_url,omitempty"` // a topic URL, not itself a bearer credential — the token below is
+	NtfyTokenIsSet bool   `json:"ntfy_token_is_set"`
+	NtfyEnabled    bool   `json:"ntfy_enabled"`
+
+	WebhookURLIsSet bool `json:"webhook_url_is_set"`
+	WebhookEnabled  bool `json:"webhook_enabled"`
+
+	OnBackupSuccess  bool `json:"on_backup_success"`
+	OnBackupFail     bool `json:"on_backup_fail"`
+	OnRestoreSuccess bool `json:"on_restore_success"`
+	OnRestoreFail    bool `json:"on_restore_fail"`
+}
+
+func redactNotifyConfig(n config.NotifyConfig) NotifyConfigView {
+	return NotifyConfigView{
+		TelegramTokenIsSet: n.TelegramToken != "",
+		TelegramChatID:     n.TelegramChatID,
+		TelegramEnabled:    n.TelegramEnabled,
+		DiscordURLIsSet:    n.DiscordURL != "",
+		DiscordEnabled:     n.DiscordEnabled,
+		NtfyURL:            n.NtfyURL,
+		NtfyTokenIsSet:     n.NtfyToken != "",
+		NtfyEnabled:        n.NtfyEnabled,
+		WebhookURLIsSet:    n.WebhookURL != "",
+		WebhookEnabled:     n.WebhookEnabled,
+		OnBackupSuccess:    n.OnBackupSuccess,
+		OnBackupFail:       n.OnBackupFail,
+		OnRestoreSuccess:   n.OnRestoreSuccess,
+		OnRestoreFail:      n.OnRestoreFail,
+	}
+}
+
+// mergeNotifySecrets fills in blank secret fields on an incoming PUT from
+// the already-saved config, the same "blank means unchanged" rule
+// mergeRemoteSecrets applies to remote targets. There's only ever one
+// NotifyConfig (unlike remote targets, no name to match on), so this is a
+// straight field-by-field fallback.
+func mergeNotifySecrets(incoming, existing config.NotifyConfig) config.NotifyConfig {
+	if incoming.TelegramToken == "" {
+		incoming.TelegramToken = existing.TelegramToken
+	}
+	if incoming.DiscordURL == "" {
+		incoming.DiscordURL = existing.DiscordURL
+	}
+	if incoming.NtfyToken == "" {
+		incoming.NtfyToken = existing.NtfyToken
+	}
+	if incoming.WebhookURL == "" {
+		incoming.WebhookURL = existing.WebhookURL
+	}
+	return incoming
+}
+
 func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		respond(w, 200, s.cfg.GetNotify())
+		respond(w, 200, redactNotifyConfig(s.cfg.GetNotify()))
 	case http.MethodPut:
 		var n config.NotifyConfig
 		if err := parseJSON(r, &n); err != nil {
 			errOut(w, 400, err.Error())
 			return
 		}
+		n = mergeNotifySecrets(n, s.cfg.GetNotify())
 		s.cfg.SetNotify(n)
-		respond(w, 200, n)
+		respond(w, 200, redactNotifyConfig(n))
 	default:
 		errOut(w, 405, "method not allowed")
 	}
 }
 
-// EncryptionSettingsView is what GET /api/encryption returns. Unlike
-// handleNotify's GET (which sends TelegramToken etc. back unredacted — an
-// existing pattern this doesn't need to match), the passphrase itself is
-// never echoed back once set: a GET response can end up in browser history
-// or a dev-tools network tab, and this passphrase is the decryption key for
-// every encrypted archive on the box, not just a notification credential.
+// EncryptionSettingsView is what GET /api/encryption returns. Same
+// redact-with-*_is_set-flags treatment NotifyConfigView and
+// RemoteTargetView give their secrets: a GET response can end up in
+// browser history or a dev-tools network tab, and this passphrase is the
+// decryption key for every encrypted archive on the box.
 type EncryptionSettingsView struct {
 	Enabled         bool `json:"enabled"`
 	PassphraseIsSet bool `json:"passphrase_is_set"`

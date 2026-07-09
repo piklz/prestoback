@@ -535,25 +535,25 @@ select.fi{cursor:pointer}
       <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg><div class="info-t">Get a bot token from <strong>@BotFather</strong> on Telegram → /newbot. Get your chat ID by messaging @userinfobot.</div></div>
       <div class="fg"><div class="ftog" onclick="togNotif('telegram')"><div class="ftog-sw" id="tog-telegram"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable Telegram notifications</div></div></div>
       <div class="fr">
-        <div class="fg"><label class="fl">Bot Token</label><input class="fi" id="tg-token" placeholder="1234567890:AAF..."></div>
+        <div class="fg"><label class="fl">Bot Token</label><input class="fi" type="password" id="tg-token" placeholder="1234567890:AAF..."><div class="fh" id="tg-token-hint"></div></div>
         <div class="fg"><label class="fl">Chat ID</label><input class="fi" id="tg-chatid" placeholder="123456789"></div>
       </div>
       <div style="font-size:12px;color:var(--txt2);margin-bottom:12px;font-weight:500">Telegram bot commands: /status · /backup &lt;name&gt; · /history · /help</div>
     </div></div>
     <div class="card"><div class="ch"><div class="ct">Discord</div></div><div class="cb">
       <div class="ftog" onclick="togNotif('discord')"><div class="ftog-sw" id="tog-discord"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable Discord notifications</div></div>
-      <div class="fg" style="margin-top:10px"><label class="fl">Webhook URL</label><input class="fi" id="dc-url" placeholder="https://discord.com/api/webhooks/1234/abcd…"><div class="fh">Create via Discord Server Settings → Integrations → Webhooks.</div></div>
+      <div class="fg" style="margin-top:10px"><label class="fl">Webhook URL</label><input class="fi" type="password" id="dc-url" placeholder="https://discord.com/api/webhooks/1234/abcd…"><div class="fh">Create via Discord Server Settings → Integrations → Webhooks.</div><div class="fh" id="dc-url-hint"></div></div>
     </div></div>
     <div class="card"><div class="ch"><div class="ct">Ntfy</div></div><div class="cb">
       <div class="ftog" onclick="togNotif('ntfy')"><div class="ftog-sw" id="tog-ntfy"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable Ntfy notifications</div></div>
       <div class="fr" style="margin-top:10px">
         <div class="fg"><label class="fl">Topic URL</label><input class="fi" id="ntfy-url" placeholder="https://ntfy.sh/my-secret-topic"></div>
-        <div class="fg"><label class="fl">Auth token (if private)</label><input class="fi" id="ntfy-token" placeholder="tk_optional…"></div>
+        <div class="fg"><label class="fl">Auth token (if private)</label><input class="fi" type="password" id="ntfy-token" placeholder="tk_optional…"><div class="fh" id="ntfy-token-hint"></div></div>
       </div>
     </div></div>
     <div class="card"><div class="ch"><div class="ct">Generic webhook (Gotify / Home Assistant / custom)</div></div><div class="cb">
       <div class="ftog" onclick="togNotif('webhook')"><div class="ftog-sw" id="tog-webhook"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable generic webhook</div></div>
-      <div class="fg" style="margin-top:10px"><label class="fl">Webhook URL</label><input class="fi" id="wh-url" placeholder="https://gotify.example.com/message?token=…"><div class="fh">Receives a JSON POST with event, app, title, detail, is_error, time fields.</div></div>
+      <div class="fg" style="margin-top:10px"><label class="fl">Webhook URL</label><input class="fi" type="password" id="wh-url" placeholder="https://gotify.example.com/message?token=…"><div class="fh">Receives a JSON POST with event, app, title, detail, is_error, time fields.</div><div class="fh" id="wh-url-hint"></div></div>
     </div></div>
     <div class="card"><div class="ch"><div class="ct">Notify on events</div></div><div class="cb">
       <div class="fg"><div class="ftog" onclick="togNotif('bk_ok')"><div class="ftog-sw" id="tog-bk_ok"><div class="ftog-kn"></div></div><div class="ftog-lbl">Backup success</div></div></div>
@@ -2819,16 +2819,35 @@ async function loadHistory() {
 }
 
 // ════════════════════ Notifications ════════════════════
+// GET /api/notify no longer sends telegram_token, discord_url, ntfy_token,
+// or webhook_url back once set (see NotifyConfigView in server.go) — only
+// whether each is already set. S_notifIsSet tracks that per field; each
+// secret input starts blank with a hint saying so, and staying blank on
+// save means "keep whatever's already stored" (merged server-side, see
+// mergeNotifySecrets). Discord/generic webhook URLs are treated as secrets
+// here too, not just the tokens — a webhook URL is itself bearer-token-
+// equivalent, anyone with it can post to that channel with no other auth.
+let S_notifIsSet = { telegram: false, discord: false, ntfy: false, webhook: false };
 async function loadNotify() {
   try {
     S.notif = await api('/api/notify');
     const n = S.notif;
-    document.getElementById('tg-token').value   = n.telegram_token   || '';
+    S_notifIsSet = {
+      telegram: !!n.telegram_token_is_set,
+      discord:  !!n.discord_url_is_set,
+      ntfy:     !!n.ntfy_token_is_set,
+      webhook:  !!n.webhook_url_is_set,
+    };
+    document.getElementById('tg-token').value   = '';
+    document.getElementById('tg-token-hint').textContent = S_notifIsSet.telegram ? 'A bot token is already set. Leave blank to keep it.' : '';
     document.getElementById('tg-chatid').value  = n.telegram_chat_id || '';
-    document.getElementById('dc-url').value     = n.discord_url      || '';
-    document.getElementById('ntfy-url').value   = n.ntfy_url         || '';
-    document.getElementById('ntfy-token').value = n.ntfy_token       || '';
-    document.getElementById('wh-url').value     = n.webhook_url      || '';
+    document.getElementById('dc-url').value     = '';
+    document.getElementById('dc-url-hint').textContent = S_notifIsSet.discord ? 'A webhook URL is already set. Leave blank to keep it.' : '';
+    document.getElementById('ntfy-url').value   = n.ntfy_url || ''; // a topic URL, not a bearer credential — fine to show
+    document.getElementById('ntfy-token').value = '';
+    document.getElementById('ntfy-token-hint').textContent = S_notifIsSet.ntfy ? 'A token is already set. Leave blank to keep it.' : '';
+    document.getElementById('wh-url').value     = '';
+    document.getElementById('wh-url-hint').textContent = S_notifIsSet.webhook ? 'A webhook URL is already set. Leave blank to keep it.' : '';
     setTog('tog-telegram', n.telegram_enabled);
     setTog('tog-discord',  n.discord_enabled);
     setTog('tog-ntfy',     n.ntfy_enabled);
@@ -2845,8 +2864,43 @@ function togNotif(key) {
   S.notif[field]=!S.notif[field]; setTog('tog-'+key,S.notif[field]);
 }
 async function saveNotify() {
-  const n={...S.notif,telegram_token:gv('tg-token'),telegram_chat_id:gv('tg-chatid'),discord_url:gv('dc-url'),ntfy_url:gv('ntfy-url'),ntfy_token:gv('ntfy-token'),webhook_url:gv('wh-url')};
-  try { await api('/api/notify',{method:'PUT',body:JSON.stringify(n)}); toast('Notification settings saved','success'); S.notif=n; }
+  const enabled = {
+    telegram: document.getElementById('tog-telegram').classList.contains('on'),
+    discord:  document.getElementById('tog-discord').classList.contains('on'),
+    ntfy:     document.getElementById('tog-ntfy').classList.contains('on'),
+    webhook:  document.getElementById('tog-webhook').classList.contains('on'),
+  };
+  // Guard against turning a channel on with neither a freshly-typed secret
+  // nor one already stored — same shape as saveEncryption's check below.
+  if (enabled.telegram && !S_notifIsSet.telegram && !gv('tg-token')) { toast('Enter a Telegram bot token before enabling it','error'); return; }
+  if (enabled.discord  && !S_notifIsSet.discord  && !gv('dc-url'))   { toast('Enter a Discord webhook URL before enabling it','error'); return; }
+  if (enabled.webhook  && !S_notifIsSet.webhook  && !gv('wh-url'))   { toast('Enter a webhook URL before enabling it','error'); return; }
+  const n = {
+    ...S.notif,
+    telegram_token: gv('tg-token'), telegram_chat_id: gv('tg-chatid'),
+    discord_url: gv('dc-url'),
+    ntfy_url: gv('ntfy-url'), ntfy_token: gv('ntfy-token'),
+    webhook_url: gv('wh-url'),
+  };
+  try {
+    const r = await api('/api/notify',{method:'PUT',body:JSON.stringify(n)});
+    S.notif = r;
+    S_notifIsSet = {
+      telegram: !!r.telegram_token_is_set,
+      discord:  !!r.discord_url_is_set,
+      ntfy:     !!r.ntfy_token_is_set,
+      webhook:  !!r.webhook_url_is_set,
+    };
+    document.getElementById('tg-token').value = '';
+    document.getElementById('dc-url').value = '';
+    document.getElementById('ntfy-token').value = '';
+    document.getElementById('wh-url').value = '';
+    document.getElementById('tg-token-hint').textContent = S_notifIsSet.telegram ? 'A bot token is already set. Leave blank to keep it.' : '';
+    document.getElementById('dc-url-hint').textContent = S_notifIsSet.discord ? 'A webhook URL is already set. Leave blank to keep it.' : '';
+    document.getElementById('ntfy-token-hint').textContent = S_notifIsSet.ntfy ? 'A token is already set. Leave blank to keep it.' : '';
+    document.getElementById('wh-url-hint').textContent = S_notifIsSet.webhook ? 'A webhook URL is already set. Leave blank to keep it.' : '';
+    toast('Notification settings saved','success');
+  }
   catch(e) { toast(e.message,'error'); }
 }
 async function testNotify() {
