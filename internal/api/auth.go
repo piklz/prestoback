@@ -229,11 +229,25 @@ func (s *Server) authJWT(next http.HandlerFunc) http.HandlerFunc {
 		if key == "" {
 			key = r.URL.Query().Get("api_key")
 		}
-		if key != "" && key == s.cfg.APIKey() {
-			r.Header.Set("X-Auth-User", "api-key")
-			r.Header.Set("X-Auth-Role", roleAdmin)
-			next(w, r)
-			return
+		if key != "" {
+			if key == s.cfg.APIKey() {
+				r.Header.Set("X-Auth-User", "api-key")
+				r.Header.Set("X-Auth-Role", roleAdmin)
+				next(w, r)
+				return
+			}
+			// Paired keys (see pairing.go): independently issued and
+			// independently revocable, but grant the same admin-equivalent
+			// access as the legacy key — same trust level, just not the
+			// same shared secret. TouchPairedKey is best-effort and never
+			// blocks the request on its own.
+			if pk, ok := s.cfg.ValidatePairedKey(key); ok {
+				s.cfg.TouchPairedKey(pk.ID)
+				r.Header.Set("X-Auth-User", "paired:"+pk.Name)
+				r.Header.Set("X-Auth-Role", roleAdmin)
+				next(w, r)
+				return
+			}
 		}
 
 		// JWT — prefer the Authorization header; fall back to ?token= only

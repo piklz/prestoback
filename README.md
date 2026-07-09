@@ -1,94 +1,71 @@
-# PrestoBack 
+# Device-pairing (QR-link) patch
 
-Self-hosted Docker config backup & restore manager for your Presto Pi stack.
-Single Go binary · embedded web UI · no external dependencies.
+Adds a Plex/GitHub-CLI-style pairing flow: an already-logged-in device shows a QR,
+a second device scans it, logs in for real, and gets its own named,
+independently-revocable API key. The shared master key (`handleRegenKey`) is
+untouched and still works exactly as before.
 
-## Quick start
+## Files (drop-in replacements / new files)
 
-```bash
-cd /home/pi/presto/prestoback
-docker compose up -d --build
-```
+- `internal/config/config.go` — modified: added `PairedKey` type, `paired_keys`
+  in the on-disk JSON, and wiring in `Load()`/`save()`. Everything else in this
+  file is unchanged from your original.
+- `internal/config/pairing.go` — **new file**. All pairing-session and
+  paired-key logic (`StartPairing`, `PairingStatus`, `ClaimPairing`,
+  `ValidatePairedKey`, `TouchPairedKey`, `ListPairedKeys`, `DeletePairedKey`).
+- `internal/api/auth.go` — modified: `authJWT` now also accepts a paired key
+  (checked by hash) alongside the legacy master key. No new imports needed.
+- `internal/api/server.go` — modified: 4 new routes + handlers
+  (`/api/pairing/start`, `/api/pairing/status`, `/api/pairing/claim`,
+  `/api/pairing/keys`), inserted right after `handleRegenKey`.
+- `web/static/index.html` — modified: a "Paired Devices" card in
+  Settings → Security, two new modals (QR display + "Authorize this device"),
+  and the JS to drive both sides of the flow.
+- `web/static/qrcode.min.js` — **new file**. Kazuhiko Arase's
+  `qrcode-generator` (MIT), vendored so no CDN dependency is introduced. I
+  round-tripped it (encode → render → decode with jsQR) before including it —
+  see verification notes below.
 
-Your **API key** is printed in the container logs on first start:
+## How it works
 
-```bash
-docker logs prestoback | grep "API Key"
-```
+1. Settings → Security → **Link a New Device** → `POST /api/pairing/start`
+   returns a short-lived code (10 hex chars, 5 min TTL).
+2. The browser renders a QR of `<origin>/?pair=<code>` and polls
+   `GET /api/pairing/status`.
+3. The second device scans it, logs in normally (this is the real auth
+   boundary, not the code), and the app shows "Authorize This Device" —
+   confirming calls `POST /api/pairing/claim`, which mints a fresh key,
+   stores only its SHA-256 hash, and returns the raw key once.
+4. The first device's next poll shows "Paired as '<name>'" and the key list
+   refreshes. Either device can revoke that key independently later via
+   `DELETE /api/pairing/keys?id=...` — the master key is never touched.
 
-Open **http://your-pi-ip:8765** — paste the key when prompted.
+## What I actually verified vs. what needs your own build
 
----
+- `internal/config` (config.go + pairing.go) — compiled clean with
+  `go build`, `go vet`, and `gofmt` as an isolated package.
+- `internal/api/auth.go` — parses and is gofmt-clean; only calls the two new
+  `Config` methods (verified above) and reuses existing symbols
+  (`roleAdmin`, header patterns) unchanged elsewhere in the file.
+- `internal/api/server.go` — parses and is gofmt-clean.
+- `web/static/index.html` — inline JS extracted and passed `node --check`;
+  the newly inserted modal markup has balanced `<div>`/`</div>` tags.
+- `qrcode.min.js` — encode → bitmap-render → decode round-tripped correctly
+  in Node with jsQR before I vendored it.
+- **Not done:** a full `go build ./...` of the whole repo together. The
+  sandbox's network egress allowlist blocks `gopkg.in` and `golang.org`,
+  which a transitive *test* dependency of the vendored `github.com/pkg/sftp`
+  needs during full module-graph resolution — unrelated to anything in this
+  patch. Please run `go build ./...` once you've merged these files in; if
+  anything doesn't line up with parts of `server.go`/`config.go` I didn't
+  have in front of me, it'll show up there immediately.
 
-## What's new 
+## Notes / things you may want to adjust
 
-| Feature | Details |
-|---|---|
-| **API key auth** | Every endpoint requires `X-API-Key` header. Auto-generated on first run, shown in logs. |
-| **Telegram bot** | `/status`, `/backup <name>`, `/history`, `/help`. Inline buttons for one-tap backups. |
-| **Discord / Ntfy / Webhook** | Auto-detected by URL shape. Generic JSON POST for anything else. |
-| **Scheduled backups** | Per-app cron expressions. Standard 5-field format. |
-| **Pin / freeze** | Mark an app to skip scheduled backups without deleting the schedule. |
-| **History log** | Persisted audit log of all backup/restore/push events with duration and size. |
-| **Proper SSE fan-out** | Multiple browser tabs all receive live updates. |
-
----
-
-## Telegram setup
-
-1. Message **@BotFather** → `/newbot` → copy the token
-2. Message **@userinfobot** → copy your chat ID
-3. In PrestoBack UI → Notifications → paste token + chat ID → Save
-4. Bot commands: `/status` · `/backup plex` · `/history` · `/help`
-
----
-
-## Notification channels
-
-| Channel | URL format |
-|---|---|
-| **Ntfy** | `https://ntfy.sh/your-topic` |
-| **Discord** | `https://discord.com/api/webhooks/...` |
-| **Gotify** | `https://gotify.example.com/message?token=...` |
-| **Custom** | Any URL — receives JSON POST |
-
----
-
-## API reference
-
-All endpoints require `X-API-Key: <key>` header (or `?api_key=<key>` query param for SSE).
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/healthz` | Health check (no auth) |
-| GET | `/api/status` | Server info |
-| GET | `/api/volumes` | Discover volume directories |
-| GET/POST | `/api/apps` | List / add apps |
-| GET/PUT/DELETE | `/api/apps/:id` | Get / update / delete app |
-| POST | `/api/apps/:id/backup[?remote=id]` | Trigger backup |
-| POST | `/api/apps/:id/restore/:backupID` | Restore a backup |
-| GET/DELETE | `/api/backups/:appID[/:backupID]` | List / delete backups |
-| POST | `/api/backups/:appID/:backupID/push?remote=id` | Push archive to remote |
-| GET/POST | `/api/remotes` | List / add remotes |
-| DELETE | `/api/remotes/:id` | Remove remote |
-| POST | `/api/remotes/:id/test` | Test SSH connectivity |
-| GET/PUT | `/api/notify` | Get / update notification settings |
-| POST | `/api/notify/test` | Send test notification |
-| GET | `/api/history` | Audit log (last 100 events) |
-| POST | `/api/apikey/regenerate` | Rotate API key |
-| GET | `/api/update/check` | Check for DockerHub update |
-| POST | `/api/update/apply` | Apply self-update |
-| GET | `/api/events?api_key=` | SSE live event stream |
-
----
-
-## Upgrading from v2
-
-Your `config.json` and backup archives are fully compatible. Just replace the
-container — the new config fields (api_key, notify, schedule) will be added
-with safe defaults on first load.
-
-```bash
-docker compose down && docker compose up -d --build
-# Paste new API key shown in logs
-```
+- Paired keys are all admin-equivalent right now, matching what the legacy
+  key already grants. If you want a viewer-scoped paired key later, add a
+  `Role` field to `PairedKey` and thread it through `ClaimPairing`/`authJWT`
+  the same way `User.Role` already works.
+- Pairing sessions live in memory only (not persisted), same reasoning
+  already used for `revokedTokens`/`loginAttempts` in your codebase — a
+  restart mid-pairing just means "generate a new QR," nothing worse.

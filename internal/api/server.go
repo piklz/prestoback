@@ -143,6 +143,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/container-health", s.authJWT(s.handleContainerHealth))
 	s.mux.HandleFunc("/api/history", s.authJWT(s.handleHistory))
 	s.mux.HandleFunc("/api/apikey", s.authJWT(s.handleAPIKey)) // masked fingerprint only, never the live key
+	s.mux.HandleFunc("/api/pairing/status", s.authJWT(s.handlePairingStatus))
 	s.mux.HandleFunc("/api/update/check", s.authJWT(s.handleUpdateCheck))
 	s.mux.HandleFunc("/api/updates/check", s.authJWT(s.handleUpdatesCheck)) // per-app registry check — distinct from /api/update/check (PrestoBack's own self-update)
 	s.mux.HandleFunc("/api/cron/preview", s.authJWT(s.handleCronPreview))
@@ -162,6 +163,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/remote", s.adminForWrites(s.handleRemote))
 	s.mux.HandleFunc("/api/remote/test", s.adminForWrites(s.handleRemoteTest))
 	s.mux.HandleFunc("/api/apikey/regenerate", s.adminForWrites(s.handleRegenKey))
+	s.mux.HandleFunc("/api/pairing/start", s.adminForWrites(s.handlePairingStart))
+	s.mux.HandleFunc("/api/pairing/claim", s.adminForWrites(s.handlePairingClaim))
+	s.mux.HandleFunc("/api/pairing/keys", s.adminForWrites(s.handlePairedKeys)) // GET (any role) + DELETE (admin only)
 	s.mux.HandleFunc("/api/update/apply", s.adminForWrites(s.handleUpdateApply))
 	s.mux.HandleFunc("/api/maintenance", s.adminForWrites(s.handleMaintenance))
 	s.mux.HandleFunc("/api/users", s.adminForWrites(s.handleUsers))
@@ -685,6 +689,131 @@ func (s *Server) handleRegenKey(w http.ResponseWriter, r *http.Request) {
 		"api_key": newKey,
 		"warning": "Copy this key now — it will not be shown again. Use it as the X-API-Key header for external integrations.",
 	})
+}
+
+// ── Device pairing (QR-linking, see internal/config/pairing.go) ──────────────
+//
+// Lets a second device (phone, NAS, another script) get its OWN named,
+// independently-revocable API key without ever typing or scanning the
+// master key from handleRegenKey. Flow:
+//   1. Device A (already logged in) POSTs /api/pairing/start, gets a code,
+//      renders it as a QR (client builds the URL from its own
+//      window.location.origin — this handler never needs to guess its own
+//      reachable address) and polls /api/pairing/status.
+//   2. Device B opens that URL, logs in for real, and POSTs
+//      /api/pairing/claim with the code — this is the actual auth boundary,
+//      not the code itself.
+//   3. Device A's next status poll sees "claimed" and refreshes its key list.
+
+// POST /api/pairing/start — admin-only. Returns a short-lived code; the
+// frontend is responsible for turning that into a scannable URL.
+func (s *Server) handlePairingStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	code, expiresAt, err := s.cfg.StartPairing()
+	if err != nil {
+		errOut(w, 500, "failed to start pairing: "+err.Error())
+		return
+	}
+	respond(w, 200, map[string]any{
+		"code":       code,
+		"expires_at": expiresAt.Unix(),
+	})
+}
+
+// GET /api/pairing/status?code=X — any authenticated role may poll (it's
+// read-only and reveals nothing but a claimed device's chosen name).
+func (s *Server) handlePairingStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	code := strings.TrimSpace(r.URL.Query().Get("code"))
+	if code == "" {
+		errOut(w, 400, "code query param required")
+		return
+	}
+	status, name := s.cfg.PairingStatus(code)
+	respond(w, 200, map[string]any{"status": status, "name": name})
+}
+
+// POST /api/pairing/claim — called from Device B, which must already be
+// authenticated as admin (adminForWrites enforces that on this route).
+// That login is the real security check; the code only says which pairing
+// session to attach the new key to. Returns the new key ONCE, same
+// one-time-reveal contract as handleRegenKey.
+func (s *Server) handlePairingClaim(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	var req struct {
+		Code string `json:"code"`
+		Name string `json:"name"`
+	}
+	if err := parseJSON(r, &req); err != nil {
+		errOut(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	req.Code = strings.TrimSpace(req.Code)
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Code == "" {
+		errOut(w, 400, "code is required")
+		return
+	}
+	newKey, err := s.cfg.ClaimPairing(req.Code, req.Name)
+	if err != nil {
+		errOut(w, 400, err.Error())
+		return
+	}
+	respond(w, 200, map[string]any{
+		"api_key": newKey,
+		"name":    req.Name,
+		"warning": "Copy this key now — it will not be shown again.",
+	})
+}
+
+// GET/DELETE /api/pairing/keys — manage paired keys issued via the flow
+// above. GET is available to any authenticated role (parity with
+// handleUsers); DELETE is admin-only via adminForWrites.
+//
+//	GET    → list all paired keys (id, name, created_at, last_used — never
+//	         the hash; see PairedKey's doc comment in config.go)
+//	DELETE → ?id=<n> revoke a paired key immediately
+func (s *Server) handlePairedKeys(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		keys := s.cfg.ListPairedKeys()
+		out := make([]map[string]any, len(keys))
+		for i, k := range keys {
+			out[i] = map[string]any{
+				"id":         k.ID,
+				"name":       k.Name,
+				"created_at": k.CreatedAt.Unix(),
+			}
+			if k.LastUsed != nil {
+				out[i]["last_used"] = k.LastUsed.Unix()
+			}
+		}
+		respond(w, 200, out)
+
+	case http.MethodDelete:
+		id := strings.TrimSpace(r.URL.Query().Get("id"))
+		if id == "" {
+			errOut(w, 400, "id query param required")
+			return
+		}
+		if err := s.cfg.DeletePairedKey(id); err != nil {
+			errOut(w, 400, err.Error())
+			return
+		}
+		respond(w, 200, map[string]string{"status": "deleted"})
+
+	default:
+		errOut(w, 405, "method not allowed")
+	}
 }
 
 // ── Volumes ───────────────────────────────────────────────────────────────────

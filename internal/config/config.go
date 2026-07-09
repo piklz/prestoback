@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Version is a plain package-level var (not const) so the Docker build can
@@ -252,6 +253,28 @@ type User struct {
 	Role     string `json:"role"`
 }
 
+// PairedKey is one API key issued through the device-pairing flow (see
+// pairing.go), distinct from the single legacy master key returned by
+// APIKey(). Each paired key is independently named and independently
+// revocable — deleting one doesn't touch any other integration.
+//
+// KeyHash, never the raw key: the actual key is shown to the user exactly
+// once, at the moment ClaimPairing generates it, and only ever compared by
+// hash from here on — same "never store what you don't have to need again"
+// posture as bcrypt password hashes elsewhere in this codebase. KeyHash
+// DOES need to round-trip through config.json (so pairing survives a
+// restart), so it keeps a normal json tag here — internal/api/server.go's
+// HTTP handler is responsible for stripping it before ever serializing a
+// PairedKey out to the browser, the same way handleUsers already strips
+// User.Hash today.
+type PairedKey struct {
+	ID        string     `json:"id"`
+	Name      string     `json:"name"`
+	KeyHash   string     `json:"key_hash"`
+	CreatedAt time.Time  `json:"created_at"`
+	LastUsed  *time.Time `json:"last_used,omitempty"`
+}
+
 // disk is the on-disk JSON shape.
 type disk struct {
 	APIKey     string           `json:"api_key"`
@@ -260,6 +283,7 @@ type disk struct {
 	Users      []User           `json:"users,omitempty"`
 	Encryption EncryptionConfig `json:"encryption,omitempty"`
 	Remote     RemoteConfig     `json:"remote,omitempty"`
+	PairedKeys []PairedKey      `json:"paired_keys,omitempty"`
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -281,6 +305,18 @@ type Config struct {
 	remote        RemoteConfig
 	users         map[string]User
 	revokedTokens map[string]struct{}
+
+	// pairedKeys are additional, independently-revocable API keys issued via
+	// the QR/device-pairing flow (pairing.go) — separate from the single
+	// legacy apiKey above. Keyed by PairedKey.ID.
+	pairedKeys map[string]PairedKey
+	// pending holds in-progress pairing sessions (code -> pendingPairing).
+	// Deliberately NOT persisted to disk: same reasoning as revokedTokens
+	// and loginAttempts elsewhere in this codebase — these are short-lived
+	// (minutes) by design, so losing them on restart is a non-event, and
+	// keeping them out of config.json means a stale one can never linger
+	// across restarts either.
+	pending map[string]*pendingPairing
 }
 
 func Load(dataDir string) (*Config, error) {
@@ -292,6 +328,8 @@ func Load(dataDir string) (*Config, error) {
 		apps:          make(map[string]AppConfig),
 		users:         make(map[string]User),
 		revokedTokens: make(map[string]struct{}),
+		pairedKeys:    make(map[string]PairedKey),
+		pending:       make(map[string]*pendingPairing),
 	}
 	path := filepath.Join(dataDir, "config.json")
 	data, err := os.ReadFile(path)
@@ -356,6 +394,9 @@ func Load(dataDir string) (*Config, error) {
 	for _, u := range d.Users {
 		c.users[u.Username] = u
 	}
+	for _, pk := range d.PairedKeys {
+		c.pairedKeys[pk.ID] = pk
+	}
 	// Persist migrated form immediately so next load is clean
 	_ = c.save()
 	return c, nil
@@ -380,6 +421,9 @@ func (c *Config) save() error {
 	}
 	for _, u := range c.users {
 		d.Users = append(d.Users, u)
+	}
+	for _, pk := range c.pairedKeys {
+		d.PairedKeys = append(d.PairedKeys, pk)
 	}
 	data, err := json.MarshalIndent(d, "", "  ")
 	if err != nil {
