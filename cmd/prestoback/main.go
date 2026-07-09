@@ -17,7 +17,7 @@ import (
 )
 
 func main() {
-	port := flag.Int("port", 8765, "HTTP server port")
+	port := flag.Int("port", 8778, "HTTP server port")
 	dataDir := flag.String("data", "/data", "PrestoBack data directory")
 	volumesDir := flag.String("volumes", "/volumes", "Presto volumes directory")
 	composeFile := flag.String("compose-file", "", "Path inside this container to your docker-compose.yml (enables /update auto-restart). E.g. /compose/docker-compose.yml")
