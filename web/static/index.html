@@ -364,6 +364,9 @@ select.fi{cursor:pointer}
     <div class="nav-item" id="nav-apps" onclick="V('apps')">
       <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg>Applications
     </div>
+    <div class="nav-item" id="nav-ctrl" onclick="V('ctrl')">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path d="M12 2v8"/><path d="M18.36 6.64a9 9 0 11-12.73 0"/></svg>Container Control
+    </div>
     <div class="nav-item" id="nav-bk" onclick="V('bk')">
       <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path d="M20 7H4a1 1 0 00-1 1v11a1 1 0 001 1h16a1 1 0 001-1V8a1 1 0 00-1-1z"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg>Backups
     </div>
@@ -393,7 +396,7 @@ select.fi{cursor:pointer}
     <div><div class="pt">Dashboard</div><div class="ps">Overview &amp; live activity</div></div>
     <div class="ha"><button class="btn btn-g btn-sm" onclick="checkForUpdatesNow()" id="updates-check-btn" title="Check every app's image against its registry now, instead of waiting for the scheduled check">🔍 Check for updates</button><button class="btn btn-g btn-sm" onclick="loadAll()">↺ Refresh</button></div>
   </div>
-  <div id="maint-banner" style="display:none;background:var(--amber2,#3a2a0f);border:1px solid var(--amber,#f0a020);border-radius:8px;padding:10px 14px;margin:0 36px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px">
+  <div id="maint-banner" style="display:none;background:var(--amber2,#3a2a0f);border:1px solid var(--amber,#f0a020);border-radius:8px;padding:10px 14px;margin:0 36px 14px;align-items:center;justify-content:space-between;gap:12px">
     <div style="display:flex;align-items:center;gap:10px">
       <span style="font-size:18px">🔧</span>
       <div>
@@ -403,7 +406,7 @@ select.fi{cursor:pointer}
     </div>
     <button class="btn btn-g btn-sm" onclick="cancelMaintenance()">End now</button>
   </div>
-  <div id="updates-banner" style="display:none;background:var(--amber2,#3a2a0f);border:1px solid var(--amber,#f0a020);border-radius:8px;padding:10px 14px;margin:0 36px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px">
+  <div id="updates-banner" style="display:none;background:var(--amber2,#3a2a0f);border:1px solid var(--amber,#f0a020);border-radius:8px;padding:10px 14px;margin:0 36px 14px;align-items:center;justify-content:space-between;gap:12px">
     <div style="display:flex;align-items:center;gap:10px">
       <span style="font-size:18px">⬆️</span>
       <div>
@@ -474,6 +477,22 @@ select.fi{cursor:pointer}
       <table class="tbl" id="apps-tbl" style="display:none">
         <thead><tr><th>Application</th><th>Path</th><th>Retain</th><th>Schedule</th><th style="text-align:right">Actions</th></tr></thead>
         <tbody id="apps-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- CONTAINER CONTROL -->
+<div id="view-ctrl" class="view-hidden">
+  <div class="ph"><div><div class="pt">Container Control</div><div class="ps">Start, stop, restart, or pause each app's container directly</div></div>
+    <div class="ha"><button class="btn btn-g btn-sm" onclick="refreshContainerHealth()">↺ Refresh</button></div>
+  </div>
+  <div class="sec">
+    <div class="card">
+      <div class="empty" id="ctrl-empty"><div class="ei"><svg width="22" height="22" fill="none" stroke="var(--txt3)" stroke-width="1.5" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg></div><div class="et">No apps configured</div><div class="es">Add an app from the Applications page first.</div></div>
+      <table class="tbl" id="ctrl-tbl" style="display:none">
+        <thead><tr><th>Application</th><th>Status</th><th>Actions</th></tr></thead>
+        <tbody id="ctrl-tbody"></tbody>
       </table>
     </div>
   </div>
@@ -600,7 +619,7 @@ select.fi{cursor:pointer}
         </div>
       </div>
       <div class="fg"><label class="fl">Use in curl:</label>
-        <div class="code-b" id="curl-example" style="font-size:11px;color:var(--txt3)">curl -H "X-API-Key: &lt;key&gt;" http://your-pi:8778/api/status</div>
+        <div class="code-b" id="curl-example" style="font-size:11px;color:var(--txt3)">curl -H "X-API-Key: &lt;key&gt;" http://your-pi:8765/api/status</div>
       </div>
       <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">Regenerating invalidates the old key immediately and revokes all active browser sessions. You will be logged out.</div></div>
       <button class="btn btn-d btn-sm" onclick="regenKey()">⚠ Regenerate API Key</button>
@@ -1107,7 +1126,7 @@ const S = {
   containerHealth:{}, // appID → {state, health, name}
   bkPage:0, bkPerPage:20, bkAll:[],
 };
-const VIEWS = ['dash','apps','bk','hist','settings'];
+const VIEWS = ['dash','apps','ctrl','bk','hist','settings'];
 // Settings is a single top-level view containing 3 inner tabs (notif/sec/upd)
 // that reuse the exact same div IDs and JS functions (loadNotify, loadStatus,
 // checkUpdate, etc.) that existed when these were 3 separate top-level views —
@@ -1306,6 +1325,7 @@ async function refreshContainerHealth() {
     S.containerHealth = {};
     (results||[]).forEach(h => { S.containerHealth[h.app_id] = h; });
     renderApps(); // re-render inline status badges
+    renderCtrl(); // keep Container Control's status/actions live too, if open
   } catch { /* docker socket may not be available — silently skip */ }
 }
 async function pollContainerHealth() {
@@ -1385,7 +1405,7 @@ async function loadStatus() {
       const keyInfo = await api('/api/apikey');
       setApiKeyDisplay(keyInfo.masked || '(no key set)', false);
       document.getElementById('curl-example').textContent =
-        'curl -H "X-API-Key: <your-key>" http://your-pi:8778/api/status\n# Regenerate the key to get a one-time copy of the full value.';
+        'curl -H "X-API-Key: <your-key>" http://your-pi:8765/api/status\n# Regenerate the key to get a one-time copy of the full value.';
     } catch {
       setApiKeyDisplay('(could not load)', false);
     }
@@ -1585,6 +1605,7 @@ function V(name) {
     document.getElementById('nav-'+v)?.classList.toggle('active', v===name);
   });
   if (name==='bk') { renderChips(); refreshBkView(); }
+  if (name==='ctrl') renderCtrl();
   if (name==='hist') loadHistory();
   if (name==='settings') settingsTab(_settingsActiveTab || 'notif');
   closeSidebar();
@@ -1730,17 +1751,39 @@ async function confirmUpdateApp() {
     toast(`Update started for ${r.app_name || 'app'} — see Live activity for progress`, 'success');
     CM('m-update-app');
     // The pull+recreate runs in the background (see handleAppUpdate on the
-    // server) — refresh badges shortly after so a fast update is reflected
-    // without the user having to hit "Check for updates" manually. A single
-    // fixed delay rather than polling: this is a convenience nudge, not a
-    // progress tracker — Live activity / Telegram are the real progress
-    // sources for anything that takes longer than this.
-    setTimeout(() => { refreshContainerHealth(); checkForUpdatesNow(); }, 8000);
+    // server). A single fixed-delay recheck used to run here, but large
+    // images (Immich's 1GB+ server/ML images, for example) can take well
+    // past that delay to pull and recreate — a check that fires too early
+    // just re-confirms "still needs an update" and, since checkForUpdates
+    // writes that straight into the server's cached pending_updates, that
+    // stale answer then sat there untouched until the next scheduled check
+    // (could be hours later) or a manual "Check for updates" click. Poll
+    // with backoff instead, and stop as soon as the badge actually clears.
+    pollUntilUpdateClears(r.app_name || '');
   } catch(e) {
     toast(e.message, 'error');
     btn.disabled = false;
     btn.textContent = '🔄 Update now';
   }
+}
+
+// Rechecks for a pending update on a backoff schedule (~10s, 20s, 30s, 45s,
+// 60s — about 2.75 minutes total) instead of one fixed-delay check, and
+// stops early the moment appName drops off S.pendingUpdates. See
+// confirmUpdateApp's comment for why a single early check was leaving the
+// badge stuck on larger images.
+function pollUntilUpdateClears(appName) {
+  const delays = [10000, 20000, 30000, 45000, 60000];
+  let i = 0;
+  const tick = () => {
+    checkForUpdatesNow().then(() => {
+      refreshContainerHealth();
+      const stillPending = (S.pendingUpdates || []).includes(appName);
+      if (!stillPending || i >= delays.length) return;
+      setTimeout(tick, delays[i++]);
+    });
+  };
+  setTimeout(tick, delays[i++]);
 }
 
 let appsFilter = '';
@@ -1851,22 +1894,27 @@ function renderApps() {
         : `<div style="font-size:10px;color:var(--txt3);margin-top:3px">next: ${esc(fmtRelTime(S.nextRuns[a.id]))}</div>`;
     }
     const pinPill = a.pinned ? `<span class="pill pa" style="margin-left:4px">📌 pinned</span>` : '';
-    // Lifecycle button — one contextual action based on the last known
-    // container state (from S.containerHealth / /api/container-health),
-    // calling the same backend action Telegram's /start /stop /restart
-    // /pause /unpause use. Deliberately just one button (the one action
-    // that makes sense right now) rather than five, to keep the row compact;
-    // /stop and full control remain available via Telegram for now.
+    // Lifecycle button — only the "get it back up" actions (Start/Unpause)
+    // stay here, since a stopped/paused container blocks backups and needs
+    // a quick fix right from this page. Restart/Pause (routine container
+    // control, not backup-blocking) moved to the dedicated Container
+    // Control page (see renderCtrl) to keep this row compact and this
+    // page focused on backups rather than doubling as process control.
     const lcState = ch ? (ch.state || 'unknown') : 'unknown';
     let lifecycleBtn = '';
     if (lcState === 'paused') {
       lifecycleBtn = `<button class="btn btn-g btn-sm" title="Resume (docker unpause)" onclick="appLifecycle('${a.id}','${esc(a.name)}','unpause')">▶ Unpause</button>`;
     } else if (lcState === 'exited') {
       lifecycleBtn = `<button class="btn btn-g btn-sm" title="Start container" onclick="appLifecycle('${a.id}','${esc(a.name)}','start')">▶ Start</button>`;
-    } else if (lcState === 'running') {
-      lifecycleBtn = `<button class="btn btn-g btn-sm btn-ic" title="Restart" onclick="appLifecycle('${a.id}','${esc(a.name)}','restart')">↻</button>
-        <button class="btn btn-g btn-sm btn-ic" title="Pause (docker pause — SIGSTOP)" onclick="appLifecycle('${a.id}','${esc(a.name)}','pause')">⏸</button>`;
     }
+    // Schedule pause/resume toggle — same field Telegram's /schedpause and
+    // /schedresume flip (app.Schedule.Enabled), just reachable with one
+    // click here instead of a chat command. Only shown for apps that
+    // actually have a cron schedule configured — toggling means nothing
+    // for a manual-only app.
+    const schedToggleBtn = a.schedule?.cron_expr
+      ? `<button class="btn btn-g btn-sm btn-ic" title="${a.schedule.enabled ? 'Pause backup schedule (/schedpause)' : 'Resume backup schedule (/schedresume)'}" onclick="toggleAppSchedule('${a.id}')">${a.schedule.enabled ? '⏸' : '▶'}</button>`
+      : '';
     return `<tr class="${rowCls}">
       <td data-label="Application"><div class="an">${esc(a.name)}${cntHtml}${updBadge}</div>${healthBadge}</td>
       <td data-label="Path"><div style="display:flex;align-items:center;gap:4px"><span class="path-status-dot ${dotCls}" title="${dotTitle}"></span><span class="ap" style="margin-top:0">${esc(a.path)}</span></div>${pathSizeLine}</td>
@@ -1875,9 +1923,68 @@ function renderApps() {
       <td data-label="Actions"><div class="ra">
         <button class="btn btn-bk btn-sm" onclick="openBkModal('${a.id}','${esc(a.name)}')"${pathSt==='missing'?' title="Config path missing — backup may fail"':''}>▶ Backup</button>
         ${lifecycleBtn}
+        ${schedToggleBtn}
         <button class="btn btn-g btn-sm btn-ic" title="Edit" onclick="openEditApp('${a.id}')">✎</button>
         <button class="btn btn-d btn-sm btn-ic" title="Delete" onclick="delApp('${a.id}')">🗑</button>
       </div></td>
+    </tr>`;
+  }).join('');
+}
+
+// Flips an app's backup-schedule enabled flag — the dashboard equivalent of
+// Telegram's /schedpause and /schedresume. Sends the full app object back
+// (same shape submitEditApp uses) since PUT /api/apps/{id} replaces the
+// whole AppConfig, not just one field.
+async function toggleAppSchedule(id) {
+  const a = S.apps.find(x => x.id === id);
+  if (!a || !a.schedule) return;
+  const willEnable = !a.schedule.enabled;
+  try {
+    await api('/api/apps/'+id, {method:'PUT', body: JSON.stringify({...a, schedule:{...a.schedule, enabled: willEnable}})});
+    toast(`${a.name}: schedule ${willEnable ? 'resumed' : 'paused'}`, 'success');
+    loadApps();
+  } catch(e) {
+    toast(e.message, 'error');
+  }
+}
+
+// Container Control page — full start/stop/restart/pause access per app,
+// split out from Applications so that page can stay focused on backups
+// (see renderApps' lifecycleBtn comment). Reuses the same
+// /api/apps/{id}/lifecycle action and S.containerHealth state Applications
+// already populates via pollContainerHealth/refreshContainerHealth.
+function renderCtrl() {
+  const tbody = document.getElementById('ctrl-tbody');
+  const empty = document.getElementById('ctrl-empty');
+  const tbl = document.getElementById('ctrl-tbl');
+  if (!tbody || !empty || !tbl) return;
+  if (!S.apps.length) { empty.style.display=''; tbl.style.display='none'; return; }
+  empty.style.display='none'; tbl.style.display='';
+  tbody.innerHTML = S.apps.map(a => {
+    const ch = S.containerHealth[a.id];
+    const state = ch ? (ch.state || 'unknown') : 'unknown';
+    let col, label;
+    if (state === 'running') { col='var(--green-dk)'; label='● running'+(ch.health?' · '+ch.health:''); }
+    else if (state === 'paused') { col='var(--amber)'; label='⏸ paused'; }
+    else if (state === 'exited') { col='var(--red)'; label='● stopped'+(ch.exit_code?` (exit ${ch.exit_code})`:''); }
+    else { col='var(--txt3)'; label='● '+state; }
+    const statusHtml = `<span style="color:${col};font-family:var(--mono);font-size:12px">${label}</span>`;
+
+    const actions = [];
+    if (state === 'running') {
+      actions.push(`<button class="btn btn-g btn-sm btn-ic" title="Restart" onclick="appLifecycle('${a.id}','${esc(a.name)}','restart')">↻</button>`);
+      actions.push(`<button class="btn btn-g btn-sm btn-ic" title="Pause (docker pause — SIGSTOP)" onclick="appLifecycle('${a.id}','${esc(a.name)}','pause')">⏸</button>`);
+      actions.push(`<button class="btn btn-d btn-sm" title="Stop" onclick="appLifecycle('${a.id}','${esc(a.name)}','stop')">⏹ Stop</button>`);
+    } else if (state === 'paused') {
+      actions.push(`<button class="btn btn-g btn-sm" title="Resume (docker unpause)" onclick="appLifecycle('${a.id}','${esc(a.name)}','unpause')">▶ Unpause</button>`);
+      actions.push(`<button class="btn btn-d btn-sm" title="Stop" onclick="appLifecycle('${a.id}','${esc(a.name)}','stop')">⏹ Stop</button>`);
+    } else if (state === 'exited') {
+      actions.push(`<button class="btn btn-g btn-sm" title="Start container" onclick="appLifecycle('${a.id}','${esc(a.name)}','start')">▶ Start</button>`);
+    }
+    return `<tr>
+      <td data-label="Application"><div class="an">${esc(a.name)}</div></td>
+      <td data-label="Status">${statusHtml}</td>
+      <td data-label="Actions"><div class="ra">${actions.join('')}</div></td>
     </tr>`;
   }).join('');
 }
@@ -3594,7 +3701,7 @@ async function regenKey() {
     // and make the curl example a real, copy-pasteable command for this window.
     setApiKeyDisplay(newKey, true);
     document.getElementById('curl-example').textContent =
-      `curl -H "X-API-Key: ${newKey}" http://your-pi:8778/api/status`;
+      `curl -H "X-API-Key: ${newKey}" http://your-pi:8765/api/status`;
 
     // One-time reveal modal — user must copy before being logged out
     const overlay = document.createElement('div');
