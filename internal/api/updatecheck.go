@@ -294,13 +294,16 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 		sb.WriteString("\n")
 	}
 
+	// One button per updatable app so each can be applied independently,
+	// plus (when there's more than one) a combined "update all" button —
+	// mirrors the reference notification pattern: individual per-app
+	// buttons for granular control, with a single "update all" shortcut
+	// added on top when a batch update is convenient instead.
 	var btns []notify.ButtonAction
-	switch len(reports) {
-	case 0:
-		// nothing to act on
-	case 1:
-		btns = append(btns, notify.ButtonAction{Label: "🔄 Update now", Data: "update:" + reports[0].AppID})
-	default:
+	for _, r := range reports {
+		btns = append(btns, notify.ButtonAction{Label: "🔄 Update " + r.AppName, Data: "update:" + r.AppID})
+	}
+	if len(reports) > 1 {
 		btns = append(btns, notify.ButtonAction{Label: fmt.Sprintf("🔄 Update all %d", len(reports)), Data: "update:all"})
 	}
 

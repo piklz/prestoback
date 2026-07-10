@@ -6,7 +6,7 @@
 <title>PrestoBack</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#0c0e11;--bg2:#111418;--bg3:#181c22;--bg4:#1e2330;--line:rgba(255,255,255,.07);--line2:rgba(255,255,255,.13);--txt:#e8eaf0;--txt2:#8b90a0;--txt3:#555b6e;--accent:#4f9cf9;--accent2:#3b7ad4;--green:#3dd68c;--green-dk:#2a9d68;--gd:rgba(61,214,140,.12);--red:#f05f5f;--rd:rgba(240,95,95,.12);--amber:#f5a623;--ad:rgba(245,166,35,.12);--bld:rgba(79,156,249,.12);--r:10px;--rs:6px;--mono:'IBM Plex Mono',monospace;--head:'Syne',sans-serif;--body:'DM Sans',sans-serif}
+:root{--bg:#0c0e11;--bg2:#111418;--bg3:#181c22;--bg4:#1e2330;--line:rgba(255,255,255,.07);--line2:rgba(255,255,255,.13);--txt:#e8eaf0;--txt2:#8b90a0;--txt3:#555b6e;--accent:#4f9cf9;--accent2:#3b7ad4;--green:#3dd68c;--green-dk:#2a9d68;--gd:rgba(61,214,140,.12);--red:#f05f5f;--rd:rgba(240,95,95,.12);--amber:#f5a623;--ad:rgba(245,166,35,.12);--bld:rgba(79,156,249,.12);--purple:#c3a6f7;--purple-dk:#9d7ce8;--pd:rgba(195,166,247,.14);--r:10px;--rs:6px;--mono:'IBM Plex Mono',monospace;--head:'Syne',sans-serif;--body:'DM Sans',sans-serif}
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;background:var(--bg);color:var(--txt);font-family:var(--body);font-size:14px;line-height:1.5}
 .shell{display:flex;height:100vh;overflow:hidden}
@@ -41,6 +41,7 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .btn-g{background:transparent;color:var(--txt2);border-color:var(--line2)}.btn-g:hover{background:var(--bg3);color:var(--txt)}
 .btn-d{background:transparent;color:var(--red);border-color:rgba(240,95,95,.3)}.btn-d:hover{background:var(--rd)}
 .btn-w{background:var(--ad);color:var(--amber);border-color:rgba(245,166,35,.3)}.btn-w:hover{background:rgba(245,166,35,.22)}
+.btn-bk{background:var(--pd);color:var(--purple);border-color:rgba(195,166,247,.35)}.btn-bk:hover{background:rgba(195,166,247,.22)}
 .btn-sm{padding:5px 10px;font-size:12px}.btn-ic{padding:8px 10px;font-size:13px}
 .ra .btn-d{margin-left:auto}
 .btn:disabled{opacity:.35;cursor:not-allowed;pointer-events:none}
@@ -230,7 +231,8 @@ select.fi{cursor:pointer}
 .ssh-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
 
 /* ══════════════════════ MOBILE ══════════════════════ */
-.mobile-menu-btn{display:none;position:fixed;top:12px;left:12px;z-index:50;width:38px;height:38px;border-radius:8px;background:var(--bg3);border:1px solid var(--line2);color:var(--txt);align-items:center;justify-content:center;font-size:17px;cursor:pointer}
+.mobile-menu-btn{display:none;position:fixed;top:12px;left:12px;z-index:50;width:38px;height:38px;border-radius:8px;background:var(--bg3);border:1px solid var(--line2);color:var(--txt);align-items:center;justify-content:center;font-size:17px;cursor:pointer;transition:transform .25s ease,opacity .2s ease}
+.mobile-menu-btn.hide-on-scroll{transform:translateY(-64px);opacity:0;pointer-events:none}
 .sidebar-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:55}
 .sidebar-backdrop.show{display:block}
 
@@ -249,6 +251,7 @@ select.fi{cursor:pointer}
 
   /* Page header / section padding — leave room for the hamburger button */
   .ph{padding:64px 16px 0;flex-wrap:wrap;gap:10px}
+  #maint-banner,#updates-banner{margin-left:16px;margin-right:16px}
   .ph .ha{flex-wrap:wrap}
   .sec{padding:16px}
 
@@ -390,7 +393,7 @@ select.fi{cursor:pointer}
     <div><div class="pt">Dashboard</div><div class="ps">Overview &amp; live activity</div></div>
     <div class="ha"><button class="btn btn-g btn-sm" onclick="checkForUpdatesNow()" id="updates-check-btn" title="Check every app's image against its registry now, instead of waiting for the scheduled check">🔍 Check for updates</button><button class="btn btn-g btn-sm" onclick="loadAll()">↺ Refresh</button></div>
   </div>
-  <div id="maint-banner" style="display:none;background:var(--amber2,#3a2a0f);border:1px solid var(--amber,#f0a020);border-radius:8px;padding:10px 14px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:12px">
+  <div id="maint-banner" style="display:none;background:var(--amber2,#3a2a0f);border:1px solid var(--amber,#f0a020);border-radius:8px;padding:10px 14px;margin:0 36px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px">
     <div style="display:flex;align-items:center;gap:10px">
       <span style="font-size:18px">🔧</span>
       <div>
@@ -400,7 +403,7 @@ select.fi{cursor:pointer}
     </div>
     <button class="btn btn-g btn-sm" onclick="cancelMaintenance()">End now</button>
   </div>
-  <div id="updates-banner" style="display:none;background:var(--amber2,#3a2a0f);border:1px solid var(--amber,#f0a020);border-radius:8px;padding:10px 14px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:12px">
+  <div id="updates-banner" style="display:none;background:var(--amber2,#3a2a0f);border:1px solid var(--amber,#f0a020);border-radius:8px;padding:10px 14px;margin:0 36px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px">
     <div style="display:flex;align-items:center;gap:10px">
       <span style="font-size:18px">⬆️</span>
       <div>
@@ -1612,6 +1615,36 @@ function settingsTab(name) {
   if (name==='sec') { loadStatus(); loadEncryption(); loadRemote(); loadPairedKeys(); }
 }
 
+// Auto-hide the fixed hamburger button while scrolling down through page
+// content (same "hide on scroll down, reveal on scroll up" pattern used by
+// Chrome's mobile toolbar and most Material apps), so it never sits on top
+// of content underneath it. Only relevant on the mobile layout — on desktop
+// the button is display:none anyway, so this is a harmless no-op there.
+(function () {
+  const btn = document.querySelector('.mobile-menu-btn');
+  const scrollEl = document.querySelector('.main');
+  if (!btn || !scrollEl) return;
+  let lastY = 0;
+  let ticking = false;
+  scrollEl.addEventListener('scroll', () => {
+    if (ticking) return;
+    ticking = true;
+    requestAnimationFrame(() => {
+      const y = scrollEl.scrollTop;
+      // Always show near the top, and show while scrolling up; hide only
+      // once the user has scrolled down a bit (avoids flicker on tiny
+      // scroll jitters right at the top of the page).
+      if (y < 40 || y < lastY) {
+        btn.classList.remove('hide-on-scroll');
+      } else if (y > lastY) {
+        btn.classList.add('hide-on-scroll');
+      }
+      lastY = y;
+      ticking = false;
+    });
+  }, { passive: true });
+})();
+
 // Mobile off-canvas sidebar
 function toggleSidebar() {
   document.querySelector('.sidebar').classList.toggle('open');
@@ -1748,7 +1781,7 @@ function renderApps() {
         : '';
     const cnt = S.backupCounts[a.id];
     const cntHtml = cnt !== undefined
-      ? `<span class="pill" style="font-family:var(--mono);font-size:10px;padding:2px 7px;margin-left:6px;${cnt>0?'background:var(--gd);color:var(--green);border:1px solid rgba(61,214,140,.35)':'background:var(--bg4);color:var(--txt3);border:1px solid var(--line)'}" title="${cnt} backup archive${cnt===1?'':'s'} on disk">${cnt}</span>`
+      ? `<span class="pill" style="font-family:var(--mono);font-size:10px;padding:2px 7px;margin-left:6px;${cnt>0?'background:var(--pd);color:var(--purple);border:1px solid rgba(195,166,247,.35)':'background:var(--bg4);color:var(--txt3);border:1px solid var(--line)'}" title="${cnt} backup archive${cnt===1?'':'s'} on disk">${cnt}</span>`
       : '';
     // Update-available badge — S.pendingUpdates comes from /api/status's
     // pending_updates field (checkForUpdates on the backend, refreshed every
@@ -1840,7 +1873,7 @@ function renderApps() {
       <td data-label="Retain"><span class="pill pb">${a.retain||5}</span></td>
       <td data-label="Schedule">${schedPill}${pinPill}${nextRunLine}</td>
       <td data-label="Actions"><div class="ra">
-        <button class="btn btn-g btn-sm" onclick="openBkModal('${a.id}','${esc(a.name)}')"${pathSt==='missing'?' title="Config path missing — backup may fail"':''}>▶ Backup</button>
+        <button class="btn btn-bk btn-sm" onclick="openBkModal('${a.id}','${esc(a.name)}')"${pathSt==='missing'?' title="Config path missing — backup may fail"':''}>▶ Backup</button>
         ${lifecycleBtn}
         <button class="btn btn-g btn-sm btn-ic" title="Edit" onclick="openEditApp('${a.id}')">✎</button>
         <button class="btn btn-d btn-sm btn-ic" title="Delete" onclick="delApp('${a.id}')">🗑</button>
