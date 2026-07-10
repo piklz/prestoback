@@ -861,12 +861,29 @@ func (s *Server) handleSuggestExcludes(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ContainerHealth is what the frontend receives per app.
+// ContainerHealth is what the frontend receives per app. The top-level
+// fields (Name/State/Health/ExitCode) stay exactly as before — they're the
+// app's PRIMARY container, and existing callers (Applications' inline
+// status badge) keep working unchanged. Containers additionally carries
+// every real container matched for this app (e.g. an Immich app matches
+// immich_server, immich_machine_learning, immich_redis, immich_postgres —
+// previously only the first of those was ever surfaced to the frontend at
+// all), so the Container Control page can show and act on each one
+// individually instead of only the primary.
 type ContainerHealth struct {
-	AppID    string `json:"app_id"`
-	Name     string `json:"name"`   // container name
-	State    string `json:"state"`  // "running" | "exited" | "paused" | "unknown"
-	Health   string `json:"health"` // "healthy" | "unhealthy" | "starting" | "" (no healthcheck)
+	AppID      string                `json:"app_id"`
+	Name       string                `json:"name"`   // container name (primary)
+	State      string                `json:"state"`  // "running" | "exited" | "paused" | "unknown"
+	Health     string                `json:"health"` // "healthy" | "unhealthy" | "starting" | "" (no healthcheck)
+	ExitCode   int                   `json:"exit_code,omitempty"`
+	Containers []ContainerHealthItem `json:"containers,omitempty"`
+}
+
+// ContainerHealthItem is one real container within an app's matched set.
+type ContainerHealthItem struct {
+	Name     string `json:"name"`
+	State    string `json:"state"`
+	Health   string `json:"health"`
 	ExitCode int    `json:"exit_code,omitempty"`
 }
 
@@ -906,6 +923,17 @@ func (s *Server) handleContainerHealth(w http.ResponseWriter, r *http.Request) {
 		h.Health = health
 		if exitCode != 0 {
 			h.ExitCode = exitCode
+		}
+		// Every matched container (redis/postgres/ML sidecars etc. included),
+		// not just the primary — see ContainerHealth's doc comment.
+		for _, cc := range containers {
+			item := ContainerHealthItem{Name: cc.Name, State: cc.Status}
+			itemHealth, itemExit := backup.HealthAndExitFromStatus(cc.RawStatus)
+			item.Health = itemHealth
+			if itemExit != 0 {
+				item.ExitCode = itemExit
+			}
+			h.Containers = append(h.Containers, item)
 		}
 		result = append(result, h)
 	}
@@ -3710,7 +3738,8 @@ func (s *Server) handleAppLifecycle(w http.ResponseWriter, r *http.Request, appI
 	}
 
 	var body struct {
-		Action string `json:"action"`
+		Action    string `json:"action"`
+		Container string `json:"container,omitempty"` // optional: target one container name within this app's matched set, instead of all of them
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errOut(w, 400, "invalid request body")
@@ -3743,16 +3772,33 @@ func (s *Server) handleAppLifecycle(w http.ResponseWriter, r *http.Request, appI
 		errOut(w, 404, "no containers found for "+app.Name)
 		return
 	}
+	if body.Container != "" {
+		var filtered []backup.ContainerInfo
+		for _, c := range containers {
+			if c.Name == body.Container {
+				filtered = append(filtered, c)
+			}
+		}
+		if len(filtered) == 0 {
+			errOut(w, 404, "container '"+body.Container+"' not found in "+app.Name)
+			return
+		}
+		containers = filtered
+	}
 
 	emit := func(msg string) {
 		log.Printf("[lifecycle:%s] %s", app.Name, msg)
 		s.engine.EmitLog(app.ID, msg)
 	}
-	emit(fmt.Sprintf("━━━ %s (from dashboard): %s ━━━", action, app.Name))
+	target := app.Name
+	if body.Container != "" {
+		target = app.Name + " / " + body.Container
+	}
+	emit(fmt.Sprintf("━━━ %s (from dashboard): %s ━━━", action, target))
 	start := time.Now()
 	failed := s.runLifecycleAction(containers, action, emit)
 	dur := time.Since(start)
-	emit(fmt.Sprintf("━━━ %s %s: %s (%s) ━━━", action, map[bool]string{true: "complete", false: "failed"}[len(failed) == 0], app.Name, formatDuration(dur)))
+	emit(fmt.Sprintf("━━━ %s %s: %s (%s) ━━━", action, map[bool]string{true: "complete", false: "failed"}[len(failed) == 0], target, formatDuration(dur)))
 
 	respond(w, 200, map[string]any{
 		"app":         app.Name,

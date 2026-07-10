@@ -47,6 +47,30 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .btn:disabled{opacity:.35;cursor:not-allowed;pointer-events:none}
 /* cards */
 .card{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;margin-bottom:18px}
+
+/* Container Control — stack-style grouping, one card per app. A single
+   real container (no siblings) renders as a plain row; an app that
+   matches multiple real containers (e.g. Immich's server + machine-learning
+   + redis + postgres) renders as an expandable group, same idea as
+   Portainer/Dockge's stack view: one summary header with aggregate status
+   and bulk actions, expanding to each container's own state + controls. */
+.ctrl-group{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);margin-bottom:12px;overflow:hidden}
+.ctrl-head{display:flex;align-items:center;gap:12px;padding:13px 16px;cursor:pointer;user-select:none}
+.ctrl-head:hover{background:var(--bg3)}
+.ctrl-chev{width:16px;height:16px;flex:none;color:var(--txt3);transition:transform .18s ease}
+.ctrl-group.open .ctrl-chev{transform:rotate(90deg)}
+.ctrl-head-name{font-weight:600;font-size:14px}
+.ctrl-head-count{font-size:11px;color:var(--txt3);font-family:var(--mono);margin-left:2px}
+.ctrl-head-status{margin-left:auto;font-family:var(--mono);font-size:12px;white-space:nowrap}
+.ctrl-children{display:none;border-top:1px solid var(--line)}
+.ctrl-group.open .ctrl-children{display:block}
+.ctrl-child{display:flex;align-items:center;gap:12px;padding:10px 16px 10px 40px;position:relative;border-top:1px solid var(--line)}
+.ctrl-child:first-child{border-top:none}
+.ctrl-child::before{content:'';position:absolute;left:22px;top:0;bottom:0;width:1px;background:var(--line2)}
+.ctrl-child::after{content:'';position:absolute;left:22px;top:50%;width:10px;height:1px;background:var(--line2)}
+.ctrl-child-name{font-size:13px;color:var(--txt2);font-family:var(--mono)}
+.ctrl-child-status{font-family:var(--mono);font-size:11.5px;white-space:nowrap}
+.ctrl-row-actions{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .card:last-child{margin-bottom:0}
 .ch{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px}
 .ct{font-family:var(--head);font-weight:700;font-size:14px}
@@ -106,6 +130,17 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .bk-list{display:flex;flex-direction:column}
 /* each item */
 .bi{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}
+/* Most-recent backup archive — a slow, subtle breathing ring around the
+   row (not a static line), so the newest restore point reads as "alive"
+   at a glance rather than needing the person to compare timestamps.
+   Brightness rides the same accent color already used for the newest
+   entry's gradient (see bkGradientBG) so it feels like an extension of
+   that cue, not a competing color. */
+@keyframes bi-latest-pulse{
+  0%,100%{box-shadow:inset 0 0 0 1.5px rgba(61,214,140,.55),0 0 8px rgba(61,214,140,.08)}
+  50%{box-shadow:inset 0 0 0 1.5px rgba(61,214,140,1),0 0 20px rgba(61,214,140,.3)}
+}
+.bi-latest{border-radius:8px;animation:bi-latest-pulse 2.8s ease-in-out infinite}
 .bi:last-child{border-bottom:none}
 .bic{width:34px;height:34px;border-radius:8px;background:var(--bg4);display:flex;align-items:center;justify-content:center;flex-shrink:0}
 .bm{flex:1;min-width:0}
@@ -488,13 +523,8 @@ select.fi{cursor:pointer}
     <div class="ha"><button class="btn btn-g btn-sm" onclick="refreshContainerHealth()">↺ Refresh</button></div>
   </div>
   <div class="sec">
-    <div class="card">
-      <div class="empty" id="ctrl-empty"><div class="ei"><svg width="22" height="22" fill="none" stroke="var(--txt3)" stroke-width="1.5" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg></div><div class="et">No apps configured</div><div class="es">Add an app from the Applications page first.</div></div>
-      <table class="tbl" id="ctrl-tbl" style="display:none">
-        <thead><tr><th>Application</th><th>Status</th><th>Actions</th></tr></thead>
-        <tbody id="ctrl-tbody"></tbody>
-      </table>
-    </div>
+    <div class="empty" id="ctrl-empty"><div class="ei"><svg width="22" height="22" fill="none" stroke="var(--txt3)" stroke-width="1.5" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg></div><div class="et">No apps configured</div><div class="es">Add an app from the Applications page first.</div></div>
+    <div id="ctrl-list" style="display:none"></div>
   </div>
 </div>
 
@@ -1709,11 +1739,13 @@ async function loadApps() {
 // (runLifecycleAction, shared code path), so a container paused from
 // Telegram can be unpaused from here and vice versa; the two surfaces can't
 // drift out of sync since they're calling the same Go function.
-async function appLifecycle(id, name, action) {
+async function appLifecycle(id, name, action, container) {
+  const label = container ? `${name} / ${container}` : name;
   try {
-    const r = await api('/api/apps/'+id+'/lifecycle', {method:'POST', body: JSON.stringify({action})});
-    if (r.success) toast(`${name}: ${action} complete`, 'success');
-    else toast(`${name}: ${action} failed — ${(r.failed||[]).join('; ')}`, 'error');
+    const body = container ? {action, container} : {action};
+    const r = await api('/api/apps/'+id+'/lifecycle', {method:'POST', body: JSON.stringify(body)});
+    if (r.success) toast(`${label}: ${action} complete`, 'success');
+    else toast(`${label}: ${action} failed — ${(r.failed||[]).join('; ')}`, 'error');
   } catch(e) {
     toast(e.message, 'error');
   } finally {
@@ -1953,39 +1985,111 @@ async function toggleAppSchedule(id) {
 // (see renderApps' lifecycleBtn comment). Reuses the same
 // /api/apps/{id}/lifecycle action and S.containerHealth state Applications
 // already populates via pollContainerHealth/refreshContainerHealth.
-function renderCtrl() {
-  const tbody = document.getElementById('ctrl-tbody');
-  const empty = document.getElementById('ctrl-empty');
-  const tbl = document.getElementById('ctrl-tbl');
-  if (!tbody || !empty || !tbl) return;
-  if (!S.apps.length) { empty.style.display=''; tbl.style.display='none'; return; }
-  empty.style.display='none'; tbl.style.display='';
-  tbody.innerHTML = S.apps.map(a => {
-    const ch = S.containerHealth[a.id];
-    const state = ch ? (ch.state || 'unknown') : 'unknown';
-    let col, label;
-    if (state === 'running') { col='var(--green-dk)'; label='● running'+(ch.health?' · '+ch.health:''); }
-    else if (state === 'paused') { col='var(--amber)'; label='⏸ paused'; }
-    else if (state === 'exited') { col='var(--red)'; label='● stopped'+(ch.exit_code?` (exit ${ch.exit_code})`:''); }
-    else { col='var(--txt3)'; label='● '+state; }
-    const statusHtml = `<span style="color:${col};font-family:var(--mono);font-size:12px">${label}</span>`;
+// Tracks which app groups are expanded across re-renders (health polling
+// re-renders this every 30s — without this, an open group would snap shut
+// on every poll).
+const _ctrlOpen = new Set();
+function toggleCtrlGroup(id) {
+  if (_ctrlOpen.has(id)) _ctrlOpen.delete(id); else _ctrlOpen.add(id);
+  renderCtrl();
+}
 
-    const actions = [];
-    if (state === 'running') {
-      actions.push(`<button class="btn btn-g btn-sm btn-ic" title="Restart" onclick="appLifecycle('${a.id}','${esc(a.name)}','restart')">↻</button>`);
-      actions.push(`<button class="btn btn-g btn-sm btn-ic" title="Pause (docker pause — SIGSTOP)" onclick="appLifecycle('${a.id}','${esc(a.name)}','pause')">⏸</button>`);
-      actions.push(`<button class="btn btn-d btn-sm" title="Stop" onclick="appLifecycle('${a.id}','${esc(a.name)}','stop')">⏹ Stop</button>`);
-    } else if (state === 'paused') {
-      actions.push(`<button class="btn btn-g btn-sm" title="Resume (docker unpause)" onclick="appLifecycle('${a.id}','${esc(a.name)}','unpause')">▶ Unpause</button>`);
-      actions.push(`<button class="btn btn-d btn-sm" title="Stop" onclick="appLifecycle('${a.id}','${esc(a.name)}','stop')">⏹ Stop</button>`);
-    } else if (state === 'exited') {
-      actions.push(`<button class="btn btn-g btn-sm" title="Start container" onclick="appLifecycle('${a.id}','${esc(a.name)}','start')">▶ Start</button>`);
+function ctrlStatusLabel(state, health, exitCode) {
+  if (state === 'running') {
+    if (health === 'healthy') return ['var(--green-dk)', '● running · healthy'];
+    if (health === 'unhealthy') return ['var(--red)', '● running · unhealthy'];
+    if (health === 'starting') return ['var(--amber)', '● running · starting'];
+    return ['var(--green-dk)', '● running'];
+  }
+  if (state === 'paused') return ['var(--amber)', '⏸ paused'];
+  if (state === 'exited') return ['var(--red)', '● stopped' + (exitCode ? ` (exit ${exitCode})` : '')];
+  return ['var(--txt3)', '● ' + state];
+}
+
+function ctrlActionButtons(appId, appName, state, containerName) {
+  const actions = [];
+  if (state === 'running') {
+    actions.push(`<button class="btn btn-g btn-sm btn-ic" title="Restart" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','restart'${containerName?`,'${esc(containerName)}'`:''})">↻</button>`);
+    actions.push(`<button class="btn btn-g btn-sm btn-ic" title="Pause (docker pause — SIGSTOP)" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','pause'${containerName?`,'${esc(containerName)}'`:''})">⏸</button>`);
+    actions.push(`<button class="btn btn-d btn-sm" title="Stop" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','stop'${containerName?`,'${esc(containerName)}'`:''})">⏹ Stop</button>`);
+  } else if (state === 'paused') {
+    actions.push(`<button class="btn btn-g btn-sm" title="Resume (docker unpause)" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','unpause'${containerName?`,'${esc(containerName)}'`:''})">▶ Unpause</button>`);
+    actions.push(`<button class="btn btn-d btn-sm" title="Stop" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','stop'${containerName?`,'${esc(containerName)}'`:''})">⏹ Stop</button>`);
+  } else if (state === 'exited') {
+    actions.push(`<button class="btn btn-g btn-sm" title="Start container" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','start'${containerName?`,'${esc(containerName)}'`:''})">▶ Start</button>`);
+  }
+  return actions.join('');
+}
+
+// Container Control page — grouped like Portainer/Dockge show a compose
+// stack: one card per app, expandable when it actually matches more than
+// one real container (e.g. Immich's app matches immich_server,
+// immich_machine_learning, immich_redis, immich_postgres — all four used
+// to collapse into a single, misleading "primary container" status). The
+// bulk restart/pause/stop buttons on the group header hit every container
+// in the group at once (same /lifecycle endpoint apps already used); the
+// per-container buttons inside the expanded group target just that one
+// container via the new `container` field.
+function renderCtrl() {
+  const empty = document.getElementById('ctrl-empty');
+  const list = document.getElementById('ctrl-list');
+  if (!empty || !list) return;
+  if (!S.apps.length) { empty.style.display=''; list.style.display='none'; return; }
+  empty.style.display='none'; list.style.display='';
+
+  list.innerHTML = S.apps.map(a => {
+    const ch = S.containerHealth[a.id];
+    const items = (ch && ch.containers && ch.containers.length) ? ch.containers : (ch ? [{name: ch.name || a.name, state: ch.state, health: ch.health, exit_code: ch.exit_code}] : [{name: a.name, state: 'unknown'}]);
+
+    // Single real container — no group chrome needed, just a plain row.
+    if (items.length <= 1) {
+      const it = items[0];
+      const [col, label] = ctrlStatusLabel(it.state, it.health, it.exit_code);
+      return `<div class="ctrl-group">
+        <div class="ctrl-head" style="cursor:default">
+          <span class="ctrl-head-name">${esc(a.name)}</span>
+          <span class="ctrl-head-status" style="color:${col}">${label}</span>
+          <div class="ctrl-row-actions">${ctrlActionButtons(a.id, a.name, it.state)}</div>
+        </div>
+      </div>`;
     }
-    return `<tr>
-      <td data-label="Application"><div class="an">${esc(a.name)}</div></td>
-      <td data-label="Status">${statusHtml}</td>
-      <td data-label="Actions"><div class="ra">${actions.join('')}</div></td>
-    </tr>`;
+
+    // Multiple real containers — expandable group. Aggregate summary is the
+    // worst state present (red > amber > green) so a single stopped sidecar
+    // isn't hidden behind an otherwise-healthy-looking summary.
+    const running = items.filter(i => i.state === 'running').length;
+    const worst = items.some(i => i.state === 'exited') ? 'exited'
+      : items.some(i => i.state === 'paused') ? 'paused'
+      : items.every(i => i.state === 'running') ? 'running' : 'unknown';
+    const [sumCol, sumLabelBase] = ctrlStatusLabel(worst, '', 0);
+    const sumLabel = worst === 'exited' || worst === 'paused'
+      ? `${sumLabelBase} · ${running}/${items.length} running`
+      : `${running}/${items.length} running`;
+    const isOpen = _ctrlOpen.has(a.id);
+
+    const childrenHtml = items.map(it => {
+      const [col, label] = ctrlStatusLabel(it.state, it.health, it.exit_code);
+      return `<div class="ctrl-child">
+        <span class="ctrl-child-name">${esc(it.name)}</span>
+        <span class="ctrl-child-status" style="color:${col};margin-left:8px">${label}</span>
+        <div class="ctrl-row-actions">${ctrlActionButtons(a.id, a.name, it.state, it.name)}</div>
+      </div>`;
+    }).join('');
+
+    return `<div class="ctrl-group${isOpen?' open':''}">
+      <div class="ctrl-head" onclick="toggleCtrlGroup('${a.id}')">
+        <svg class="ctrl-chev" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
+        <span class="ctrl-head-name">${esc(a.name)}</span>
+        <span class="ctrl-head-count">${items.length} containers</span>
+        <span class="ctrl-head-status" style="color:${sumCol}">${sumLabel}</span>
+        <div class="ctrl-row-actions" onclick="event.stopPropagation()">
+          <button class="btn btn-g btn-sm btn-ic" title="Restart all" onclick="appLifecycle('${a.id}','${esc(a.name)}','restart')">↻</button>
+          <button class="btn btn-g btn-sm btn-ic" title="Pause all (docker pause — SIGSTOP)" onclick="appLifecycle('${a.id}','${esc(a.name)}','pause')">⏸</button>
+          <button class="btn btn-d btn-sm" title="Stop all" onclick="appLifecycle('${a.id}','${esc(a.name)}','stop')">⏹ Stop all</button>
+        </div>
+      </div>
+      <div class="ctrl-children">${childrenHtml}</div>
+    </div>`;
   }).join('');
 }
 
@@ -2812,12 +2916,13 @@ function renderBkPage() {
   let html = '<div class="bk-list">' + slice.map((m, i) => {
     const missing = m.size_bytes === 0;
     const absIdx = page * BK_PER_PAGE + i;
-    return `<div class="bi${missing?' file-missing':''}" style="background:${bkGradientBG(absIdx, total)}">
+    const isLatest = absIdx === 0 && !missing;
+    return `<div class="bi${missing?' file-missing':''}${isLatest?' bi-latest':''}" style="background:${bkGradientBG(absIdx, total)}">
       <div class="bic">${m.pre_restore
         ? '<span style="font-size:14px">⭐</span>'
         : '<svg width="14" height="14" fill="none" stroke="var(--accent)" stroke-width="1.8" viewBox="0 0 24 24"><path d="M20 7H4a1 1 0 00-1 1v11a1 1 0 001 1h16a1 1 0 001-1V8a1 1 0 00-1-1z"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg>'}</div>
       <div class="bm">
-        <div class="bid">${esc(m.id)} ${m.pre_restore?'<span class="pill pa" style="font-size:9px">safety snap</span>':''}${m.remote&&m.remote.length?`<span class="pill pg" style="font-size:9px" title="${esc(m.remote.join(', '))}">☁ ${m.remote.length>1?m.remote.length+' remotes':'remote'}</span>`:''}</div>
+        <div class="bid">${esc(m.id)} ${isLatest?'<span class="pill" style="font-size:10px;font-weight:700;padding:2px 8px;background:var(--green);color:#06210f;border:1px solid var(--green)">🕐 LATEST</span>':''}${m.pre_restore?'<span class="pill pa" style="font-size:9px">safety snap</span>':''}${m.remote&&m.remote.length?`<span class="pill pg" style="font-size:9px" title="${esc(m.remote.join(', '))}">☁ ${m.remote.length>1?m.remote.length+' remotes':'remote'}</span>`:''}</div>
         <div class="bif">${new Date(m.started_at).toLocaleString()}</div>
       </div>
       <span class="bsz">${missing?'<span style="color:var(--red)">corrupt/empty</span>':fmtBytes(m.size_bytes)}</span>
