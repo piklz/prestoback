@@ -1640,6 +1640,7 @@ func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 //	POST   /api/apps/{id}/restore/{backupID} → restore a single volume archive
 //	POST   /api/apps/{id}/volumes          → add a volume to an existing app
 //	DELETE /api/apps/{id}/volumes/{slug}   → remove a volume from an app
+//	POST   /api/apps/{id}/update           → pull + recreate this app's container(s)
 func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 	tail := strings.TrimPrefix(r.URL.Path, "/api/apps/")
 	parts := strings.SplitN(tail, "/", 4)
@@ -1674,6 +1675,15 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 	// web dashboard's equivalent of the Telegram bot's lifecycle commands.
 	if len(parts) == 2 && parts[1] == "lifecycle" && r.Method == http.MethodPost {
 		s.handleAppLifecycle(w, r, appID)
+		return
+	}
+	// POST /api/apps/{id}/update — pull + recreate this app's container(s),
+	// the web dashboard's equivalent of Telegram's "update:<appID>" callback
+	// and /update <name> command. Previously only reachable from Telegram —
+	// the "⬆ update" badge in the Applications table had nowhere to send a
+	// click.
+	if len(parts) == 2 && parts[1] == "update" && r.Method == http.MethodPost {
+		s.handleAppUpdate(w, r, appID)
 		return
 	}
 
@@ -3751,6 +3761,55 @@ func (s *Server) handleAppLifecycle(w http.ResponseWriter, r *http.Request, appI
 		"failed":      failed,
 		"duration_ms": dur.Milliseconds(),
 	})
+}
+
+// handleAppUpdate triggers a pull + recreate for a single app's container(s)
+// — the web dashboard's equivalent of Telegram's "update:<appID>" callback
+// and /update <name> command, which reuses the exact same runContainerUpdates
+// path (same updateMu lock, same rollback-on-failure behavior, same history
+// entries). Progress is still reported to Telegram if configured — this
+// endpoint doesn't replace that, it just gives the web UI a way to kick the
+// same operation off, since previously an app's "⬆ update" badge had no web
+// action behind it at all.
+//
+// Fire-and-forget by design, matching handleUpdateApply's self-update
+// pattern: respond 202 immediately, run in the background. The caller
+// (renderApps' update-confirm modal) re-polls /api/updates/check afterward
+// to pick up the result rather than blocking on this request, since a pull +
+// recreate can take anywhere from a few seconds to a couple of minutes
+// depending on image size and connection speed.
+func (s *Server) handleAppUpdate(w http.ResponseWriter, r *http.Request, appID string) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	app, ok := s.cfg.GetApp(appID)
+	if !ok {
+		errOut(w, 404, "app not found")
+		return
+	}
+
+	// Same guard handleAppLifecycle uses — refuse to race a manual update
+	// against another update or stack operation already in flight. See
+	// updateMu's doc comment on the Server struct.
+	s.stateMu.Lock()
+	busy := s.updateRunning
+	s.stateMu.Unlock()
+	if busy {
+		errOut(w, 409, "an update or stack operation is already in progress — please wait for it to finish first")
+		return
+	}
+
+	if reachable, errMsg := backup.DockerReachable(); !reachable {
+		errOut(w, 503, "Docker isn't reachable right now (daemon may be restarting): "+errMsg)
+		return
+	}
+
+	nc := s.cfg.GetNotify()
+	tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
+
+	respond(w, 202, map[string]string{"status": "update started", "app_id": app.ID, "app_name": app.Name})
+	go s.runContainerUpdates(tgCfg, []config.AppConfig{app})
 }
 
 // runContainerLifecycle does the actual work for a resolved app — shared by

@@ -6,7 +6,7 @@
 <title>PrestoBack</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#0c0e11;--bg2:#111418;--bg3:#181c22;--bg4:#1e2330;--line:rgba(255,255,255,.07);--line2:rgba(255,255,255,.13);--txt:#e8eaf0;--txt2:#8b90a0;--txt3:#555b6e;--accent:#4f9cf9;--accent2:#3b7ad4;--green:#3dd68c;--gd:rgba(61,214,140,.12);--red:#f05f5f;--rd:rgba(240,95,95,.12);--amber:#f5a623;--ad:rgba(245,166,35,.12);--bld:rgba(79,156,249,.12);--r:10px;--rs:6px;--mono:'IBM Plex Mono',monospace;--head:'Syne',sans-serif;--body:'DM Sans',sans-serif}
+:root{--bg:#0c0e11;--bg2:#111418;--bg3:#181c22;--bg4:#1e2330;--line:rgba(255,255,255,.07);--line2:rgba(255,255,255,.13);--txt:#e8eaf0;--txt2:#8b90a0;--txt3:#555b6e;--accent:#4f9cf9;--accent2:#3b7ad4;--green:#3dd68c;--green-dk:#2a9d68;--gd:rgba(61,214,140,.12);--red:#f05f5f;--rd:rgba(240,95,95,.12);--amber:#f5a623;--ad:rgba(245,166,35,.12);--bld:rgba(79,156,249,.12);--r:10px;--rs:6px;--mono:'IBM Plex Mono',monospace;--head:'Syne',sans-serif;--body:'DM Sans',sans-serif}
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;background:var(--bg);color:var(--txt);font-family:var(--body);font-size:14px;line-height:1.5}
 .shell{display:flex;height:100vh;overflow:hidden}
@@ -42,7 +42,7 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .btn-d{background:transparent;color:var(--red);border-color:rgba(240,95,95,.3)}.btn-d:hover{background:var(--rd)}
 .btn-w{background:var(--ad);color:var(--amber);border-color:rgba(245,166,35,.3)}.btn-w:hover{background:rgba(245,166,35,.22)}
 .btn-sm{padding:5px 10px;font-size:12px}.btn-ic{padding:8px 10px;font-size:13px}
-.ra .btn-d{margin-left:10px}
+.ra .btn-d{margin-left:auto}
 .btn:disabled{opacity:.35;cursor:not-allowed;pointer-events:none}
 /* cards */
 .card{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;margin-bottom:18px}
@@ -111,6 +111,8 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .bid{font-family:var(--mono);font-size:11px;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .bif{font-size:12px;color:var(--txt3);margin-top:1px}
 .bsz{font-family:var(--mono);font-size:12px;color:var(--txt2);white-space:nowrap}
+.bi-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.bi-actions .btn-d{margin-left:8px}
 /* missing-on-disk backup item */
 .bi.file-missing{opacity:.45;pointer-events:none}
 .bi.file-missing .bid::after{content:" [file missing]";color:var(--red);font-size:9px;margin-left:5px}
@@ -274,6 +276,16 @@ select.fi{cursor:pointer}
   .apps-toolbar{flex-wrap:wrap}
   .apps-search{max-width:none}
 
+  /* Backups list: icon+name+date wrap onto their own line, size moves to
+     the far right of that line, and actions (Restore/Download/Delete) drop
+     to a dedicated full-width row below with room to breathe — previously
+     all of this squeezed onto one row and Download/Delete ended up close
+     enough together to mis-tap. */
+  .bi{flex-wrap:wrap;row-gap:10px;padding:12px 0}
+  .bsz{margin-left:auto}
+  .bi-actions{flex:1 0 100%;justify-content:flex-end;gap:10px}
+  .bi-actions .btn-d{margin-left:auto}
+
   /* Discover Apps modal: stack the name/path block above the mode toggle */
   #m-discover .modal{max-width:100%}
   .disc-group-head{flex-wrap:wrap}
@@ -376,7 +388,7 @@ select.fi{cursor:pointer}
 <div id="view-dash">
   <div class="ph">
     <div><div class="pt">Dashboard</div><div class="ps">Overview &amp; live activity</div></div>
-    <div class="ha"><button class="btn btn-g btn-sm" onclick="loadAll()">↺ Refresh</button></div>
+    <div class="ha"><button class="btn btn-g btn-sm" onclick="checkForUpdatesNow()" id="updates-check-btn" title="Check every app's image against its registry now, instead of waiting for the scheduled check">🔍 Check for updates</button><button class="btn btn-g btn-sm" onclick="loadAll()">↺ Refresh</button></div>
   </div>
   <div id="maint-banner" style="display:none;background:var(--amber2,#3a2a0f);border:1px solid var(--amber,#f0a020);border-radius:8px;padding:10px 14px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:12px">
     <div style="display:flex;align-items:center;gap:10px">
@@ -397,7 +409,6 @@ select.fi{cursor:pointer}
       </div>
     </div>
     <div style="display:flex;gap:8px">
-      <button class="btn btn-g btn-sm" onclick="checkForUpdatesNow()" id="updates-check-btn">🔍 Check now</button>
       <button class="btn btn-g btn-sm" onclick="V('apps')">Review</button>
     </div>
   </div>
@@ -969,6 +980,22 @@ select.fi{cursor:pointer}
       </label>
     </div>
     <div class="mf"><button class="btn btn-g" onclick="CM('m-del-app')">Cancel</button><button class="btn btn-d" onclick="confirmDelApp()">🗑 Remove Application</button></div>
+  </div>
+</div>
+
+<div class="overlay hidden" id="m-update-app">
+  <div class="modal">
+    <div class="mh"><div class="mt">Update Application</div><button class="btn btn-g btn-ic" onclick="CM('m-update-app')">✕</button></div>
+    <div class="mb">
+      <div style="font-size:13.5px;color:var(--txt2)">
+        Pull the latest image for <strong id="upd-app-name" style="color:var(--txt)">this app</strong> and recreate its container(s)?
+      </div>
+      <div style="margin-top:14px;padding:10px 14px;background:var(--bg3);border-radius:var(--rs);font-size:12.5px;color:var(--txt2)">
+        💡 Recreating a container always restarts it — there's no way to apply a new image without a brief restart, typically a few seconds to a couple of minutes depending on image size and connection speed. This runs in the background; check <strong>Live activity</strong> on the Dashboard or Telegram (if configured) for progress.
+      </div>
+      <div id="upd-app-detail" style="margin-top:12px;font-family:var(--mono);font-size:11.5px;color:var(--txt3);white-space:pre-line"></div>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="CM('m-update-app')">Cancel</button><button class="btn btn-w" id="upd-app-confirm-btn" onclick="confirmUpdateApp()">🔄 Update now</button></div>
   </div>
 </div>
 
@@ -1640,6 +1667,49 @@ async function appLifecycle(id, name, action) {
   }
 }
 
+// Update-confirm modal — opened by clicking an app's "⬆ update" badge
+// (renderApps). Shows the same version-delta detail already computed for
+// the badge's tooltip so the confirm dialog isn't just a bare "are you
+// sure" with no specifics.
+let _updateAppID = null;
+function openUpdateAppModal(id, name) {
+  _updateAppID = id;
+  document.getElementById('upd-app-name').textContent = name;
+  const rpt = (S.lastUpdateReports||[]).find(r => r.app_name === name);
+  const detail = rpt
+    ? rpt.images.filter(im => im.update_available).map(im =>
+        `${im.container_name}: ${im.current_version || im.current_tag || '?'} → ${im.latest_version || 'newer'}`
+      ).join('\n')
+    : '';
+  document.getElementById('upd-app-detail').textContent = detail;
+  const btn = document.getElementById('upd-app-confirm-btn');
+  btn.disabled = false;
+  btn.textContent = '🔄 Update now';
+  OM('m-update-app');
+}
+async function confirmUpdateApp() {
+  if (!_updateAppID) return;
+  const btn = document.getElementById('upd-app-confirm-btn');
+  btn.disabled = true;
+  btn.textContent = '🔄 Starting…';
+  try {
+    const r = await api('/api/apps/'+_updateAppID+'/update', {method:'POST'});
+    toast(`Update started for ${r.app_name || 'app'} — see Live activity for progress`, 'success');
+    CM('m-update-app');
+    // The pull+recreate runs in the background (see handleAppUpdate on the
+    // server) — refresh badges shortly after so a fast update is reflected
+    // without the user having to hit "Check for updates" manually. A single
+    // fixed delay rather than polling: this is a convenience nudge, not a
+    // progress tracker — Live activity / Telegram are the real progress
+    // sources for anything that takes longer than this.
+    setTimeout(() => { refreshContainerHealth(); checkForUpdatesNow(); }, 8000);
+  } catch(e) {
+    toast(e.message, 'error');
+    btn.disabled = false;
+    btn.textContent = '🔄 Update now';
+  }
+}
+
 let appsFilter = '';
 function filterApps(q) {
   appsFilter = q.toLowerCase();
@@ -1678,7 +1748,7 @@ function renderApps() {
         : '';
     const cnt = S.backupCounts[a.id];
     const cntHtml = cnt !== undefined
-      ? `<span style="font-family:var(--mono);font-size:10px;color:${cnt>0?'var(--green)':'var(--txt3)'};margin-left:4px">[${cnt}]</span>`
+      ? `<span class="pill" style="font-family:var(--mono);font-size:10px;padding:2px 7px;margin-left:6px;${cnt>0?'background:var(--gd);color:var(--green);border:1px solid rgba(61,214,140,.35)':'background:var(--bg4);color:var(--txt3);border:1px solid var(--line)'}" title="${cnt} backup archive${cnt===1?'':'s'} on disk">${cnt}</span>`
       : '';
     // Update-available badge — S.pendingUpdates comes from /api/status's
     // pending_updates field (checkForUpdates on the backend, refreshed every
@@ -1688,6 +1758,10 @@ function renderApps() {
     // upgrade to the real per-image detail — version delta in the tooltip,
     // and a distinct badge for a check that failed vs. one that's just
     // pinned-by-digest/locally-built (not actionable, so no badge at all).
+    // Clickable (update badges only, not the check-issue badge — a failed
+    // registry check isn't something "Update now" can act on) — opens the
+    // update-confirm modal instead of just sitting there as a tooltip-only
+    // indicator with no action behind it.
     const rpt = (S.lastUpdateReports||[]).find(r => r.app_name === a.name);
     let updBadge = '';
     if (rpt) {
@@ -1697,26 +1771,30 @@ function renderApps() {
         const detail = updatable.map(im =>
           `${im.container_name}: ${im.current_version || im.current_tag || '?'} → ${im.latest_version || 'newer'}`
         ).join('\n');
-        updBadge = `<span class="pill" style="background:var(--amber2,#3a2a0f);color:var(--amber,#f0a020);border:1px solid var(--amber,#f0a020);margin-left:6px" title="${esc(detail)}">⬆ update</span>`;
+        updBadge = `<span class="pill" style="background:var(--amber2,#3a2a0f);color:var(--amber,#f0a020);border:1px solid var(--amber,#f0a020);margin-left:6px;cursor:pointer" title="${esc(detail)}\n\nClick to update" onclick="openUpdateAppModal('${a.id}','${esc(a.name)}')">⬆ update</span>`;
       } else if (failed.length) {
         const detail = failed.map(im => `${im.container_name}: ${im.err}`).join('\n');
         updBadge = `<span class="pill" style="background:var(--red2,#3a1010);color:var(--red,#e05050);border:1px solid var(--red,#e05050);margin-left:6px" title="${esc(detail)}">⚠ check issue</span>`;
       }
     } else if ((S.pendingUpdates||[]).includes(a.name)) {
-      updBadge = `<span class="pill" style="background:var(--amber2,#3a2a0f);color:var(--amber,#f0a020);border:1px solid var(--amber,#f0a020);margin-left:6px" title="Newer image available">⬆ update</span>`;
+      updBadge = `<span class="pill" style="background:var(--amber2,#3a2a0f);color:var(--amber,#f0a020);border:1px solid var(--amber,#f0a020);margin-left:6px;cursor:pointer" title="Newer image available\n\nClick to update" onclick="openUpdateAppModal('${a.id}','${esc(a.name)}')">⬆ update</span>`;
     }
     // Container health badge — shown under the app name once polling data arrives
     const ch = S.containerHealth[a.id];
     const healthBadge = ch ? (() => {
       const state = ch.state || 'unknown';
       const health = ch.health || '';
-      // Determine colour and label
+      // Determine colour and label. "healthy"/plain-running use a slightly
+      // darker green than the bright --green used for actionable highlights
+      // (backup counts, schedule pills) — this is a passive status label,
+      // not something to click, so it reads calmer at a glance. Severity
+      // still ramps green → amber → red as things get worse.
       let col, label;
       if (state === 'running') {
-        if (health === 'healthy')   { col='var(--green)'; label='● running · healthy'; }
+        if (health === 'healthy')   { col='var(--green-dk)'; label='● running · healthy'; }
         else if (health === 'unhealthy') { col='var(--red)'; label='● running · unhealthy'; }
         else if (health === 'starting') { col='var(--amber)'; label='● running · starting'; }
-        else                         { col='var(--green)'; label='● running'; }
+        else                         { col='var(--green-dk)'; label='● running'; }
       } else if (state === 'paused')  { col='var(--amber)'; label='⏸ paused'; }
       else if (state === 'exited')    { col='var(--red)';   label='● stopped'+(ch.exit_code?` (exit ${ch.exit_code})`:''); }
       else                            { col='var(--txt3)';  label='● '+state; }
@@ -2560,6 +2638,27 @@ async function loadBackups() {
   } catch(e) { toast(e.message,'error'); body.innerHTML = `<div style="color:var(--red);font-size:13px">Error loading backups: ${esc(e.message)}</div>`; }
 }
 
+// bkGradientBG returns a left-fading gradient background for a backup row —
+// a subtle recency cue: the newest archive (idx 0) reads pastel green, the
+// oldest (idx totalCount-1) reads a soft purple, with every archive between
+// interpolated along that line. Deliberately low alpha (.12 fading to 0)
+// and a left-to-right fade rather than a flat fill — this needs to read as
+// a gentle accent on a dark background, not a colored block competing with
+// the row's own text. idx is the archive's ABSOLUTE position across all
+// pages (not just the current slice) so the gradient stays continuous when
+// paging through a long list rather than resetting to full-green on every
+// page.
+function bkGradientBG(idx, totalCount) {
+  if (totalCount <= 1) return 'linear-gradient(90deg, rgba(61,214,140,.12), rgba(61,214,140,0) 55%)';
+  const t = idx / (totalCount - 1); // 0 = newest, 1 = oldest
+  const green  = [61, 214, 140];
+  const purple = [168, 130, 247];
+  const r = Math.round(green[0] + (purple[0]-green[0]) * t);
+  const g = Math.round(green[1] + (purple[1]-green[1]) * t);
+  const b = Math.round(green[2] + (purple[2]-green[2]) * t);
+  return `linear-gradient(90deg, rgba(${r},${g},${b},.12), rgba(${r},${g},${b},0) 55%)`;
+}
+
 function renderBkPage() {
   const metas = S.bkAll;
   const isOrphan = !S.apps.find(a => a.id === S.selAppID);
@@ -2570,9 +2669,10 @@ function renderBkPage() {
   const slice = metas.slice(page * BK_PER_PAGE, (page+1) * BK_PER_PAGE);
   const body = document.getElementById('bk-list-area');
 
-  let html = '<div class="bk-list">' + slice.map(m => {
+  let html = '<div class="bk-list">' + slice.map((m, i) => {
     const missing = m.size_bytes === 0;
-    return `<div class="bi${missing?' file-missing':''}">
+    const absIdx = page * BK_PER_PAGE + i;
+    return `<div class="bi${missing?' file-missing':''}" style="background:${bkGradientBG(absIdx, total)}">
       <div class="bic">${m.pre_restore
         ? '<span style="font-size:14px">⭐</span>'
         : '<svg width="14" height="14" fill="none" stroke="var(--accent)" stroke-width="1.8" viewBox="0 0 24 24"><path d="M20 7H4a1 1 0 00-1 1v11a1 1 0 001 1h16a1 1 0 001-1V8a1 1 0 00-1-1z"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg>'}</div>
@@ -2581,7 +2681,7 @@ function renderBkPage() {
         <div class="bif">${new Date(m.started_at).toLocaleString()}</div>
       </div>
       <span class="bsz">${missing?'<span style="color:var(--red)">corrupt/empty</span>':fmtBytes(m.size_bytes)}</span>
-      <div style="display:flex;gap:6px">
+      <div class="bi-actions">
         ${!missing && !isOrphan?`<button class="btn btn-g btn-sm" onclick="openRsModal('${S.selAppID}','${esc(m.id)}')">↺ Restore</button>`:''}
         ${!missing && isOrphan?`<button class="btn btn-g btn-sm" disabled title="Adopt this app first" style="opacity:.5">↺ Restore</button>`:''}
         ${!missing?`<button class="btn btn-g btn-sm btn-ic" onclick="downloadBackup('${esc(m.id)}')" title="Download to this device">⬇</button>`:''}

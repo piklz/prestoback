@@ -93,9 +93,10 @@ func SendRaw(cfg TelegramConfig, text string) error {
 		return fmt.Errorf("telegram not configured")
 	}
 	return telegramPost(cfg.Token, "sendMessage", map[string]any{
-		"chat_id":    cfg.ChatID,
-		"text":       text,
-		"parse_mode": "MarkdownV2",
+		"chat_id":                  cfg.ChatID,
+		"text":                     text,
+		"parse_mode":               "MarkdownV2",
+		"disable_web_page_preview": true,
 	})
 }
 
@@ -108,8 +109,9 @@ func SendRawPlain(cfg TelegramConfig, text string) error {
 		return fmt.Errorf("telegram not configured")
 	}
 	return telegramPost(cfg.Token, "sendMessage", map[string]any{
-		"chat_id": cfg.ChatID,
-		"text":    text,
+		"chat_id":                  cfg.ChatID,
+		"text":                     text,
+		"disable_web_page_preview": true,
 	})
 }
 
@@ -125,9 +127,10 @@ func SendTelegram(cfg TelegramConfig, ev Event) error {
 		return fmt.Errorf("telegram not configured")
 	}
 	return telegramPost(cfg.Token, "sendMessage", map[string]any{
-		"chat_id":    cfg.ChatID,
-		"text":       fmtEvent(ev),
-		"parse_mode": "MarkdownV2",
+		"chat_id":                  cfg.ChatID,
+		"text":                     fmtEvent(ev),
+		"parse_mode":               "MarkdownV2",
+		"disable_web_page_preview": true,
 	})
 }
 
@@ -145,9 +148,10 @@ func SendTelegramWithButtons(cfg TelegramConfig, ev Event, actions map[string]st
 		})
 	}
 	return telegramPost(cfg.Token, "sendMessage", map[string]any{
-		"chat_id":    cfg.ChatID,
-		"text":       fmtEvent(ev),
-		"parse_mode": "MarkdownV2",
+		"chat_id":                  cfg.ChatID,
+		"text":                     fmtEvent(ev),
+		"parse_mode":               "MarkdownV2",
+		"disable_web_page_preview": true,
 		"reply_markup": map[string]any{
 			"inline_keyboard": [][]map[string]string{buttons},
 		},
@@ -399,9 +403,10 @@ func SendRawWithButtons(cfg TelegramConfig, text string, actions []ButtonAction)
 		rows[i] = []map[string]string{{"text": a.Label, "callback_data": a.Data}}
 	}
 	return telegramPost(cfg.Token, "sendMessage", map[string]any{
-		"chat_id":    cfg.ChatID,
-		"text":       text,
-		"parse_mode": "MarkdownV2",
+		"chat_id":                  cfg.ChatID,
+		"text":                     text,
+		"parse_mode":               "MarkdownV2",
+		"disable_web_page_preview": true,
 		"reply_markup": map[string]any{
 			"inline_keyboard": rows,
 		},
