@@ -466,6 +466,19 @@ select.fi{cursor:pointer}
       <button class="btn btn-g btn-sm" onclick="V('apps')">Review</button>
     </div>
   </div>
+  <div id="selfupdate-banner" style="display:none;background:var(--amber2,#3a2a0f);border:1px solid var(--amber,#f0a020);border-radius:8px;padding:10px 14px;margin:0 36px 14px;align-items:center;justify-content:space-between;gap:12px">
+    <div style="display:flex;align-items:center;gap:10px">
+      <span style="font-size:18px">📦</span>
+      <div>
+        <div style="font-weight:600;color:var(--amber,#f0a020)">PrestoBack update available</div>
+        <div style="font-size:12px;color:var(--txt3)" id="selfupdate-banner-detail"></div>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-g btn-sm" onclick="openChangelogModal()">📋 Changelog</button>
+      <button class="btn btn-w btn-sm" onclick="openUpdModal()">⬆ Update now</button>
+    </div>
+  </div>
   <div class="sec">
     <div class="stats">
       <div class="stat" onclick="V('apps')" title="Go to Applications"><div class="sl">Applications</div><div class="sv a" id="s-apps">0</div></div>
@@ -782,6 +795,7 @@ select.fi{cursor:pointer}
         </table>
         <div id="upd-update-btn-row" style="display:none;margin-top:14px">
           <button class="btn btn-w" onclick="openUpdModal()">⬆ Update now</button>
+          <button class="btn btn-g" onclick="openChangelogModal()">📋 View changelog</button>
           <span style="font-size:12px;color:var(--txt2);margin-left:12px">New image available on DockerHub</span>
         </div>
       </div>
@@ -1109,6 +1123,15 @@ select.fi{cursor:pointer}
   </div>
 </div>
 
+<!-- Changelog viewer — shown before applying a self-update -->
+<div class="overlay hidden" id="m-changelog">
+  <div class="modal">
+    <div class="mh"><div class="mt" id="changelog-title">What's new</div><button class="btn btn-g btn-ic" onclick="CM('m-changelog')">✕</button></div>
+    <div class="mb" id="changelog-body" style="max-height:60vh;overflow-y:auto"></div>
+    <div class="mf"><button class="btn btn-g" onclick="CM('m-changelog')">Close</button><button class="btn btn-w" id="changelog-update-btn" onclick="CM('m-changelog');openUpdModal()">⬆ Update now</button></div>
+  </div>
+</div>
+
 <!-- Link a new device (Device A: shows QR, polls for claim) -->
 <div class="overlay hidden" id="m-pair">
   <div class="modal">
@@ -1407,6 +1430,12 @@ async function loadStatus() {
     S.pendingUpdates = d.pending_updates || [];
     renderUpdatesBanner();
     renderApps(); // re-render so the inline "⬆ update available" badge picks up S.pendingUpdates
+    // Pending PrestoBack self-update — populated by the background
+    // selfUpdateCheckLoop (see selfupdatecheck.go), not just by manually
+    // clicking "Check for update" in Settings, so the banner/sidebar dot
+    // reflect it even if the user never opens that page.
+    S.pendingSelfUpdate = d.pending_self_update || null;
+    renderSelfUpdateBanner();
     // Disk space — dashboard stat
     if (d.disk_total_bytes && d.disk_total_bytes > 0) {
       const free = d.disk_free_bytes, total = d.disk_total_bytes;
@@ -1473,6 +1502,63 @@ function renderUpdatesBanner() {
   document.getElementById('updates-banner-title').textContent =
     n === 1 ? 'Update available' : n + ' updates available';
   document.getElementById('updates-banner-detail').textContent = S.pendingUpdates.join(', ');
+}
+
+// Shows/hides the PrestoBack self-update banner and the sidebar dot.
+// S.pendingSelfUpdate comes from /api/status's pending_self_update field
+// (nil when up to date) — see selfupdatecheck.go on the backend.
+function renderSelfUpdateBanner() {
+  const banner = document.getElementById('selfupdate-banner');
+  const dot = document.getElementById('upd-dot');
+  const p = S.pendingSelfUpdate;
+  if (!p) {
+    if (banner) banner.style.display = 'none';
+    if (dot) dot.classList.remove('show');
+    return;
+  }
+  if (dot) dot.classList.add('show');
+  if (!banner) return;
+  banner.style.display = 'flex';
+  const detail = document.getElementById('selfupdate-banner-detail');
+  if (p.releases && p.releases.length) {
+    const latest = p.releases[0];
+    detail.textContent = p.releases.length === 1
+      ? (latest.tag_name || latest.name || 'new version')
+      : p.releases.length + ' new versions — latest ' + (latest.tag_name || latest.name || '');
+  } else {
+    detail.textContent = 'New image available';
+  }
+}
+
+// Renders S.pendingSelfUpdate's release notes into the changelog modal.
+// Falls back to a plain "new image available" message if the changelog
+// itself couldn't be fetched (e.g. PRESTOBACK_GITHUB_REPO not set) — the
+// update is still real and applyable even without release notes.
+function openChangelogModal() {
+  const p = S.pendingSelfUpdate;
+  const body = document.getElementById('changelog-body');
+  if (!p) {
+    body.innerHTML = '<p style="color:var(--txt3);font-size:13px">No pending update.</p>';
+    OM('m-changelog');
+    return;
+  }
+  const releases = p.releases || [];
+  if (!releases.length) {
+    body.innerHTML = '<p style="color:var(--txt3);font-size:13px">'
+      + (p.changelog_err ? esc(p.changelog_err) : 'A new image is available, but release notes could not be loaded.')
+      + '</p>';
+    OM('m-changelog');
+    return;
+  }
+  document.getElementById('changelog-title').textContent =
+    releases.length === 1 ? 'What\'s new' : releases.length + ' new versions';
+  body.innerHTML = releases.map(r => `
+    <div style="margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--line)">
+      <div style="font-weight:600;font-size:14px;margin-bottom:4px">${esc(r.tag_name || r.name || '')}</div>
+      <div style="font-size:11px;color:var(--txt3);margin-bottom:8px">${r.published_at ? new Date(r.published_at).toLocaleDateString() : ''}</div>
+      <div style="font-size:13px;color:var(--txt2);white-space:pre-wrap;line-height:1.5">${esc(r.body || '(no description)')}</div>
+    </div>`).join('');
+  OM('m-changelog');
 }
 
 
@@ -2941,7 +3027,7 @@ function renderBkPage() {
       <div class="bi-actions">
         ${!missing && !isOrphan?`<button class="btn btn-g btn-sm" onclick="openRsModal('${S.selAppID}','${esc(m.id)}')">↺ Restore</button>`:''}
         ${!missing && isOrphan?`<button class="btn btn-g btn-sm" disabled title="Adopt this app first" style="opacity:.5">↺ Restore</button>`:''}
-        ${!missing?`<button class="btn btn-g btn-sm btn-ic" onclick="downloadBackup('${esc(m.id)}')" title="Download to this device">⬇</button>`:''}
+        ${!missing?`<button class="btn btn-g btn-sm" onclick="downloadBackup('${esc(m.id)}')" title="Download this archive to your device">⬇ Export</button>`:''}
         <button class="btn btn-d btn-sm btn-ic" onclick="delBackup('${esc(m.id)}')">🗑</button>
       </div>
     </div>`;
@@ -3881,6 +3967,14 @@ async function checkUpdate() {
       document.getElementById('upd-remote-full').style.color = 'var(--amber)';
       document.getElementById('upd-update-btn-row').style.display = '';
       document.getElementById('upd-dot').classList.add('show');
+      // Keep S.pendingSelfUpdate (and therefore the dashboard banner +
+      // changelog modal) in sync with this manual check too, not just the
+      // background loop's periodic one.
+      S.pendingSelfUpdate = {
+        local_digest: r.local_digest, remote_digest: r.remote_digest,
+        releases: r.releases || [], changelog_err: r.changelog_err || ''
+      };
+      renderSelfUpdateBanner();
       toast('Update available!', 'warn');
     } else {
       document.getElementById('upd-status-title').textContent = 'Digest comparison';
@@ -3888,6 +3982,8 @@ async function checkUpdate() {
       document.getElementById('upd-remote-full').style.color = 'var(--green)';
       document.getElementById('upd-update-btn-row').style.display = 'none';
       document.getElementById('upd-dot').classList.remove('show');
+      S.pendingSelfUpdate = null;
+      renderSelfUpdateBanner();
       toast('Already up to date ✓', 'info');
     }
   } catch(e) { toast(e.message, 'error'); }

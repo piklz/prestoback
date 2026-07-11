@@ -61,6 +61,14 @@ type Server struct {
 	// silently no-op'ing forever like it used to.
 	dismissBatches map[string][]string
 	dismissSeq     int
+
+	// Pending self-update tracking — mirrors pendingUpdates above but for
+	// PrestoBack's own image (see selfupdatecheck.go). Guarded by stateMu.
+	// nil means "no update currently pending" (either never checked, or
+	// already up to date).
+	pendingSelfUpdate   *PendingSelfUpdate
+	selfUpdateAlertSent bool // debounce, same spirit as updateAlertSent
+
 	// restartNote carries a human-readable reason from main.go's shutdown-
 	// marker check (see installShutdownMarker/checkPreviousShutdown there) —
 	// "" for a normal start. Read once by runTelegramBot's startup message.
@@ -105,6 +113,7 @@ func NewServer(cfg *config.Config, image, selfName, restartNote string) *Server 
 	go s.runTelegramBot()
 	go s.diskMonitorLoop()
 	go s.updateCheckLoop()
+	go s.selfUpdateCheckLoop()
 	return s
 }
 
@@ -268,27 +277,29 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.stateMu.Lock()
 	maintUntil := s.maintUntil
 	pendingUpdates := append([]string{}, s.pendingUpdates...) // copy under lock
+	pendingSelfUpdate := s.pendingSelfUpdate                  // pointer copy — read-only downstream, never mutated in place
 	s.stateMu.Unlock()
 	var maintUntilStr string
 	if !maintUntil.IsZero() && time.Now().Before(maintUntil) {
 		maintUntilStr = maintUntil.UTC().Format(time.RFC3339)
 	}
 	respond(w, 200, map[string]any{
-		"version":           config.Version,
-		"app_count":         s.cfg.AppCount(),
-		"volumes_dir":       s.cfg.VolumesDir,
-		"backup_dir":        s.cfg.BackupDir(),
-		"image":             s.image,
-		"self_name":         s.selfName,
-		"built_at":          builtAt,
-		"time":              time.Now().UTC(),
-		"disk_free_bytes":   diskFreeBytes,
-		"disk_total_bytes":  diskTotalBytes,
-		"disk_low_pct":      diskLowPct,        // non-zero = warning; value = % free
-		"maintenance_until": maintUntilStr,     // RFC3339 or "" if not in maintenance
-		"compose_file":      s.cfg.ComposeFile, // "" if /update auto-restart not configured
-		"pending_updates":   pendingUpdates,    // app names with an image update available
-		"next_runs":         nextRuns,
+		"version":             config.Version,
+		"app_count":           s.cfg.AppCount(),
+		"volumes_dir":         s.cfg.VolumesDir,
+		"backup_dir":          s.cfg.BackupDir(),
+		"image":               s.image,
+		"self_name":           s.selfName,
+		"built_at":            builtAt,
+		"time":                time.Now().UTC(),
+		"disk_free_bytes":     diskFreeBytes,
+		"disk_total_bytes":    diskTotalBytes,
+		"disk_low_pct":        diskLowPct,        // non-zero = warning; value = % free
+		"maintenance_until":   maintUntilStr,     // RFC3339 or "" if not in maintenance
+		"compose_file":        s.cfg.ComposeFile, // "" if /update auto-restart not configured
+		"pending_updates":     pendingUpdates,    // app names with an image update available
+		"pending_self_update": pendingSelfUpdate, // nil if PrestoBack itself is up to date
+		"next_runs":           nextRuns,
 	})
 }
 
@@ -2750,17 +2761,33 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		respond(w, 200, map[string]any{"available": false, "reason": "PRESTOBACK_IMAGE not set"})
 		return
 	}
-	hasUpdate, local, remote, err := backup.ForceCheckForUpdate(s.image)
+	// Routed through checkSelfUpdate (not backup.ForceCheckForUpdate directly)
+	// so a dashboard-triggered check also fetches and caches the GitHub
+	// changelog into s.pendingSelfUpdate — the same state the "Update
+	// available" banner and Telegram's /selfupdate both read from, so all
+	// three surfaces agree on one check result instead of three separate ones.
+	pending, err := s.checkSelfUpdate(false, false)
 	if err != nil {
 		respond(w, 200, map[string]any{"available": false, "error": err.Error()})
 		return
 	}
+	if pending == nil {
+		respond(w, 200, map[string]any{
+			"available":     false,
+			"local_digest":  "",
+			"remote_digest": "",
+			"image":         s.image,
+		})
+		return
+	}
 	respond(w, 200, map[string]any{
-		"available":     hasUpdate,
-		"local_digest":  local,
-		"remote_digest": remote,
+		"available":     true,
+		"local_digest":  pending.LocalDigest,
+		"remote_digest": pending.RemoteDigest,
 		"image":         s.image,
-		"locally_built": local == "local-build",
+		"locally_built": pending.LocalDigest == "local-build",
+		"releases":      pending.Releases,
+		"changelog_err": pending.ChangelogErr,
 	})
 }
 
@@ -2899,7 +2926,8 @@ func prestoBackBotCommands() []notify.BotCommand {
 		{Command: "maintenance", Description: "Freeze all schedules — /maintenance 2h / 1d / 1w / on / off"},
 		{Command: "update", Description: "Pull + recreate a container — /update <name> or /update all"},
 		{Command: "settings", Description: "Show current notification and app configuration"},
-		{Command: "selfupdate", Description: "Check for a new PrestoBack image and apply it"},
+		{Command: "selfupdate", Description: "Check for a new PrestoBack image — shows changelog, asks before applying"},
+		{Command: "changelog", Description: "Show release notes for any PrestoBack versions newer than this one"},
 		{Command: "help", Description: "Show all available commands"},
 	}
 }
@@ -3103,37 +3131,39 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			return
 		}
 		_ = notify.SendRaw(tgCfg, "🔍 Checking for updates\\.\\.\\.")
-		hasUpdate, local, remote, err := backup.ForceCheckForUpdate(s.image)
+		pending, err := s.checkSelfUpdate(false, true) // force=true: always reply, even if the background loop already alerted
 		if err != nil {
 			_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Update check failed: `%s`", notify.EscapeMD(err.Error())))
 			return
 		}
-		localShort := local
-		if len(localShort) > 12 {
-			localShort = localShort[:12]
-		}
-		remoteShort := remote
-		if len(remoteShort) > 12 {
-			remoteShort = remoteShort[:12]
-		}
-		if !hasUpdate {
-			_ = notify.SendRaw(tgCfg, fmt.Sprintf("✅ Already up to date\\.\nDigest: `%s`", notify.EscapeMD(localShort)))
+		if pending == nil {
+			_ = notify.SendRaw(tgCfg, "✅ Already up to date\\.")
 			return
 		}
-		_ = notify.SendRaw(tgCfg, fmt.Sprintf(
-			"🆕 Update available\\!\n📦 Local: `%s`\n🌐 Remote: `%s`\n\nPulling and restarting now\\. PrestoBack will briefly go offline — you'll get backup notifications once it's back\\.",
-			notify.EscapeMD(localShort),
-			notify.EscapeMD(remoteShort),
-		))
-		go func() {
-			if err := backup.SelfUpdate(s.image, s.selfName, s.engine.AnyRunning, s.engine.EmitUpdate); err != nil {
-				log.Printf("[bot] selfupdate: %v", err)
-				_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Self\\-update failed: `%s`", notify.EscapeMD(err.Error())))
-			}
-			// If SelfUpdate succeeds, the container is replaced — this goroutine
-			// will never reach here. The "back online" message must be sent
-			// on startup instead (see the startup notification in runTelegramBot).
-		}()
+		text := buildSelfUpdateMessage(pending)
+		btns := []notify.ButtonAction{
+			{Label: "🔄 Update now", Data: "selfupdate:apply"},
+			{Label: "📋 Full changelog", Data: "selfupdate:changelog"},
+			{Label: "👀 Remind me later", Data: "selfupdate:dismiss"},
+		}
+		if err := notify.SendRawWithButtons(tgCfg, text, btns); err != nil {
+			log.Printf("[bot] selfupdate reply: %v", err)
+		}
+
+	case "/changelog":
+		if s.image == "" {
+			_ = notify.SendRaw(tgCfg, "❌ `PRESTOBACK_IMAGE` isn't set — can't check for a changelog\\.")
+			return
+		}
+		_ = notify.SendRaw(tgCfg, "🔍 Fetching changelog from GitHub\\.\\.\\.")
+		pending, err := s.checkSelfUpdate(false, false)
+		if err != nil {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Changelog check failed: `%s`", notify.EscapeMD(err.Error())))
+			return
+		}
+		if err := notify.SendRaw(tgCfg, buildFullChangelogMessage(pending)); err != nil {
+			log.Printf("[bot] changelog reply: %v", err)
+		}
 
 	case "/apps", "/status": // /status is a legacy alias — merged into /apps, same report either way
 		// One detailed pass per app: path, human schedule + next run, volume
@@ -3575,7 +3605,8 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			"📚 /stack ps — show status of every service\n\n" +
 			"*System*\n" +
 			"⚙️ /settings — notification and app configuration\n" +
-			"🔃 /selfupdate — check for a new PrestoBack image and apply\n" +
+			"🔃 /selfupdate — check for a new PrestoBack image \\(shows changelog, asks before applying\\)\n" +
+			"📋 /changelog — release notes for versions newer than this one\n" +
 			"❓ /help — this message"
 		if err := notify.SendRaw(tgCfg, help); err != nil {
 			log.Printf("[bot] send help: %v", err)
@@ -3702,6 +3733,41 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 				s.stateMu.Unlock()
 			}
 			_ = notify.SendRaw(tgCfg, "OK — I'll remind you again if it's still pending at the next check\\.")
+		}
+
+	case "selfupdate":
+		s.stateMu.Lock()
+		pending := s.pendingSelfUpdate
+		s.stateMu.Unlock()
+
+		switch parts[1] {
+		case "apply":
+			if pending == nil {
+				_ = notify.SendRaw(tgCfg, "Nothing pending — already up to date\\.")
+				return
+			}
+			if s.image == "" || s.selfName == "" {
+				_ = notify.SendRaw(tgCfg, "❌ Self\\-update not available: `PRESTOBACK_IMAGE` and `PRESTOBACK_CONTAINER` must be set\\.")
+				return
+			}
+			_ = notify.SendRaw(tgCfg, "🔄 Pulling and restarting now\\. PrestoBack will briefly go offline — you'll get a message once it's back\\.")
+			go func() {
+				if err := backup.SelfUpdate(s.image, s.selfName, s.engine.AnyRunning, s.engine.EmitUpdate); err != nil {
+					log.Printf("[bot] selfupdate apply: %v", err)
+					_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Self\\-update failed: `%s`", notify.EscapeMD(err.Error())))
+					return
+				}
+				// On success the container is replaced — this goroutine never
+				// reaches here; the "back online" message fires on startup
+				// instead (see runTelegramBot's startup notification).
+			}()
+		case "changelog":
+			_ = notify.SendRaw(tgCfg, buildFullChangelogMessage(pending))
+		case "dismiss":
+			s.stateMu.Lock()
+			s.selfUpdateAlertSent = false
+			s.stateMu.Unlock()
+			_ = notify.SendRaw(tgCfg, "OK \\— I'll remind you again if it's still pending at the next check\\.")
 		}
 	}
 }
