@@ -892,6 +892,57 @@ type ContainerHealthItem struct {
 // Uses the same matching as the backup pipeline so the displayed container is
 // always the one that would actually be stopped/paused on backup.
 //
+// resolveContainerHealthOwnership fixes a real bug: findContainersIn's fuzzy
+// substring matching (see docker.go) has no cross-app awareness, so a
+// container like "immich_postgres" matches BOTH the "immich" app (its
+// baseName "immich" is a literal substring) AND a separately-registered
+// "Immich-postgres" app (its own, more specific, baseName match) — the
+// container showed up in two places at once in Container Control.
+//
+// This assigns each container to exactly one owning app: the one whose
+// matched appID is longest/most specific (same "longest match wins" rule
+// updatecheck.go's ownedContainers already uses for update-check reporting —
+// this is that same fix, applied here too). Deliberately does NOT re-run
+// FindContainers to pick up exact ContainerName/LinkedContainers matches the
+// way ownedContainers does — that would mean extra `docker inspect` calls
+// per app on every 30s poll, exactly what FindContainersFor's single batched
+// snapshot exists to avoid (see the comment above handleContainerHealth).
+// Operating on the already-fetched matches map keeps this at zero
+// additional Docker calls.
+func resolveContainerHealthOwnership(matches map[string][]backup.ContainerInfo) map[string][]backup.ContainerInfo {
+	appIDs := make([]string, 0, len(matches))
+	for id := range matches {
+		appIDs = append(appIDs, id)
+	}
+	sort.Strings(appIDs) // deterministic tie-break when two appIDs are equally specific
+
+	type claim struct {
+		appID       string
+		specificity int
+	}
+	owner := map[string]claim{}
+	byID := map[string]backup.ContainerInfo{}
+
+	for _, appID := range appIDs {
+		specificity := len(appID)
+		for _, c := range matches[appID] {
+			byID[c.ID] = c
+			if cur, ok := owner[c.ID]; !ok || specificity > cur.specificity {
+				owner[c.ID] = claim{appID: appID, specificity: specificity}
+			}
+		}
+	}
+
+	result := make(map[string][]backup.ContainerInfo, len(matches))
+	for appID := range matches {
+		result[appID] = nil // keep every app present, even with zero owned containers
+	}
+	for id, cl := range owner {
+		result[cl.appID] = append(result[cl.appID], byID[id])
+	}
+	return result
+}
+
 // This used to call backup.FindContainers per app — each call spawning up to
 // ~6 separate `docker ps`/`docker inspect` subprocesses on its own — so a
 // 7-app dashboard fired off ~50 subprocesses every 30s, forever. It now takes
@@ -908,6 +959,7 @@ func (s *Server) handleContainerHealth(w http.ResponseWriter, r *http.Request) {
 		appIDs[i] = a.ID
 	}
 	matches := backup.FindContainersFor(appIDs)
+	matches = resolveContainerHealthOwnership(matches)
 
 	result := make([]ContainerHealth, 0, len(apps))
 	for _, a := range apps {

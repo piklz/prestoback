@@ -55,22 +55,31 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
    Portainer/Dockge's stack view: one summary header with aggregate status
    and bulk actions, expanding to each container's own state + controls. */
 .ctrl-group{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);margin-bottom:12px;overflow:hidden}
-.ctrl-head{display:flex;align-items:center;gap:12px;padding:13px 16px;cursor:pointer;user-select:none}
+.ctrl-head{display:flex;align-items:center;gap:14px;padding:16px 18px;cursor:pointer;user-select:none;flex-wrap:wrap;row-gap:10px}
 .ctrl-head:hover{background:var(--bg3)}
 .ctrl-chev{width:16px;height:16px;flex:none;color:var(--txt3);transition:transform .18s ease}
 .ctrl-group.open .ctrl-chev{transform:rotate(90deg)}
-.ctrl-head-name{font-weight:600;font-size:14px}
+.ctrl-head-name{font-weight:600;font-size:14.5px}
 .ctrl-head-count{font-size:11px;color:var(--txt3);font-family:var(--mono);margin-left:2px}
-.ctrl-head-status{margin-left:auto;font-family:var(--mono);font-size:12px;white-space:nowrap}
+.ctrl-status-pill{font-family:var(--mono);font-size:11.5px;font-weight:600;padding:4px 11px;border-radius:20px;white-space:nowrap;margin-left:auto}
 .ctrl-children{display:none;border-top:1px solid var(--line)}
 .ctrl-group.open .ctrl-children{display:block}
-.ctrl-child{display:flex;align-items:center;gap:12px;padding:10px 16px 10px 40px;position:relative;border-top:1px solid var(--line)}
+.ctrl-child{display:flex;align-items:center;gap:14px;padding:12px 18px 12px 42px;position:relative;border-top:1px solid var(--line);flex-wrap:wrap;row-gap:8px}
 .ctrl-child:first-child{border-top:none}
-.ctrl-child::before{content:'';position:absolute;left:22px;top:0;bottom:0;width:1px;background:var(--line2)}
-.ctrl-child::after{content:'';position:absolute;left:22px;top:50%;width:10px;height:1px;background:var(--line2)}
+.ctrl-child::before{content:'';position:absolute;left:24px;top:0;bottom:0;width:1px;background:var(--line2)}
+.ctrl-child::after{content:'';position:absolute;left:24px;top:50%;width:10px;height:1px;background:var(--line2)}
 .ctrl-child-name{font-size:13px;color:var(--txt2);font-family:var(--mono)}
-.ctrl-child-status{font-family:var(--mono);font-size:11.5px;white-space:nowrap}
-.ctrl-row-actions{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.ctrl-row-actions{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.ctrl-row-actions .btn{padding:9px 16px;font-size:13px}
+.ctrl-row-actions .btn-ic{width:40px;height:40px;padding:0}
+@media (max-width:860px){
+  .ctrl-status-pill{margin-left:0;flex:1 0 100%}
+  .ctrl-row-actions{flex:1 0 100%;justify-content:flex-start}
+  .ctrl-row-actions .btn{padding:10px 16px;font-size:13.5px}
+  .ctrl-row-actions .btn-ic{width:42px;height:42px}
+  .ctrl-child{padding-left:34px}
+  .ctrl-child::before,.ctrl-child::after{left:18px}
+}
 .card:last-child{margin-bottom:0}
 .ch{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px}
 .ct{font-family:var(--head);font-weight:700;font-size:14px}
@@ -129,7 +138,8 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 /* ── BACKUP LIST (many items support) ── */
 .bk-list{display:flex;flex-direction:column}
 /* each item */
-.bi{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}
+.bi{display:flex;align-items:center;gap:14px;padding:14px 16px;border-radius:10px;border:1px solid var(--line);margin-bottom:8px}
+.bi:last-child{margin-bottom:0}
 /* Most-recent backup archive — a slow, subtle breathing ring around the
    row (not a static line), so the newest restore point reads as "alive"
    at a glance rather than needing the person to compare timestamps.
@@ -140,14 +150,15 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
   0%,100%{box-shadow:inset 0 0 0 1.5px rgba(61,214,140,.55),0 0 8px rgba(61,214,140,.08)}
   50%{box-shadow:inset 0 0 0 1.5px rgba(61,214,140,1),0 0 20px rgba(61,214,140,.3)}
 }
-.bi-latest{border-radius:8px;animation:bi-latest-pulse 2.8s ease-in-out infinite}
-.bi:last-child{border-bottom:none}
+.bi-latest{border-radius:10px;animation:bi-latest-pulse 2.8s ease-in-out infinite}
 .bic{width:34px;height:34px;border-radius:8px;background:var(--bg4);display:flex;align-items:center;justify-content:center;flex-shrink:0}
 .bm{flex:1;min-width:0}
 .bid{font-family:var(--mono);font-size:11px;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .bif{font-size:12px;color:var(--txt3);margin-top:1px}
 .bsz{font-family:var(--mono);font-size:12px;color:var(--txt2);white-space:nowrap}
 .bi-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.bi-actions .btn{padding:9px 16px;font-size:13px}
+.bi-actions .btn-ic{width:40px;height:40px;padding:0}
 .bi-actions .btn-d{margin-left:8px}
 /* missing-on-disk backup item */
 .bi.file-missing{opacity:.45;pointer-events:none}
@@ -319,9 +330,11 @@ select.fi{cursor:pointer}
      to a dedicated full-width row below with room to breathe — previously
      all of this squeezed onto one row and Download/Delete ended up close
      enough together to mis-tap. */
-  .bi{flex-wrap:wrap;row-gap:10px;padding:12px 0}
+  .bi{flex-wrap:wrap;row-gap:10px;padding:14px 16px}
   .bsz{margin-left:auto}
   .bi-actions{flex:1 0 100%;justify-content:flex-end;gap:10px}
+  .bi-actions .btn{padding:10px 16px;font-size:13.5px}
+  .bi-actions .btn-ic{width:42px;height:42px}
   .bi-actions .btn-d{margin-left:auto}
 
   /* Discover Apps modal: stack the name/path block above the mode toggle */
@@ -1996,21 +2009,20 @@ function toggleCtrlGroup(id) {
 
 function ctrlStatusLabel(state, health, exitCode) {
   if (state === 'running') {
-    if (health === 'healthy') return ['var(--green-dk)', '● running · healthy'];
-    if (health === 'unhealthy') return ['var(--red)', '● running · unhealthy'];
-    if (health === 'starting') return ['var(--amber)', '● running · starting'];
-    return ['var(--green-dk)', '● running'];
+    if (health === 'unhealthy') return ['var(--red)', 'var(--rd)', '● running · unhealthy'];
+    if (health === 'starting') return ['var(--amber)', 'var(--ad)', '● running · starting'];
+    return ['var(--green-dk)', 'var(--gd)', health === 'healthy' ? '● running · healthy' : '● running'];
   }
-  if (state === 'paused') return ['var(--amber)', '⏸ paused'];
-  if (state === 'exited') return ['var(--red)', '● stopped' + (exitCode ? ` (exit ${exitCode})` : '')];
-  return ['var(--txt3)', '● ' + state];
+  if (state === 'paused') return ['var(--amber)', 'var(--ad)', '⏸ paused'];
+  if (state === 'exited') return ['var(--red)', 'var(--rd)', '● stopped' + (exitCode ? ` (exit ${exitCode})` : '')];
+  return ['var(--txt3)', 'var(--bg4)', '● ' + state];
 }
 
 function ctrlActionButtons(appId, appName, state, containerName) {
   const actions = [];
   if (state === 'running') {
-    actions.push(`<button class="btn btn-g btn-sm btn-ic" title="Restart" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','restart'${containerName?`,'${esc(containerName)}'`:''})">↻</button>`);
-    actions.push(`<button class="btn btn-g btn-sm btn-ic" title="Pause (docker pause — SIGSTOP)" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','pause'${containerName?`,'${esc(containerName)}'`:''})">⏸</button>`);
+    actions.push(`<button class="btn btn-g btn-sm" title="Restart" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','restart'${containerName?`,'${esc(containerName)}'`:''})">↻ Restart</button>`);
+    actions.push(`<button class="btn btn-g btn-sm" title="Pause (docker pause — SIGSTOP)" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','pause'${containerName?`,'${esc(containerName)}'`:''})">⏸ Pause</button>`);
     actions.push(`<button class="btn btn-d btn-sm" title="Stop" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','stop'${containerName?`,'${esc(containerName)}'`:''})">⏹ Stop</button>`);
   } else if (state === 'paused') {
     actions.push(`<button class="btn btn-g btn-sm" title="Resume (docker unpause)" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','unpause'${containerName?`,'${esc(containerName)}'`:''})">▶ Unpause</button>`);
@@ -2044,11 +2056,11 @@ function renderCtrl() {
     // Single real container — no group chrome needed, just a plain row.
     if (items.length <= 1) {
       const it = items[0];
-      const [col, label] = ctrlStatusLabel(it.state, it.health, it.exit_code);
+      const [col, bg, label] = ctrlStatusLabel(it.state, it.health, it.exit_code);
       return `<div class="ctrl-group">
         <div class="ctrl-head" style="cursor:default">
           <span class="ctrl-head-name">${esc(a.name)}</span>
-          <span class="ctrl-head-status" style="color:${col}">${label}</span>
+          <span class="ctrl-status-pill" style="color:${col};background:${bg}">${label}</span>
           <div class="ctrl-row-actions">${ctrlActionButtons(a.id, a.name, it.state)}</div>
         </div>
       </div>`;
@@ -2061,17 +2073,17 @@ function renderCtrl() {
     const worst = items.some(i => i.state === 'exited') ? 'exited'
       : items.some(i => i.state === 'paused') ? 'paused'
       : items.every(i => i.state === 'running') ? 'running' : 'unknown';
-    const [sumCol, sumLabelBase] = ctrlStatusLabel(worst, '', 0);
+    const [sumCol, sumBg, sumLabelBase] = ctrlStatusLabel(worst, '', 0);
     const sumLabel = worst === 'exited' || worst === 'paused'
       ? `${sumLabelBase} · ${running}/${items.length} running`
       : `${running}/${items.length} running`;
     const isOpen = _ctrlOpen.has(a.id);
 
     const childrenHtml = items.map(it => {
-      const [col, label] = ctrlStatusLabel(it.state, it.health, it.exit_code);
+      const [col, bg, label] = ctrlStatusLabel(it.state, it.health, it.exit_code);
       return `<div class="ctrl-child">
         <span class="ctrl-child-name">${esc(it.name)}</span>
-        <span class="ctrl-child-status" style="color:${col};margin-left:8px">${label}</span>
+        <span class="ctrl-status-pill" style="color:${col};background:${bg};margin-left:0">${label}</span>
         <div class="ctrl-row-actions">${ctrlActionButtons(a.id, a.name, it.state, it.name)}</div>
       </div>`;
     }).join('');
@@ -2081,11 +2093,11 @@ function renderCtrl() {
         <svg class="ctrl-chev" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
         <span class="ctrl-head-name">${esc(a.name)}</span>
         <span class="ctrl-head-count">${items.length} containers</span>
-        <span class="ctrl-head-status" style="color:${sumCol}">${sumLabel}</span>
+        <span class="ctrl-status-pill" style="color:${sumCol};background:${sumBg}">${sumLabel}</span>
         <div class="ctrl-row-actions" onclick="event.stopPropagation()">
-          <button class="btn btn-g btn-sm btn-ic" title="Restart all" onclick="appLifecycle('${a.id}','${esc(a.name)}','restart')">↻</button>
-          <button class="btn btn-g btn-sm btn-ic" title="Pause all (docker pause — SIGSTOP)" onclick="appLifecycle('${a.id}','${esc(a.name)}','pause')">⏸</button>
-          <button class="btn btn-d btn-sm" title="Stop all" onclick="appLifecycle('${a.id}','${esc(a.name)}','stop')">⏹ Stop all</button>
+          <button class="btn btn-g btn-sm" title="Restart every container in this group" onclick="appLifecycle('${a.id}','${esc(a.name)}','restart')">↻ Restart all</button>
+          <button class="btn btn-g btn-sm" title="Pause every container in this group (docker pause — SIGSTOP)" onclick="appLifecycle('${a.id}','${esc(a.name)}','pause')">⏸ Pause all</button>
+          <button class="btn btn-d btn-sm" title="Stop every container in this group" onclick="appLifecycle('${a.id}','${esc(a.name)}','stop')">⏹ Stop all</button>
         </div>
       </div>
       <div class="ctrl-children">${childrenHtml}</div>
