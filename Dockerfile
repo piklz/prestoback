@@ -31,7 +31,7 @@ VOLUME ["/data", "/volumes"]
 EXPOSE 8778
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -qO- http://localhost:8765/healthz || exit 1
+  CMD wget -qO- http://localhost:8778/healthz || exit 1
 
 ENTRYPOINT ["/app/prestoback"]
 CMD ["--port=8778", "--data=/data", "--volumes=/volumes"]
