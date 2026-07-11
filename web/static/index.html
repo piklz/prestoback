@@ -1556,9 +1556,43 @@ function openChangelogModal() {
     <div style="margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--line)">
       <div style="font-weight:600;font-size:14px;margin-bottom:4px">${esc(r.tag_name || r.name || '')}</div>
       <div style="font-size:11px;color:var(--txt3);margin-bottom:8px">${r.published_at ? new Date(r.published_at).toLocaleDateString() : ''}</div>
-      <div style="font-size:13px;color:var(--txt2);white-space:pre-wrap;line-height:1.5">${esc(r.body || '(no description)')}</div>
+      <div style="font-size:13px;color:var(--txt2);line-height:1.6">${mdLite(r.body) || '<span style="color:var(--txt3)">(no description)</span>'}</div>
     </div>`).join('');
   OM('m-changelog');
+}
+
+// mdLite — a small, safe subset markdown-to-HTML renderer for GitHub
+// release bodies (already boilerplate-stripped server-side, see
+// stripReleaseBoilerplate in selfupdatecheck.go). HTML-escapes the raw
+// text FIRST, then layers formatting on top via regex — so nothing in the
+// release body (including any stray literal HTML someone pasted into a
+// release description) can inject markup. Handles headings, **bold**,
+// [text](url) links (http/https only), inline `code`, and "* "/"- "
+// bullet lists — deliberately not a full CommonMark implementation, just
+// enough for what GitHub's auto-generated release notes actually contain.
+function mdLite(text) {
+  if (!text) return '';
+  let s = esc(text);
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener noreferrer" style="color:var(--accent,#6cf)">$1</a>');
+  s = s.replace(/`([^`]+)`/g, '<code style="background:var(--bg2,#1a1a1a);padding:1px 5px;border-radius:4px;font-size:12px">$1</code>');
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/^#{1,6}\s*(.+)$/gm, '<div style="font-weight:600;margin:10px 0 4px;color:var(--txt1)">$1</div>');
+
+  const lines = s.split('\n');
+  let out = [], inList = false;
+  for (const line of lines) {
+    const m = line.match(/^[*\-]\s+(.*)$/);
+    if (m) {
+      if (!inList) { out.push('<ul style="margin:2px 0 10px;padding-left:20px">'); inList = true; }
+      out.push('<li style="margin-bottom:3px">' + m[1] + '</li>');
+    } else {
+      if (inList) { out.push('</ul>'); inList = false; }
+      if (line.trim()) out.push('<div style="margin-bottom:6px">' + line + '</div>');
+    }
+  }
+  if (inList) out.push('</ul>');
+  return out.join('');
 }
 
 

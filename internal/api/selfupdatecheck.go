@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -29,11 +30,11 @@ const selfUpdateCheckInterval = 6 * time.Hour
 // PendingSelfUpdate is what's shown on the dashboard banner and re-sent to
 // Telegram until applied or dismissed.
 type PendingSelfUpdate struct {
-	LocalDigest  string           `json:"local_digest"`
-	RemoteDigest string           `json:"remote_digest"`
-	Releases     []GithubRelease  `json:"releases,omitempty"` // newest first; may be empty if changelog fetch failed
-	ChangelogErr string           `json:"changelog_err,omitempty"`
-	CheckedAt    time.Time        `json:"checked_at"`
+	LocalDigest  string          `json:"local_digest"`
+	RemoteDigest string          `json:"remote_digest"`
+	Releases     []GithubRelease `json:"releases,omitempty"` // newest first; may be empty if changelog fetch failed
+	ChangelogErr string          `json:"changelog_err,omitempty"`
+	CheckedAt    time.Time       `json:"checked_at"`
 }
 
 // GithubRelease mirrors backup.GithubRelease for the JSON the frontend sees
@@ -97,6 +98,9 @@ func (s *Server) checkSelfUpdate(notifyUser, force bool) (*PendingSelfUpdate, er
 			pending.ChangelogErr = cerr.Error()
 			log.Printf("[selfupdate] changelog fetch failed: %v", cerr)
 		} else {
+			for i := range releases {
+				releases[i].Body = stripReleaseBoilerplate(releases[i].Body)
+			}
 			pending.Releases = releases
 		}
 	} else {
@@ -141,7 +145,7 @@ func buildSelfUpdateMessage(p *PendingSelfUpdate) string {
 	if len(p.Releases) == 1 {
 		r := p.Releases[0]
 		sb.WriteString(fmt.Sprintf("*%s*\n", notify.EscapeMD(displayVersion(r))))
-		sb.WriteString(trimmedBody(r.Body, 500))
+		sb.WriteString(renderReleaseBodyTelegram(truncateRaw(r.Body, 500)))
 	} else if len(p.Releases) > 1 {
 		sb.WriteString(fmt.Sprintf("*%d new version\\(s\\)* since `%s`:\n\n", len(p.Releases), notify.EscapeMD(config.Version)))
 		for _, r := range p.Releases {
@@ -171,8 +175,8 @@ func buildFullChangelogMessage(p *PendingSelfUpdate) string {
 	sb.WriteString(fmt.Sprintf("📋 *%d new version\\(s\\) since `%s`*\n\n", len(p.Releases), notify.EscapeMD(config.Version)))
 	for _, r := range p.Releases {
 		sb.WriteString(fmt.Sprintf("*%s* — %s\n", notify.EscapeMD(displayVersion(r)), notify.EscapeMD(r.PublishedAt.Format("2006-01-02"))))
-		sb.WriteString(trimmedBody(r.Body, 800))
-		sb.WriteString("\n")
+		sb.WriteString(renderReleaseBodyTelegram(truncateRaw(r.Body, 800)))
+		sb.WriteString("\n\n")
 	}
 	return strings.TrimRight(sb.String(), "\n")
 }
@@ -184,21 +188,137 @@ func displayVersion(r GithubRelease) string {
 	return r.TagName
 }
 
-// trimmedBody escapes and hard-truncates a release body for MarkdownV2 —
-// Telegram messages are capped at 4096 chars, and release notes can run
-// long, especially summed across several versions.
-func trimmedBody(body string, max int) string {
+// ── Release body cleanup + Telegram markdown rendering ────────────────────────
+//
+// GitHub's auto-generated release notes (generate_release_notes: true, as
+// used by this repo's own docker-build.yml) come back as real markdown —
+// headings, **bold**, [links](url), "* item" bullets — plus boilerplate
+// that's useful on the GitHub releases page but just noise in a push
+// notification: an HTML comment GitHub embeds at the top, a "New
+// Contributors" section, and a trailing "**Full Changelog**: <compare-url>"
+// line. Both the Telegram message and the dashboard's changelog view (see
+// index.html's mdLite()) start from the same stripReleaseBoilerplate output,
+// so the two surfaces show consistent, cleaned-up content.
+
+var (
+	htmlCommentRe = regexp.MustCompile(`(?s)<!--.*?-->`)
+	mdHeadingRe   = regexp.MustCompile(`(?m)^#{1,6}\s*(.+?)\s*$`)
+	mdBulletRe    = regexp.MustCompile(`^[*\-]\s+`)
+	mdLinkRe      = regexp.MustCompile(`\[([^\]]+)\]\((https?://[^)\s]+)\)`)
+	mdBoldRe      = regexp.MustCompile(`\*\*([^*]+)\*\*`)
+)
+
+// stripReleaseBoilerplate removes GitHub's auto-generated filler, leaving
+// just the actual "What's Changed" bullets (and any other real content the
+// release body has) as markdown for renderReleaseBodyTelegram / mdLite to
+// format.
+func stripReleaseBoilerplate(body string) string {
+	body = htmlCommentRe.ReplaceAllString(body, "")
+
+	lines := strings.Split(body, "\n")
+	var out []string
+	skippingSection := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if m := mdHeadingRe.FindStringSubmatch(trimmed); m != nil {
+			skippingSection = strings.Contains(strings.ToLower(m[1]), "new contributors")
+			if skippingSection {
+				continue
+			}
+		}
+		if skippingSection {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "**Full Changelog**") || strings.HasPrefix(trimmed, "Full Changelog:") {
+			continue
+		}
+		out = append(out, line)
+	}
+	// Collapse 3+ blank lines left behind by the section removal down to one,
+	// so stripping "New Contributors" doesn't leave a visible gap.
+	cleaned := strings.Join(out, "\n")
+	for strings.Contains(cleaned, "\n\n\n") {
+		cleaned = strings.ReplaceAll(cleaned, "\n\n\n", "\n\n")
+	}
+	return strings.TrimSpace(cleaned)
+}
+
+// truncateRaw hard-truncates the RAW markdown (before rendering), not the
+// rendered MarkdownV2 output — cutting after rendering risks slicing a
+// message mid-escape-sequence or mid-link and corrupting Telegram's
+// formatting. Truncating the source text first, then rendering the
+// (shorter) result, is always safe.
+func truncateRaw(body string, max int) (out string) {
 	body = strings.TrimSpace(body)
+	if len(body) <= max {
+		return body
+	}
+	return strings.TrimSpace(body[:max]) + "…"
+}
+
+// renderReleaseBodyTelegram converts cleaned release markdown into real
+// Telegram MarkdownV2 formatting: headings become bold lines, "* "/"- "
+// bullets become "• ", **bold** becomes Telegram's bold, and [text](url)
+// links stay tappable — instead of running the whole body through
+// EscapeMD, which previously left every one of those as literal
+// backslash-escaped punctuation (e.g. "\*\*bold\*\*") rather than actual
+// formatting.
+func renderReleaseBodyTelegram(body string) string {
 	if body == "" {
 		return ""
 	}
-	truncated := len(body) > max
-	if truncated {
-		body = body[:max]
+	lines := strings.Split(body, "\n")
+	var out []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			out = append(out, "")
+			continue
+		}
+		if m := mdHeadingRe.FindStringSubmatch(trimmed); m != nil {
+			out = append(out, "*"+notify.EscapeMD(m[1])+"*")
+			continue
+		}
+		isBullet := mdBulletRe.MatchString(trimmed)
+		text := mdBulletRe.ReplaceAllString(trimmed, "")
+		text = renderInlineMDToTelegram(text)
+		if isBullet {
+			out = append(out, "• "+text)
+		} else {
+			out = append(out, text)
+		}
 	}
-	out := notify.EscapeMD(body) + "\n"
-	if truncated {
-		out += "…\n"
+	return strings.Trim(strings.Join(out, "\n"), "\n")
+}
+
+// renderInlineMDToTelegram escapes a single line of text for MarkdownV2
+// while preserving [text](url) links and **bold** spans as real formatting
+// rather than escaping every character indiscriminately. Links are
+// extracted to placeholders before EscapeMD runs (their URLs would
+// otherwise collide with EscapeMD's own reserved-character escaping), then
+// substituted back in as proper Telegram link syntax afterward.
+func renderInlineMDToTelegram(text string) string {
+	type link struct{ label, url string }
+	var links []link
+	text = mdLinkRe.ReplaceAllStringFunc(text, func(m string) string {
+		sub := mdLinkRe.FindStringSubmatch(m)
+		links = append(links, link{label: sub[1], url: sub[2]})
+		return fmt.Sprintf("\x00LINK%d\x00", len(links)-1)
+	})
+
+	// Bold markers get non-reserved placeholder bytes so EscapeMD passes
+	// them through untouched, then get swapped back to literal "*" after —
+	// simpler than teaching EscapeMD to skip a matched span.
+	text = mdBoldRe.ReplaceAllString(text, "\x01$1\x02")
+
+	escaped := notify.EscapeMD(text)
+	escaped = strings.ReplaceAll(escaped, "\x01", "*")
+	escaped = strings.ReplaceAll(escaped, "\x02", "*")
+
+	for i, l := range links {
+		placeholder := fmt.Sprintf("\x00LINK%d\x00", i) // no reserved chars — EscapeMD left it untouched
+		md := fmt.Sprintf("[%s](%s)", notify.EscapeMD(l.label), escapeMDURL(l.url))
+		escaped = strings.ReplaceAll(escaped, placeholder, md)
 	}
-	return out
+	return escaped
 }
