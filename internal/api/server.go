@@ -2766,17 +2766,23 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	// changelog into s.pendingSelfUpdate — the same state the "Update
 	// available" banner and Telegram's /selfupdate both read from, so all
 	// three surfaces agree on one check result instead of three separate ones.
-	pending, err := s.checkSelfUpdate(false, false)
+	pending, localDigest, remoteDigest, err := s.checkSelfUpdate(false, false)
 	if err != nil {
 		respond(w, 200, map[string]any{"available": false, "error": err.Error()})
 		return
 	}
 	if pending == nil {
+		// Up to date — localDigest/remoteDigest still came back from the
+		// registry check above (fixed bug: this used to send back empty
+		// strings here, which the dashboard rendered identically to "no
+		// registry digest at all", even when the check found real matching
+		// digests).
 		respond(w, 200, map[string]any{
 			"available":     false,
-			"local_digest":  "",
-			"remote_digest": "",
+			"local_digest":  localDigest,
+			"remote_digest": remoteDigest,
 			"image":         s.image,
+			"locally_built": localDigest == "local-build",
 		})
 		return
 	}
@@ -3131,7 +3137,7 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			return
 		}
 		_ = notify.SendRaw(tgCfg, "🔍 Checking for updates\\.\\.\\.")
-		pending, err := s.checkSelfUpdate(false, true) // force=true: always reply, even if the background loop already alerted
+		pending, _, _, err := s.checkSelfUpdate(false, true) // force=true: always reply, even if the background loop already alerted
 		if err != nil {
 			_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Update check failed: `%s`", notify.EscapeMD(err.Error())))
 			return
@@ -3156,7 +3162,7 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			return
 		}
 		_ = notify.SendRaw(tgCfg, "🔍 Fetching changelog from GitHub\\.\\.\\.")
-		pending, err := s.checkSelfUpdate(false, false)
+		pending, _, _, err := s.checkSelfUpdate(false, false)
 		if err != nil {
 			_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Changelog check failed: `%s`", notify.EscapeMD(err.Error())))
 			return

@@ -58,7 +58,7 @@ func (s *Server) selfUpdateCheckLoop() {
 	time.Sleep(3 * time.Minute) // stagger from updateCheckLoop's own startup delay
 	for {
 		if s.image != "" && s.selfName != "" {
-			s.checkSelfUpdate(true, false)
+			s.checkSelfUpdate(true, false) // return values unused here — pendingSelfUpdate is read from state by anything that needs it
 		}
 		time.Sleep(selfUpdateCheckInterval)
 	}
@@ -73,10 +73,23 @@ func (s *Server) selfUpdateCheckLoop() {
 //   - force: bypass the alert debounce — used by the /selfupdate command so
 //     an explicit user request always gets a reply, even if the background
 //     loop already alerted about this same update earlier.
-func (s *Server) checkSelfUpdate(notifyUser, force bool) (*PendingSelfUpdate, error) {
+//
+// Returns (pending, localDigest, remoteDigest, err). pending is nil when
+// already up to date — but localDigest/remoteDigest are still populated in
+// that case. This distinction matters: BUG FIXED HERE — the previous
+// version only surfaced the digests on PendingSelfUpdate, which is nil on
+// the up-to-date path, so handleUpdateCheck's "up to date" branch had
+// nothing to show and fell back to empty strings, which the dashboard then
+// rendered as "local build (no registry digest)" — visually identical to
+// the genuine no-RepoDigests case, even though the real check succeeded
+// with real matching digests (confirmed via container logs: "local digest"
+// and "remote digest" both logged correctly, hasUpdate=false). Callers
+// that just want "what did the digest comparison find" should read the
+// digest return values directly, not pending.LocalDigest/RemoteDigest.
+func (s *Server) checkSelfUpdate(notifyUser, force bool) (pending *PendingSelfUpdate, localDigest, remoteDigest string, err error) {
 	hasUpdate, local, remote, err := backup.ForceCheckForUpdate(s.image)
 	if err != nil {
-		return nil, err
+		return nil, "", "", err
 	}
 
 	if !hasUpdate {
@@ -84,10 +97,10 @@ func (s *Server) checkSelfUpdate(notifyUser, force bool) (*PendingSelfUpdate, er
 		s.pendingSelfUpdate = nil
 		s.selfUpdateAlertSent = false
 		s.stateMu.Unlock()
-		return nil, nil
+		return nil, local, remote, nil
 	}
 
-	pending := &PendingSelfUpdate{
+	p := &PendingSelfUpdate{
 		LocalDigest:  local,
 		RemoteDigest: remote,
 		CheckedAt:    time.Now(),
@@ -95,20 +108,20 @@ func (s *Server) checkSelfUpdate(notifyUser, force bool) (*PendingSelfUpdate, er
 	if repo := githubRepo(); repo != "" {
 		releases, cerr := backup.FetchReleasesSince(repo, config.Version)
 		if cerr != nil {
-			pending.ChangelogErr = cerr.Error()
+			p.ChangelogErr = cerr.Error()
 			log.Printf("[selfupdate] changelog fetch failed: %v", cerr)
 		} else {
 			for i := range releases {
 				releases[i].Body = stripReleaseBoilerplate(releases[i].Body)
 			}
-			pending.Releases = releases
+			p.Releases = releases
 		}
 	} else {
-		pending.ChangelogErr = "PRESTOBACK_GITHUB_REPO not configured — set it to show release notes here"
+		p.ChangelogErr = "PRESTOBACK_GITHUB_REPO not configured — set it to show release notes here"
 	}
 
 	s.stateMu.Lock()
-	s.pendingSelfUpdate = pending
+	s.pendingSelfUpdate = p
 	alreadyAlerted := s.selfUpdateAlertSent
 	if !alreadyAlerted || force {
 		s.selfUpdateAlertSent = true
@@ -119,7 +132,7 @@ func (s *Server) checkSelfUpdate(notifyUser, force bool) (*PendingSelfUpdate, er
 		nc := s.cfg.GetNotify()
 		if nc.TelegramEnabled && nc.TelegramToken != "" && nc.TelegramChatID != "" {
 			tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
-			text := buildSelfUpdateMessage(pending)
+			text := buildSelfUpdateMessage(p)
 			btns := []notify.ButtonAction{
 				{Label: "🔄 Update now", Data: "selfupdate:apply"},
 				{Label: "📋 Full changelog", Data: "selfupdate:changelog"},
@@ -131,7 +144,7 @@ func (s *Server) checkSelfUpdate(notifyUser, force bool) (*PendingSelfUpdate, er
 		}
 	}
 
-	return pending, nil
+	return p, local, remote, nil
 }
 
 // buildSelfUpdateMessage renders a short "update available" summary —
