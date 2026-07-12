@@ -56,6 +56,22 @@ type AppConfig struct {
 	ContainerName string         `json:"container_name,omitempty"`
 	Volumes       []VolumeConfig `json:"volumes"`
 
+	// CreatedAt fixes app ordering. apps is a Go map (see Config below),
+	// and map iteration order is deliberately randomized by the runtime —
+	// ListApps used to range over it with no sort at all, so the
+	// Applications page could come back in a different order on every
+	// single load, including right after saving an unrelated field on a
+	// different app entirely (a reported bug: editing one app's schedule
+	// and going back to the list changed everyone's position). CreatedAt
+	// gives ListApps a stable, meaningful sort key — the order apps were
+	// actually added in — instead of whatever order the map's internal
+	// hash table happened to produce this time. Omitted from existing
+	// configs predating this field; ListApps' sort falls back to Name for
+	// any two apps that both have a zero CreatedAt, so pre-existing apps
+	// still sort deterministically (just alphabetically) rather than
+	// randomly, without needing a migration.
+	CreatedAt time.Time `json:"created_at,omitempty"`
+
 	// PreBackupCmd is an optional shell command run BEFORE container stop and
 	// archiving begins — e.g. `docker exec postgres pg_dump -U app app > /volumes/app/dump.sql`.
 	// Runs via `sh -c`, output streamed to SSE logs. Failures are logged but
@@ -419,6 +435,12 @@ func (c *Config) save() error {
 	for _, a := range c.apps {
 		d.Apps = append(d.Apps, a)
 	}
+	sort.Slice(d.Apps, func(i, j int) bool {
+		if !d.Apps[i].CreatedAt.Equal(d.Apps[j].CreatedAt) {
+			return d.Apps[i].CreatedAt.Before(d.Apps[j].CreatedAt)
+		}
+		return d.Apps[i].Name < d.Apps[j].Name
+	})
 	for _, u := range c.users {
 		d.Users = append(d.Users, u)
 	}
@@ -462,6 +484,21 @@ func (c *Config) ListApps() []AppConfig {
 	for _, a := range c.apps {
 		out = append(out, a)
 	}
+	// c.apps is a map — iteration order above is randomized by the Go
+	// runtime, not just "unspecified once and stable after that." Without
+	// this sort, GET /api/apps could (and did) come back in a different
+	// order on every single call, so the Applications page visibly
+	// reshuffled on any reload, including one triggered by saving a
+	// completely unrelated field on a different app. CreatedAt gives a
+	// real, stable ordering (the order apps were added); Name is only the
+	// tie-break for apps predating that field, whose CreatedAt is the zero
+	// value and would otherwise all tie against each other.
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].Name < out[j].Name
+	})
 	return out
 }
 
@@ -503,6 +540,9 @@ func (c *Config) AddApp(a AppConfig) error {
 	if a.Retain <= 0 {
 		a.Retain = 5
 	}
+	if a.CreatedAt.IsZero() {
+		a.CreatedAt = time.Now()
+	}
 	// Normalise volumes
 	for i := range a.Volumes {
 		if a.Volumes[i].Slug == "" {
@@ -523,8 +563,16 @@ func (c *Config) AddApp(a AppConfig) error {
 func (c *Config) UpdateApp(a AppConfig) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, exists := c.apps[a.ID]; !exists {
+	existing, exists := c.apps[a.ID]
+	if !exists {
 		return fmt.Errorf("app '%s' not found", a.ID)
+	}
+	// The Edit App form has no CreatedAt field and never sends one back —
+	// without this, every save would silently zero it out again (a is a
+	// fresh struct built from the request body), right back to the
+	// map-iteration-order bug ListApps' sort exists to fix.
+	if a.CreatedAt.IsZero() {
+		a.CreatedAt = existing.CreatedAt
 	}
 	// The Edit App UI exposes a single "Config directory path" field, which
 	// maps to the top-level Path — but Path is normally just a *computed*

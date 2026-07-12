@@ -122,10 +122,10 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
    shell the Backups page already uses so the two pages feel consistent. */
 .ctrl-toolbar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}
 .ctrl-chip-row{display:flex;gap:8px;flex-wrap:wrap}
-.ctrl-filter-chip{display:inline-flex;align-items:center;gap:6px;padding:6px 13px;border-radius:99px;border:1px solid var(--line2);background:var(--bg2);color:var(--txt2);font-size:12px;cursor:pointer;user-select:none;transition:border-color .15s,color .15s}
-.ctrl-filter-chip:hover{border-color:var(--accent);color:var(--txt)}
-.ctrl-filter-chip.active{border-color:var(--accent);color:var(--accent);background:var(--bld)}
-.ctrl-filter-chip .cnt{font-family:var(--mono);font-size:10.5px;color:inherit;opacity:.75}
+.ctrl-filter-chip,.filter-chip{display:inline-flex;align-items:center;gap:6px;padding:6px 13px;border-radius:99px;border:1px solid var(--line2);background:var(--bg2);color:var(--txt2);font-size:12px;cursor:pointer;user-select:none;transition:border-color .15s,color .15s}
+.ctrl-filter-chip:hover,.filter-chip:hover{border-color:var(--accent);color:var(--txt)}
+.ctrl-filter-chip.active,.filter-chip.active{border-color:var(--accent);color:var(--accent);background:var(--bld)}
+.ctrl-filter-chip .cnt,.filter-chip .cnt{font-family:var(--mono);font-size:10.5px;color:inherit;opacity:.75}
 .ctrl-sort-toggle{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--txt3)}
 .card:last-child{margin-bottom:0}
 .ch{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px}
@@ -654,7 +654,9 @@ select.fi{cursor:pointer}
   <div class="sec">
     <div class="card">
       <div class="ch"><div class="ct">Event log</div><span id="hist-count" class="pill pb">0 events</span></div>
+      <div class="ctrl-chip-row" id="hist-filter-chips" style="padding:14px 18px 0"></div>
       <div class="cb" id="hist-body"><div style="color:var(--txt3)">Loading…</div></div>
+      <div style="padding:14px 18px;text-align:center" id="hist-more-wrap"></div>
     </div>
   </div>
 </div>
@@ -2203,8 +2205,19 @@ function renderApps() {
     // click here instead of a chat command. Only shown for apps that
     // actually have a cron schedule configured — toggling means nothing
     // for a manual-only app.
+    // Resume gets the same --amber token as the paused pill's ring above —
+    // one color meaning "this schedule needs your attention" wherever it
+    // shows up, instead of a plain grey button next to an amber pill that
+    // don't visually agree they're describing the same state. (Pause,
+    // going the other direction, stays the neutral grey action button —
+    // there's nothing alarming about an *active* schedule.) Driven by the
+    // existing --amber/--bg4 CSS variables rather than a hardcoded color,
+    // so this stays correct automatically if/when a broader theme system
+    // (light/dark, alternate palettes) changes what --amber resolves to.
     const schedToggleBtn = a.schedule?.cron_expr
-      ? `<button class="btn btn-g btn-sm btn-ic" title="${a.schedule.enabled ? 'Pause backup schedule (/schedpause)' : 'Resume backup schedule (/schedresume)'}" onclick="toggleAppSchedule('${a.id}')">${a.schedule.enabled ? '⏸' : '▶'}</button>`
+      ? a.schedule.enabled
+        ? `<button class="btn btn-g btn-sm btn-ic" title="Pause backup schedule (/schedpause)" onclick="toggleAppSchedule('${a.id}')">⏸</button>`
+        : `<button class="btn btn-sm btn-ic" style="background:var(--bg4);color:var(--amber,#f0a020);border:1px solid var(--amber,#f0a020)" title="Resume backup schedule (/schedresume) — currently paused" onclick="toggleAppSchedule('${a.id}')">▶</button>`
       : '';
     return `<tr class="${rowCls}">
       <td data-label="Application"><div class="an">${esc(a.name)}${cntHtml}${updBadge}</div>${healthBadge}</td>
@@ -3579,24 +3592,81 @@ async function uploadBackupFile(file, appID) {
 }
 
 // ════════════════════ History ════════════════════
-async function loadHistory() {
+// The panel used to fetch and render up to 100 entries in one shot with no
+// way to see more or narrow it down — as the log fills up toward
+// history.go's own 500-entry cap, that's an ever-growing single block of
+// DOM, which is what "getting long and large" actually meant (the
+// underlying storage itself is already capped — see history.go's
+// maxEntries/maxBytesOnDisk). Paginated in fixed pages instead, with a
+// Load More footer, plus filter chips so "just backup failures" doesn't
+// mean scrolling past everything else to find them.
+const HIST_PAGE_SIZE = 30;
+const HIST_EVENT_DEFS = [
+  ['', 'All', ''],
+  ['backup_success', '✅ Backup OK', ''],
+  ['backup_fail', '❌ Backup failed', ''],
+  ['restore_success', '🔄 Restore OK', ''],
+  ['restore_fail', '💥 Restore failed', ''],
+  ['push_success', '⇪ Push OK', ''],
+  ['push_fail', '⚠ Push failed', ''],
+];
+
+async function loadHistory(append) {
+  const body = document.getElementById('hist-body');
+  const moreWrap = document.getElementById('hist-more-wrap');
+  if (!body) return;
+  if (!append) {
+    S.histOffset = 0;
+    S.histEntries = [];
+    S.histTotal = 0;
+    if (S.histFilter === undefined) S.histFilter = '';
+    body.innerHTML = '<div style="color:var(--txt3)">Loading…</div>';
+  }
   try {
-    const entries = await api('/api/history') || [];
-    document.getElementById('hist-count').textContent = entries.length + ' events';
-    const body = document.getElementById('hist-body');
-    if (!entries.length) { body.innerHTML='<div style="color:var(--txt2)">No history yet.</div>'; return; }
-    body.innerHTML = entries.map(e => {
-      const icons={'backup_success':'✅','backup_fail':'❌','restore_success':'🔄','restore_fail':'💥','push_success':'⇪','push_fail':'⚠'};
-      return `<div class="hi">
+    const q = new URLSearchParams({limit: HIST_PAGE_SIZE, offset: S.histOffset});
+    if (S.histFilter) q.set('event', S.histFilter);
+    const r = await api('/api/history?' + q.toString());
+    const page = r.entries || [];
+    S.histEntries = append ? S.histEntries.concat(page) : page;
+    S.histTotal = r.total || 0;
+    S.histOffset += page.length;
+
+    document.getElementById('hist-count').textContent =
+      (S.histFilter ? `${S.histTotal} matching` : `${S.histTotal} events`);
+    renderHistoryChips();
+
+    if (!S.histEntries.length) {
+      body.innerHTML = `<div style="color:var(--txt2)">${S.histFilter ? 'No matching events.' : 'No history yet.'}</div>`;
+      moreWrap.innerHTML = '';
+      return;
+    }
+    const icons={'backup_success':'✅','backup_fail':'❌','restore_success':'🔄','restore_fail':'💥','push_success':'⇪','push_fail':'⚠'};
+    body.innerHTML = S.histEntries.map(e => `<div class="hi">
         <div class="hic">${icons[e.event]||'📋'}</div>
         <div style="flex:1">
           <div style="font-weight:500">${esc(e.app_name)} <span style="font-family:var(--mono);font-size:11px;color:var(--txt3)">${e.event}</span></div>
           <div style="font-size:12px;color:var(--txt3)">${esc(e.detail)}</div>
         </div>
         <div style="font-family:var(--mono);font-size:11px;color:var(--txt3);white-space:nowrap">${new Date(e.time).toLocaleString()}</div>
-      </div>`;
-    }).join('');
+      </div>`).join('');
+
+    moreWrap.innerHTML = S.histOffset < S.histTotal
+      ? `<button class="btn btn-g btn-sm" onclick="loadHistory(true)">Load more (${S.histTotal - S.histOffset} remaining)</button>`
+      : (S.histTotal > HIST_PAGE_SIZE ? `<span style="font-size:12px;color:var(--txt3)">— end of log —</span>` : '');
   } catch(e) { toast(e.message,'error'); }
+}
+
+function renderHistoryChips() {
+  const el = document.getElementById('hist-filter-chips');
+  if (!el) return;
+  el.innerHTML = HIST_EVENT_DEFS.map(([key, label]) =>
+    `<div class="filter-chip${(S.histFilter||'')===key?' active':''}" onclick="setHistFilter('${key}')">${label}</div>`
+  ).join('');
+}
+
+function setHistFilter(key) {
+  S.histFilter = key;
+  loadHistory();
 }
 
 // ════════════════════ Notifications ════════════════════

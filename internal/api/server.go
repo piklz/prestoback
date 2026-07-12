@@ -308,7 +308,31 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // ── History ───────────────────────────────────────────────────────────────────
 
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
-	respond(w, 200, s.hist.List(100))
+	// limit/offset/event are all optional — no query params at all
+	// reproduces the old behavior (first 100, unfiltered) for any other
+	// caller of this endpoint, just with "total" added alongside so the
+	// History page can show "X of Y" and know whether more pages exist.
+	limit := 100
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	offset := 0
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	eventFilter := r.URL.Query().Get("event")
+
+	entries, total := s.hist.ListPage(limit, offset, eventFilter)
+	respond(w, 200, map[string]any{
+		"entries": entries,
+		"total":   total,
+		"offset":  offset,
+		"limit":   limit,
+	})
 }
 
 // ── Notifications ─────────────────────────────────────────────────────────────
