@@ -1119,13 +1119,62 @@ func (s *Server) handleContainerControlLifecycle(w http.ResponseWriter, r *http.
 	// process serving this request, and this endpoint takes raw container
 	// names that could be called directly.
 	selfName := strings.TrimPrefix(strings.TrimSpace(s.selfName), "/")
-	if selfName != "" && action != "restart" {
-		for _, n := range body.Names {
-			if strings.EqualFold(strings.TrimPrefix(n, "/"), selfName) {
-				errOut(w, 400, "refusing to "+action+" PrestoBack's own container — restart is the only action available for the app you're currently using")
-				return
-			}
+	targetsSelf := false
+	othersOnly := make([]string, 0, len(body.Names))
+	for _, n := range body.Names {
+		if selfName != "" && strings.EqualFold(strings.TrimPrefix(n, "/"), selfName) {
+			targetsSelf = true
+			continue
 		}
+		othersOnly = append(othersOnly, n)
+	}
+	if targetsSelf && action != "restart" {
+		errOut(w, 400, "refusing to "+action+" PrestoBack's own container — restart is the only action available for the app you're currently using")
+		return
+	}
+	if targetsSelf && action == "restart" && len(othersOnly) == 0 {
+		// A plain `docker restart` here acts on the very container running
+		// this request — the command that's supposed to bring it back up
+		// gets severed partway through when the container it's issued from
+		// goes down, which is what previously left PrestoBack needing a
+		// manual restart from the host. SelfUpdate already solves this
+		// exact problem for the update flow via a detached helper container
+		// (spawned over the Docker socket, so it keeps running after this
+		// container is gone) — SelfRestart reuses that same mechanism, just
+		// without pulling a new image. Same async/202 pattern as
+		// handleUpdateApply, for the same reason: the response needs to go
+		// out before the container it's coming from disappears.
+		if s.image == "" {
+			errOut(w, 400, "PRESTOBACK_IMAGE must be set to safely restart PrestoBack's own container")
+			return
+		}
+		s.stateMu.Lock()
+		busy := s.updateRunning
+		s.stateMu.Unlock()
+		if busy {
+			errOut(w, 409, "an update or stack operation is in progress — please wait for it to finish first")
+			return
+		}
+		respond(w, 202, map[string]any{"status": "restart started", "self": true})
+		go func() {
+			if err := backup.SelfRestart(s.selfName, s.engine.AnyRunning, s.engine.EmitUpdate); err != nil {
+				log.Printf("[lifecycle:control] self-restart error: %v", err)
+				s.engine.EmitUpdate(backup.UpdateResult{Stage: "error", Message: "Restart failed", Error: err.Error()})
+			}
+		}()
+		return
+	}
+	// targetsSelf && action == "restart" && len(othersOnly) > 0: a
+	// group-level "Restart all" swept up PrestoBack's own container
+	// alongside real siblings (only possible if PrestoBack itself is
+	// depends_on-linked into a compose group). Restart the siblings
+	// normally below via othersOnly — self is excluded here and needs its
+	// own dedicated Restart click, since bundling it into the same
+	// synchronous batch as other containers doesn't fit the async
+	// helper-based path SelfRestart requires.
+	selfSkipped := targetsSelf && action == "restart" && len(othersOnly) > 0
+	if selfSkipped {
+		body.Names = othersOnly
 	}
 
 	s.stateMu.Lock()
@@ -1157,11 +1206,12 @@ func (s *Server) handleContainerControlLifecycle(w http.ResponseWriter, r *http.
 	emit(fmt.Sprintf("━━━ %s %s: %s (%s) ━━━", action, map[bool]string{true: "complete", false: "failed"}[len(failed) == 0], target, formatDuration(dur)))
 
 	respond(w, 200, map[string]any{
-		"names":       body.Names,
-		"action":      action,
-		"success":     len(failed) == 0,
-		"failed":      failed,
-		"duration_ms": dur.Milliseconds(),
+		"names":        body.Names,
+		"action":       action,
+		"success":      len(failed) == 0,
+		"failed":       failed,
+		"duration_ms":  dur.Milliseconds(),
+		"self_skipped": selfSkipped,
 	})
 }
 

@@ -54,13 +54,17 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
    + redis + postgres) renders as an expandable group, same idea as
    Portainer/Dockge's stack view: one summary header with aggregate status
    and bulk actions, expanding to each container's own state + controls. */
-.ctrl-group{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);margin-bottom:12px;overflow:hidden}
+.ctrl-group{background:var(--bg2);border:1px solid var(--line);border-left:3px solid var(--line2);border-radius:var(--r);margin-bottom:12px;overflow:hidden}
+.ctrl-group.st-bad{border-left-color:var(--red)}
+.ctrl-group.st-warn{border-left-color:var(--amber)}
+.ctrl-group.st-ok{border-left-color:var(--green-dk)}
+.ctrl-group.st-self{border-left-color:var(--purple)}
 .ctrl-head{display:flex;align-items:center;gap:14px;padding:16px 18px;cursor:pointer;user-select:none;flex-wrap:wrap;row-gap:10px}
 .ctrl-head:hover{background:var(--bg3)}
 .ctrl-chev{width:16px;height:16px;flex:none;color:var(--txt3);transition:transform .18s ease}
 .ctrl-group.open .ctrl-chev{transform:rotate(90deg)}
-.ctrl-head-name{font-weight:600;font-size:14.5px}
-.ctrl-head-count{font-size:11px;color:var(--txt3);font-family:var(--mono);margin-left:2px}
+.ctrl-head-name{font-weight:600;font-size:14.5px;white-space:nowrap}
+.ctrl-head-count{font-size:11px;color:var(--txt3);font-family:var(--mono);margin-left:2px;white-space:nowrap}
 .ctrl-status-pill{font-family:var(--mono);font-size:11.5px;font-weight:600;padding:4px 11px;border-radius:20px;white-space:nowrap;margin-left:auto}
 .ctrl-children{display:none;border-top:1px solid var(--line)}
 .ctrl-group.open .ctrl-children{display:block}
@@ -68,14 +72,20 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .ctrl-child:first-child{border-top:none}
 .ctrl-child::before{content:'';position:absolute;left:24px;top:0;bottom:0;width:1px;background:var(--line2)}
 .ctrl-child::after{content:'';position:absolute;left:24px;top:50%;width:10px;height:1px;background:var(--line2)}
-.ctrl-child-name{font-size:13px;color:var(--txt2);font-family:var(--mono)}
+.ctrl-child-name{font-size:13px;color:var(--txt2);font-family:var(--mono);white-space:nowrap}
 .ctrl-row-actions{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .ctrl-row-actions .btn{padding:9px 16px;font-size:13px}
 .ctrl-row-actions .btn-ic{width:40px;height:40px;padding:0}
 .ctrl-backed-badge{font-size:10.5px;font-family:var(--mono);padding:3px 9px;border-radius:20px;white-space:nowrap;color:var(--green-dk);background:var(--gd)}
 .ctrl-unmanaged-badge{font-size:10.5px;font-family:var(--mono);padding:3px 9px;border-radius:20px;white-space:nowrap;color:var(--txt3);background:var(--bg4);border:1px dashed var(--line2)}
 .ctrl-self-note{font-size:11.5px;color:var(--purple);background:var(--pd);border-radius:0 0 var(--r) var(--r);padding:8px 18px;line-height:1.4}
-.ctrl-image{font-size:10.5px;color:var(--txt3);font-family:var(--mono)}
+/* Image refs (e.g. ghcr.io/immich-app/immich-server:release) are often the
+   longest string in the row — on desktop, where flex-wrap has room to keep
+   everything on one line, an untruncated image name was what made the row
+   feel messy/uneven compared to mobile's forced one-item-per-line stacking.
+   Capping width + ellipsis keeps every row the same rhythm; the full value
+   is still one hover away via the title attribute. */
+.ctrl-image{font-size:10.5px;color:var(--txt3);font-family:var(--mono);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 @media (max-width:860px){
   .ctrl-status-pill{margin-left:0;flex:1 0 100%}
   .ctrl-row-actions{flex:1 0 100%;justify-content:flex-start}
@@ -83,7 +93,18 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
   .ctrl-row-actions .btn-ic{width:42px;height:42px}
   .ctrl-child{padding-left:34px}
   .ctrl-child::before,.ctrl-child::after{left:18px}
+  .ctrl-image{max-width:160px}
 }
+/* Container Control toolbar — filter chips (All/Running/Stopped/Paused/
+   Unmanaged) plus a status-first/alphabetical sort toggle, same chips-wrap
+   shell the Backups page already uses so the two pages feel consistent. */
+.ctrl-toolbar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}
+.ctrl-chip-row{display:flex;gap:8px;flex-wrap:wrap}
+.ctrl-filter-chip{display:inline-flex;align-items:center;gap:6px;padding:6px 13px;border-radius:99px;border:1px solid var(--line2);background:var(--bg2);color:var(--txt2);font-size:12px;cursor:pointer;user-select:none;transition:border-color .15s,color .15s}
+.ctrl-filter-chip:hover{border-color:var(--accent);color:var(--txt)}
+.ctrl-filter-chip.active{border-color:var(--accent);color:var(--accent);background:var(--bld)}
+.ctrl-filter-chip .cnt{font-family:var(--mono);font-size:10.5px;color:inherit;opacity:.75}
+.ctrl-sort-toggle{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--txt3)}
 .card:last-child{margin-bottom:0}
 .ch{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px}
 .ct{font-family:var(--head);font-weight:700;font-size:14px}
@@ -553,6 +574,13 @@ select.fi{cursor:pointer}
     <div class="ha"><button class="btn btn-g btn-sm" onclick="refreshContainerControl()">↺ Refresh</button></div>
   </div>
   <div class="sec">
+    <div class="ctrl-toolbar" id="ctrl-toolbar" style="display:none;margin-bottom:14px">
+      <div class="ctrl-chip-row" id="ctrl-filter-chips"></div>
+      <div class="ctrl-sort-toggle">
+        Sort:
+        <button class="btn btn-g btn-sm" id="ctrl-sort-btn" onclick="toggleCtrlSort()"></button>
+      </div>
+    </div>
     <div class="empty" id="ctrl-empty"><div class="ei"><svg width="22" height="22" fill="none" stroke="var(--txt3)" stroke-width="1.5" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg></div><div class="et">No containers found</div><div class="es">Docker socket may not be reachable, or nothing is running yet.</div></div>
     <div id="ctrl-list" style="display:none"></div>
   </div>
@@ -1195,6 +1223,8 @@ const S = {
   orphanIDs:[],      // appIDs found on disk but not in config
   containerHealth:{}, // appID → {state, health, name}
   ctrlGroups:[],      // Container Control's own data — [{anchor, containers:[...]}], null if last fetch failed
+  ctrlFilter:'all',   // 'all' | 'running' | 'stopped' | 'paused' | 'unmanaged' — which groups renderCtrl shows
+  ctrlSort:'status',  // 'status' (needs-attention first) | 'name' (alphabetical, the old fixed order)
   bkPage:0, bkPerPage:20, bkAll:[],
 };
 const VIEWS = ['dash','apps','ctrl','bk','hist','settings'];
@@ -1915,11 +1945,30 @@ async function appLifecycle(id, name, action, container) {
 // container on the host, including ones with no registered app at all (see
 // handleContainerControlLifecycle on the backend). names is an array so a
 // group-level button can act on every container in that group in one call.
-async function containerLifecycle(names, label, action) {
+async function containerLifecycle(names, label, action, isSelf) {
+  if (isSelf && action === 'restart') {
+    // PrestoBack restarting itself: routed server-side through the same
+    // detached-helper mechanism the self-update flow uses (see
+    // backup.SelfRestart) instead of a plain docker restart, which used to
+    // leave the container needing a manual restart from the host. The
+    // response may never arrive since this process goes down mid-request —
+    // same expected-network-error handling as applyUpdate() in Settings.
+    toast('PrestoBack restarting — reconnect in ~10s', 'warn');
+    addLog('_system', '↻ PrestoBack restart initiated (Container Control) — container will restart…', 'info');
+    try {
+      await api('/api/containers/lifecycle', {method:'POST', body: JSON.stringify({names, action})});
+    } catch(e) {
+      if (e.message && !e.message.includes('fetch') && !e.message.includes('Failed to fetch') && !e.message.includes('NetworkError')) {
+        toast('Restart error: '+e.message, 'error');
+      }
+    }
+    return;
+  }
   try {
     const r = await api('/api/containers/lifecycle', {method:'POST', body: JSON.stringify({names, action})});
-    if (r.success) toast(`${label}: ${action} complete`, 'success');
-    else toast(`${label}: ${action} failed — ${(r.failed||[]).join('; ')}`, 'error');
+    const skippedNote = r.self_skipped ? ' (PrestoBack itself was skipped — restart it separately from its own entry)' : '';
+    if (r.success) toast(`${label}: ${action} complete${skippedNote}`, 'success');
+    else toast(`${label}: ${action} failed — ${(r.failed||[]).join('; ')}${skippedNote}`, 'error');
   } catch(e) {
     toast(e.message, 'error');
   } finally {
@@ -2173,7 +2222,7 @@ function ctrlActionButtons(names, label, state, isSelf) {
     // Enforced server-side too (handleContainerControlLifecycle) — this is
     // just keeping the UI from offering an action that'll be rejected.
     return state === 'running'
-      ? `<button class="btn btn-g btn-sm" title="Restart PrestoBack" onclick='event.stopPropagation();containerLifecycle(${JSON.stringify(names)},${JSON.stringify(label)},"restart")'>↻ Restart</button>`
+      ? `<button class="btn btn-g btn-sm" title="Restart PrestoBack" onclick='event.stopPropagation();containerLifecycle(${JSON.stringify(names)},${JSON.stringify(label)},"restart",true)'>↻ Restart</button>`
       : '';
   }
   const actions = [];
@@ -2206,18 +2255,83 @@ function toggleCtrlGroup(anchor) {
   renderCtrl();
 }
 
+// Classifies one group's aggregate state once, up front — reused for the
+// left status-accent border, the default "needs attention first" sort, and
+// filter-chip matching, so all three stay in sync automatically instead of
+// three separate ad-hoc checks drifting apart over time.
+function ctrlGroupInfo(g) {
+  const items = g.containers || [];
+  const hasExited = items.some(i => i.state === 'exited');
+  const hasPaused = items.some(i => i.state === 'paused');
+  const hasUnhealthy = items.some(i => i.state === 'running' && i.health === 'unhealthy');
+  const hasSelf = items.some(i => i.is_self);
+  const hasUnmanaged = items.some(i => !i.backed_up_as);
+  // Sort priority: lower rises to the top. Stopped containers are the most
+  // actionable ("did I forget this was down?"), then paused, then
+  // running-but-unhealthy, then everything genuinely fine.
+  const priority = hasExited ? 0 : hasPaused ? 1 : hasUnhealthy ? 2 : 3;
+  const borderClass = hasSelf ? 'st-self' : hasExited ? 'st-bad' : (hasPaused || hasUnhealthy) ? 'st-warn' : 'st-ok';
+  return {g, items, priority, hasExited, hasPaused, hasUnhealthy, hasSelf, hasUnmanaged, borderClass};
+}
+
+function ctrlMatchesFilter(info, filter) {
+  switch (filter) {
+    case 'running':   return info.items.some(i => i.state === 'running');
+    case 'stopped':   return info.hasExited;
+    case 'paused':    return info.hasPaused;
+    case 'unmanaged': return info.hasUnmanaged;
+    default:          return true; // 'all'
+  }
+}
+
+function setCtrlFilter(f) { S.ctrlFilter = f; renderCtrl(); }
+function toggleCtrlSort() { S.ctrlSort = S.ctrlSort === 'status' ? 'name' : 'status'; renderCtrl(); }
+
+// Filter chips show live counts (containers, not groups — a chip that says
+// "3" should mean 3 actual containers) and the sort toggle flips between
+// "problems first" (the new default) and the plain alphabetical order this
+// page used exclusively before.
+function renderCtrlToolbar(infos) {
+  const toolbar = document.getElementById('ctrl-toolbar');
+  const chipsEl = document.getElementById('ctrl-filter-chips');
+  const sortBtn = document.getElementById('ctrl-sort-btn');
+  if (!toolbar || !chipsEl || !sortBtn) return;
+  toolbar.style.display = '';
+
+  const allItems = infos.flatMap(i => i.items);
+  const counts = {
+    all: allItems.length,
+    running: allItems.filter(i => i.state === 'running').length,
+    stopped: allItems.filter(i => i.state === 'exited').length,
+    paused: allItems.filter(i => i.state === 'paused').length,
+    unmanaged: allItems.filter(i => !i.backed_up_as).length,
+  };
+  const defs = [['all','All'],['running','Running'],['stopped','Stopped'],['paused','Paused'],['unmanaged','Unmanaged']];
+  chipsEl.innerHTML = defs.map(([key, lbl]) =>
+    `<div class="ctrl-filter-chip${S.ctrlFilter===key?' active':''}" onclick="setCtrlFilter('${key}')">${lbl}<span class="cnt">${counts[key]}</span></div>`
+  ).join('');
+
+  sortBtn.textContent = S.ctrlSort === 'status' ? '⚠ Needs attention first' : 'A–Z';
+  sortBtn.title = S.ctrlSort === 'status'
+    ? 'Stopped and paused containers rise to the top — click for alphabetical order'
+    : 'Alphabetical order — click to bring stopped/paused containers to the top';
+}
+
 function renderCtrl() {
   const empty = document.getElementById('ctrl-empty');
   const list = document.getElementById('ctrl-list');
+  const toolbar = document.getElementById('ctrl-toolbar');
   if (!empty || !list) return;
 
   if (S.ctrlGroups === null) {
+    if (toolbar) toolbar.style.display = 'none';
     empty.style.display=''; list.style.display='none';
     empty.querySelector('.et').textContent = 'Docker unreachable';
     empty.querySelector('.es').textContent = 'Could not reach the Docker socket — check the mount and try refreshing.';
     return;
   }
   if (!S.ctrlGroups || !S.ctrlGroups.length) {
+    if (toolbar) toolbar.style.display = 'none';
     empty.style.display=''; list.style.display='none';
     empty.querySelector('.et').textContent = 'No containers found';
     empty.querySelector('.es').textContent = 'Nothing is running yet.';
@@ -2225,8 +2339,21 @@ function renderCtrl() {
   }
   empty.style.display='none'; list.style.display='';
 
-  list.innerHTML = S.ctrlGroups.map(g => {
-    const items = g.containers || [];
+  const allInfos = S.ctrlGroups.map(ctrlGroupInfo);
+  renderCtrlToolbar(allInfos);
+
+  let infos = allInfos.filter(info => ctrlMatchesFilter(info, S.ctrlFilter));
+  infos.sort((a, b) => {
+    if (S.ctrlSort === 'status' && a.priority !== b.priority) return a.priority - b.priority;
+    return a.g.anchor.localeCompare(b.g.anchor);
+  });
+
+  if (!infos.length) {
+    list.innerHTML = `<div class="empty"><div class="et">No containers match "${esc(S.ctrlFilter)}"</div><div class="es">Try a different filter — <span style="color:var(--accent);cursor:pointer" onclick="setCtrlFilter('all')">clear it</span> to see everything again.</div></div>`;
+    return;
+  }
+
+  list.innerHTML = infos.map(({g, items, borderClass}) => {
     const backedBadge = (it) => it.backed_up_as
       ? `<span class="ctrl-backed-badge" title="Backed up as part of the '${esc(it.backed_up_as)}' app">✓ ${esc(it.backed_up_as)}</span>`
       : `<span class="ctrl-unmanaged-badge" title="No PrestoBack app covers this container">not backed up</span>`;
@@ -2238,11 +2365,11 @@ function renderCtrl() {
       const selfNote = it.is_self
         ? `<div class="ctrl-self-note">This is PrestoBack itself — start/stop/pause are disabled here to avoid cutting off the app you're using. Restart is still available.</div>`
         : '';
-      return `<div class="ctrl-group">
+      return `<div class="ctrl-group ${borderClass}">
         <div class="ctrl-head" style="cursor:default${it.is_self ? ';opacity:.8' : ''}">
           <span class="ctrl-head-name">${esc(it.name)}</span>
           ${it.service ? `<span class="ctrl-head-count">${esc(it.service)}</span>` : ''}
-          <span class="ctrl-image">${esc(it.image||'')}</span>
+          <span class="ctrl-image" title="${esc(it.image||'')}">${esc(it.image||'')}</span>
           ${backedBadge(it)}
           <span class="ctrl-status-pill" style="color:${col};background:${bg}">${label}</span>
           <div class="ctrl-row-actions">${ctrlActionButtons([it.name], it.name, it.state, it.is_self)}</div>
@@ -2272,7 +2399,7 @@ function renderCtrl() {
       return `<div class="ctrl-child">
         <span class="ctrl-child-name">${esc(it.name)}</span>
         ${it.service ? `<span class="ctrl-image">${esc(it.service)}</span>` : ''}
-        <span class="ctrl-image">${esc(it.image||'')}</span>
+        <span class="ctrl-image" title="${esc(it.image||'')}">${esc(it.image||'')}</span>
         ${backedBadge(it)}
         <span class="ctrl-status-pill" style="color:${col};background:${bg};margin-left:0">${label}</span>
         <div class="ctrl-row-actions">${ctrlActionButtons([it.name], it.name, it.state, it.is_self)}</div>
@@ -2280,7 +2407,7 @@ function renderCtrl() {
       </div>`;
     }).join('');
 
-    return `<div class="ctrl-group${isOpen?' open':''}">
+    return `<div class="ctrl-group ${borderClass}${isOpen?' open':''}">
       <div class="ctrl-head" onclick="toggleCtrlGroup('${esc(g.anchor)}')">
         <svg class="ctrl-chev" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
         <span class="ctrl-head-name">${esc(g.anchor)}</span>

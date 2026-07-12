@@ -169,6 +169,122 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 	return nil
 }
 
+// SelfRestart safely restarts PrestoBack's own container in place, without
+// changing its image — for the Container Control page's Restart button on
+// PrestoBack's own entry, which previously called the same plain
+// `docker restart` used for every other container. That works fine for any
+// OTHER container, but here the command is issued FROM the very container
+// it targets: `docker restart` doesn't return until the container is back
+// up, and this container going down partway through severs the process
+// that's waiting on that return — the container was left stopped, needing
+// a manual restart from the host, rather than actually broken by the
+// restart itself.
+//
+// SelfUpdate already solves exactly this class of problem for the update
+// flow: hand the "stop the container I'm running in, then start it again"
+// step to a detached helper container (spawned over the Docker socket), so
+// it keeps running and completes the swap after this process is gone.
+// SelfRestart reuses that same helper mechanism — same inspect →
+// buildDockerRunArgs → helper-spawn sequence — just with the image left
+// exactly as it currently is (no pull, no digest change) and a shorter
+// grace period, since there's no new image to justify SelfUpdate's fuller
+// 60s drain/30s stop budget for what's meant to be a quick bounce.
+func SelfRestart(selfName string, isRunning func() bool, emit func(UpdateResult)) error {
+	emit(UpdateResult{Stage: "draining", Message: "Waiting for active jobs to finish…"})
+	deadline := time.Now().Add(30 * time.Second)
+	for isRunning() && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+	}
+	if isRunning() {
+		emit(UpdateResult{Stage: "draining", Message: "Warning: jobs still running after 30s — proceeding anyway"})
+	} else {
+		emit(UpdateResult{Stage: "draining", Message: "No active jobs ✓"})
+	}
+
+	raw, err := exec.Command("docker", "container", "inspect", selfName).Output()
+	if err != nil {
+		return fmt.Errorf("could not inspect current container: %w", err)
+	}
+	var arr []containerInspect
+	if err := json.Unmarshal(raw, &arr); err != nil || len(arr) == 0 {
+		return fmt.Errorf("could not parse container inspect output: %w", err)
+	}
+	ci := arr[0]
+
+	// The currently-running image, unchanged — this is a restart, not an
+	// update, so buildDockerRunArgs gets told to recreate with the exact
+	// image already in use rather than a new one.
+	imgRaw, err := exec.Command("docker", "inspect", "--format={{.Config.Image}}", selfName).Output()
+	if err != nil {
+		return fmt.Errorf("could not determine current image: %w", err)
+	}
+	image := strings.TrimSpace(string(imgRaw))
+	if image == "" {
+		return fmt.Errorf("could not determine current image for %s", selfName)
+	}
+
+	runArgs, err := buildDockerRunArgs(ci, selfName, image)
+	if err != nil {
+		return fmt.Errorf("could not reconstruct docker run args: %w", err)
+	}
+	if info := getComposeInfo(ci); info != nil {
+		emit(UpdateResult{Stage: "stopping", Message: fmt.Sprintf(
+			"Compose project detected (%s / %s) — preserving compose labels in restart",
+			info.Project, info.Service,
+		)})
+	}
+	log.Printf("[updater] self-restart run args: %v", runArgs)
+
+	quotedArgs := make([]string, len(runArgs))
+	for i, a := range runArgs {
+		quotedArgs[i] = shellEscape(a)
+	}
+	// A shorter grace period than SelfUpdate's "sleep 5" — no image pull
+	// preceded this, so the request has already had less time in flight.
+	stopScript := fmt.Sprintf(
+		"sleep 3 && docker rm -f %s && docker run %s",
+		shellEscape(selfName), strings.Join(quotedArgs, " "),
+	)
+	log.Printf("[updater] helper script: %s", stopScript)
+	emit(UpdateResult{Stage: "stopping", Message: "Spawning restart helper…"})
+	_ = exec.Command("docker", "rm", "-f", "prestoback-updater").Run()
+
+	helperArgs := []string{
+		"run", "-d", "--name", "prestoback-updater",
+		"-v", "/var/run/docker.sock:/var/run/docker.sock",
+		"docker:cli", "sh", "-c", stopScript,
+	}
+
+	helperOut, err := exec.Command("docker", helperArgs...).CombinedOutput()
+	if err != nil {
+		log.Printf("[updater] docker:cli failed (%v: %s), trying docker:latest", err, helperOut)
+		_ = exec.Command("docker", "rm", "-f", "prestoback-updater").Run()
+		for i, a := range helperArgs {
+			if a == "docker:cli" {
+				helperArgs[i] = "docker:latest"
+				break
+			}
+		}
+		helperOut, err = exec.Command("docker", helperArgs...).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to start restart helper: %w\n%s", err, helperOut)
+		}
+	}
+
+	helperID := strings.TrimSpace(string(helperOut))
+	if len(helperID) > 12 {
+		helperID = helperID[:12]
+	}
+	log.Printf("[updater] restart helper container started: %s", helperID)
+
+	emit(UpdateResult{
+		Stage: "done",
+		Message: "Helper started (" + helperID + ") — PrestoBack restarting in ~8s. " +
+			"If it doesn't return, run: docker logs prestoback-updater",
+	})
+	return nil
+}
+
 // buildDockerRunArgs inspects the running container and returns the exact
 // []string args needed to recreate it with a new image.
 //
