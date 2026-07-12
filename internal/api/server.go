@@ -1014,6 +1014,13 @@ type ContainerControlItemOut struct {
 	backup.ContainerControlItem
 	BackedUpAs string `json:"backed_up_as,omitempty"` // PrestoBack app name, "" if not backed up
 	AppID      string `json:"app_id,omitempty"`
+	// IsSelf marks the container running PrestoBack itself, identified by
+	// name against s.selfName (PRESTOBACK_CONTAINER). The frontend uses
+	// this to restrict this one entry to Restart-only — Stop/Pause here
+	// would cut off the very app the user is looking at, and Start doesn't
+	// apply since a stopped PrestoBack couldn't have served this request in
+	// the first place.
+	IsSelf bool `json:"is_self,omitempty"`
 }
 type ContainerControlGroupOut struct {
 	Anchor     string                    `json:"anchor"`
@@ -1058,6 +1065,7 @@ func (s *Server) handleContainerControl(w http.ResponseWriter, r *http.Request) 
 	}
 
 	out := make([]ContainerControlGroupOut, 0, len(groups))
+	selfName := strings.TrimPrefix(strings.TrimSpace(s.selfName), "/")
 	for _, g := range groups {
 		og := ContainerControlGroupOut{Anchor: g.Anchor}
 		for _, c := range g.Containers {
@@ -1065,6 +1073,9 @@ func (s *Server) handleContainerControl(w http.ResponseWriter, r *http.Request) 
 			if owner, ok := backedUpAs[c.ID]; ok {
 				item.BackedUpAs = owner.name
 				item.AppID = owner.id
+			}
+			if selfName != "" && strings.EqualFold(strings.TrimPrefix(c.Name, "/"), selfName) {
+				item.IsSelf = true
 			}
 			og.Containers = append(og.Containers, item)
 		}
@@ -1100,6 +1111,21 @@ func (s *Server) handleContainerControlLifecycle(w http.ResponseWriter, r *http.
 	if !validLifecycleActions[action] {
 		errOut(w, 400, "unknown action: "+action)
 		return
+	}
+
+	// Guard PrestoBack's own container against anything but restart, here at
+	// the API level too — not just hidden in the UI (see IsSelf in
+	// handleContainerControl) — since stop/pause would cut off the very
+	// process serving this request, and this endpoint takes raw container
+	// names that could be called directly.
+	selfName := strings.TrimPrefix(strings.TrimSpace(s.selfName), "/")
+	if selfName != "" && action != "restart" {
+		for _, n := range body.Names {
+			if strings.EqualFold(strings.TrimPrefix(n, "/"), selfName) {
+				errOut(w, 400, "refusing to "+action+" PrestoBack's own container — restart is the only action available for the app you're currently using")
+				return
+			}
+		}
 	}
 
 	s.stateMu.Lock()
@@ -2903,8 +2929,12 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	// available" banner and Telegram's /selfupdate both read from, so all
 	// three surfaces agree on one check result instead of three separate ones.
 	pending, localDigest, remoteDigest, err := s.checkSelfUpdate(false, false)
+	// Always cheap/local — populated on every response, including errors, so
+	// the digest table's "local" row can show a build date even when the
+	// registry side of the check failed.
+	localCreated := backup.LocalImageCreatedDate(s.image)
 	if err != nil {
-		respond(w, 200, map[string]any{"available": false, "error": err.Error()})
+		respond(w, 200, map[string]any{"available": false, "error": err.Error(), "local_created": localCreated})
 		return
 	}
 	if pending == nil {
@@ -2912,24 +2942,31 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		// registry check above (fixed bug: this used to send back empty
 		// strings here, which the dashboard rendered identically to "no
 		// registry digest at all", even when the check found real matching
-		// digests).
+		// digests). Local and remote are the same image here, so the remote
+		// row reuses localCreated rather than spending another registry
+		// round trip just to confirm what's already known.
 		respond(w, 200, map[string]any{
-			"available":     false,
-			"local_digest":  localDigest,
-			"remote_digest": remoteDigest,
-			"image":         s.image,
-			"locally_built": localDigest == "local-build",
+			"available":      false,
+			"local_digest":   localDigest,
+			"remote_digest":  remoteDigest,
+			"image":          s.image,
+			"locally_built":  localDigest == "local-build",
+			"local_created":  localCreated,
+			"remote_created": localCreated,
 		})
 		return
 	}
 	respond(w, 200, map[string]any{
-		"available":     true,
-		"local_digest":  pending.LocalDigest,
-		"remote_digest": pending.RemoteDigest,
-		"image":         s.image,
-		"locally_built": pending.LocalDigest == "local-build",
-		"releases":      pending.Releases,
-		"changelog_err": pending.ChangelogErr,
+		"available":         true,
+		"local_digest":      pending.LocalDigest,
+		"remote_digest":     pending.RemoteDigest,
+		"image":             s.image,
+		"locally_built":     pending.LocalDigest == "local-build",
+		"releases":          pending.Releases,
+		"changelog_err":     pending.ChangelogErr,
+		"local_created":     localCreated,
+		"remote_created":    pending.RemoteCreatedDate,
+		"remote_size_bytes": pending.RemoteSizeBytes,
 	})
 }
 

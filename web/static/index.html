@@ -74,6 +74,7 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .ctrl-row-actions .btn-ic{width:40px;height:40px;padding:0}
 .ctrl-backed-badge{font-size:10.5px;font-family:var(--mono);padding:3px 9px;border-radius:20px;white-space:nowrap;color:var(--green-dk);background:var(--gd)}
 .ctrl-unmanaged-badge{font-size:10.5px;font-family:var(--mono);padding:3px 9px;border-radius:20px;white-space:nowrap;color:var(--txt3);background:var(--bg4);border:1px dashed var(--line2)}
+.ctrl-self-note{font-size:11.5px;color:var(--purple);background:var(--pd);border-radius:0 0 var(--r) var(--r);padding:8px 18px;line-height:1.4}
 .ctrl-image{font-size:10.5px;color:var(--txt3);font-family:var(--mono)}
 @media (max-width:860px){
   .ctrl-status-pill{margin-left:0;flex:1 0 100%}
@@ -2164,7 +2165,17 @@ function ctrlStatusLabel(state, health, exitCode) {
   return ['var(--txt3)', 'var(--bg4)', '● ' + state];
 }
 
-function ctrlActionButtons(names, label, state) {
+function ctrlActionButtons(names, label, state, isSelf) {
+  if (isSelf) {
+    // PrestoBack acting on itself: Restart is safe (a short reconnect), but
+    // Stop/Pause would cut off the very app serving this page, and Start
+    // doesn't apply since a stopped self couldn't have rendered this row.
+    // Enforced server-side too (handleContainerControlLifecycle) — this is
+    // just keeping the UI from offering an action that'll be rejected.
+    return state === 'running'
+      ? `<button class="btn btn-g btn-sm" title="Restart PrestoBack" onclick='event.stopPropagation();containerLifecycle(${JSON.stringify(names)},${JSON.stringify(label)},"restart")'>↻ Restart</button>`
+      : '';
+  }
   const actions = [];
   if (state === 'running') {
     actions.push(`<button class="btn btn-g btn-sm" title="Restart" onclick='event.stopPropagation();containerLifecycle(${JSON.stringify(names)},${JSON.stringify(label)},"restart")'>↻ Restart</button>`);
@@ -2224,15 +2235,19 @@ function renderCtrl() {
     if (items.length <= 1) {
       const it = items[0] || {name: g.anchor, state: 'unknown'};
       const [col, bg, label] = ctrlStatusLabel(it.state, it.health, it.exit_code);
+      const selfNote = it.is_self
+        ? `<div class="ctrl-self-note">This is PrestoBack itself — start/stop/pause are disabled here to avoid cutting off the app you're using. Restart is still available.</div>`
+        : '';
       return `<div class="ctrl-group">
-        <div class="ctrl-head" style="cursor:default">
+        <div class="ctrl-head" style="cursor:default${it.is_self ? ';opacity:.8' : ''}">
           <span class="ctrl-head-name">${esc(it.name)}</span>
           ${it.service ? `<span class="ctrl-head-count">${esc(it.service)}</span>` : ''}
           <span class="ctrl-image">${esc(it.image||'')}</span>
           ${backedBadge(it)}
           <span class="ctrl-status-pill" style="color:${col};background:${bg}">${label}</span>
-          <div class="ctrl-row-actions">${ctrlActionButtons([it.name], it.name, it.state)}</div>
+          <div class="ctrl-row-actions">${ctrlActionButtons([it.name], it.name, it.state, it.is_self)}</div>
         </div>
+        ${selfNote}
       </div>`;
     }
 
@@ -2251,13 +2266,17 @@ function renderCtrl() {
 
     const childrenHtml = items.map(it => {
       const [col, bg, label] = ctrlStatusLabel(it.state, it.health, it.exit_code);
+      const selfNote = it.is_self
+        ? `<div class="ctrl-self-note">This is PrestoBack itself — restart-only, see above.</div>`
+        : '';
       return `<div class="ctrl-child">
         <span class="ctrl-child-name">${esc(it.name)}</span>
         ${it.service ? `<span class="ctrl-image">${esc(it.service)}</span>` : ''}
         <span class="ctrl-image">${esc(it.image||'')}</span>
         ${backedBadge(it)}
         <span class="ctrl-status-pill" style="color:${col};background:${bg};margin-left:0">${label}</span>
-        <div class="ctrl-row-actions">${ctrlActionButtons([it.name], it.name, it.state)}</div>
+        <div class="ctrl-row-actions">${ctrlActionButtons([it.name], it.name, it.state, it.is_self)}</div>
+        ${selfNote}
       </div>`;
     }).join('');
 

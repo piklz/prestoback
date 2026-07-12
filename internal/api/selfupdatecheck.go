@@ -25,7 +25,7 @@ import (
 	"github.com/pi/prestoback/internal/notify"
 )
 
-const selfUpdateCheckInterval = 6 * time.Hour
+const selfUpdateCheckInterval = 6 * time.Hour // 4x/day — comfortably covers "at least twice a day"
 
 // PendingSelfUpdate is what's shown on the dashboard banner and re-sent to
 // Telegram until applied or dismissed.
@@ -34,6 +34,14 @@ type PendingSelfUpdate struct {
 	RemoteDigest string          `json:"remote_digest"`
 	Releases     []GithubRelease `json:"releases,omitempty"` // newest first; may be empty if changelog fetch failed
 	ChangelogErr string          `json:"changelog_err,omitempty"`
+	// LocalCreatedDate / RemoteCreatedDate / RemoteSizeBytes mirror
+	// ImageMeta's own build-date/size fields (imagemeta.go) — same
+	// registry-manifest lookups, reused here via LocalImageCreatedDate /
+	// RemoteImageDetails so the Settings > Updates digest table can show
+	// "Built" dates for both rows instead of sitting empty.
+	LocalCreatedDate  string `json:"local_created_date,omitempty"`
+	RemoteCreatedDate string `json:"remote_created_date,omitempty"`
+	RemoteSizeBytes   int64  `json:"remote_size_bytes,omitempty"`
 	// IsDevBuild and SourceBranch record which changelog source was used —
 	// GitHub Releases (IsDevBuild false) or commits on SourceBranch
 	// (IsDevBuild true) — see backup.DevTrackInfo. Surfaced in the
@@ -60,9 +68,12 @@ func githubRepo() string {
 
 // selfUpdateCheckLoop periodically checks for a new PrestoBack image and,
 // if one is available, alerts once (debounced) — same shape as
-// updateCheckLoop for app images.
+// updateCheckLoop for app images. Runs once shortly after startup (so a
+// freshly-deployed container gets an answer within a minute or two, not
+// after waiting out the first full interval) and every
+// selfUpdateCheckInterval after that.
 func (s *Server) selfUpdateCheckLoop() {
-	time.Sleep(3 * time.Minute) // stagger from updateCheckLoop's own startup delay
+	time.Sleep(1 * time.Minute) // stagger from updateCheckLoop's own startup delay, short enough to feel like a real on-start check
 	for {
 		if s.image != "" && s.selfName != "" {
 			s.checkSelfUpdate(true, false) // return values unused here — pendingSelfUpdate is read from state by anything that needs it
@@ -111,6 +122,15 @@ func (s *Server) checkSelfUpdate(notifyUser, force bool) (pending *PendingSelfUp
 		LocalDigest:  local,
 		RemoteDigest: remote,
 		CheckedAt:    time.Now(),
+	}
+	// Cheap, local-only lookup — always populate regardless of what the
+	// remote lookup below finds.
+	p.LocalCreatedDate = backup.LocalImageCreatedDate(s.image)
+	if size, created, derr := backup.RemoteImageDetails(s.image, remote); derr == nil {
+		p.RemoteCreatedDate = created
+		p.RemoteSizeBytes = size
+	} else {
+		log.Printf("[selfupdate] remote image details lookup failed: %v", derr)
 	}
 	if repo := githubRepo(); repo != "" {
 		branch, baseSHA, isDev := backup.DevTrackInfo(s.image, config.Version)

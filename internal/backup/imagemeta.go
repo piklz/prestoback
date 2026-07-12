@@ -299,6 +299,25 @@ func hostPlatform() (arch, variant string) {
 // or unrecognized registry just means the field stays "", never breaks the
 // check itself.
 
+// LocalImageCreatedDate is the exported form of localImageCreatedDate, for
+// callers outside this package — namely the self-update flow
+// (selfupdatecheck.go), which wants the same "build date of the image
+// running right now" lookup this file already does for per-app update
+// checks, rather than a second implementation of the same docker-inspect
+// call.
+func LocalImageCreatedDate(image string) string {
+	return localImageCreatedDate(image)
+}
+
+// RemoteImageDetails is the exported form of fetchImageDetails, resolving
+// image into its registry+repository first — same reasoning as
+// LocalImageCreatedDate above, for the "what does the NEW image on the
+// registry look like" half of the same self-update use case.
+func RemoteImageDetails(image, digest string) (sizeBytes int64, createdDate string, err error) {
+	registry, repository, _ := parseImageRef(image)
+	return fetchImageDetails(registry, repository, digest)
+}
+
 // localImageCreatedDate returns the build date of the image reference as it
 // exists LOCALLY right now — a single local `docker image inspect`, no
 // registry round trip, so it's cheap enough to always compute, independent
