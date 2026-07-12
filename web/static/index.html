@@ -72,6 +72,9 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .ctrl-row-actions{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .ctrl-row-actions .btn{padding:9px 16px;font-size:13px}
 .ctrl-row-actions .btn-ic{width:40px;height:40px;padding:0}
+.ctrl-backed-badge{font-size:10.5px;font-family:var(--mono);padding:3px 9px;border-radius:20px;white-space:nowrap;color:var(--green-dk);background:var(--gd)}
+.ctrl-unmanaged-badge{font-size:10.5px;font-family:var(--mono);padding:3px 9px;border-radius:20px;white-space:nowrap;color:var(--txt3);background:var(--bg4);border:1px dashed var(--line2)}
+.ctrl-image{font-size:10.5px;color:var(--txt3);font-family:var(--mono)}
 @media (max-width:860px){
   .ctrl-status-pill{margin-left:0;flex:1 0 100%}
   .ctrl-row-actions{flex:1 0 100%;justify-content:flex-start}
@@ -545,11 +548,11 @@ select.fi{cursor:pointer}
 
 <!-- CONTAINER CONTROL -->
 <div id="view-ctrl" class="view-hidden">
-  <div class="ph"><div><div class="pt">Container Control</div><div class="ps">Start, stop, restart, or pause each app's container directly</div></div>
-    <div class="ha"><button class="btn btn-g btn-sm" onclick="refreshContainerHealth()">↺ Refresh</button></div>
+  <div class="ph"><div><div class="pt">Container Control</div><div class="ps">Every container in your stack, grouped by compose dependencies — start, stop, restart, or pause any of them directly</div></div>
+    <div class="ha"><button class="btn btn-g btn-sm" onclick="refreshContainerControl()">↺ Refresh</button></div>
   </div>
   <div class="sec">
-    <div class="empty" id="ctrl-empty"><div class="ei"><svg width="22" height="22" fill="none" stroke="var(--txt3)" stroke-width="1.5" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg></div><div class="et">No apps configured</div><div class="es">Add an app from the Applications page first.</div></div>
+    <div class="empty" id="ctrl-empty"><div class="ei"><svg width="22" height="22" fill="none" stroke="var(--txt3)" stroke-width="1.5" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg></div><div class="et">No containers found</div><div class="es">Docker socket may not be reachable, or nothing is running yet.</div></div>
     <div id="ctrl-list" style="display:none"></div>
   </div>
 </div>
@@ -1190,6 +1193,7 @@ const S = {
   backupCounts:{},   // appID → number (from real disk listing)
   orphanIDs:[],      // appIDs found on disk but not in config
   containerHealth:{}, // appID → {state, health, name}
+  ctrlGroups:[],      // Container Control's own data — [{anchor, containers:[...]}], null if last fetch failed
   bkPage:0, bkPerPage:20, bkAll:[],
 };
 const VIEWS = ['dash','apps','ctrl','bk','hist','settings'];
@@ -1391,8 +1395,22 @@ async function refreshContainerHealth() {
     S.containerHealth = {};
     (results||[]).forEach(h => { S.containerHealth[h.app_id] = h; });
     renderApps(); // re-render inline status badges
-    renderCtrl(); // keep Container Control's status/actions live too, if open
   } catch { /* docker socket may not be available — silently skip */ }
+  // Container Control has its own richer, all-containers data source (see
+  // below) — kept as a separate fetch/state from S.containerHealth above so
+  // the Applications page's per-app badges (keyed by app_id) can't regress
+  // just because this page also needed full container data.
+  refreshContainerControl();
+}
+
+async function refreshContainerControl() {
+  try {
+    const groups = await api('/api/container-control');
+    S.ctrlGroups = groups || [];
+  } catch {
+    S.ctrlGroups = null; // null = fetch failed (Docker unreachable) — distinct from [] = fetched, genuinely zero containers
+  }
+  renderCtrl();
 }
 async function pollContainerHealth() {
   await refreshContainerHealth();
@@ -1886,6 +1904,23 @@ async function appLifecycle(id, name, action, container) {
   }
 }
 
+// Container Control's lifecycle action — targets containers by NAME
+// directly rather than by PrestoBack app ID, since this page shows every
+// container on the host, including ones with no registered app at all (see
+// handleContainerControlLifecycle on the backend). names is an array so a
+// group-level button can act on every container in that group in one call.
+async function containerLifecycle(names, label, action) {
+  try {
+    const r = await api('/api/containers/lifecycle', {method:'POST', body: JSON.stringify({names, action})});
+    if (r.success) toast(`${label}: ${action} complete`, 'success');
+    else toast(`${label}: ${action} failed — ${(r.failed||[]).join('; ')}`, 'error');
+  } catch(e) {
+    toast(e.message, 'error');
+  } finally {
+    refreshContainerHealth(); // also refreshes Container Control's own state
+  }
+}
+
 // Update-confirm modal — opened by clicking an app's "⬆ update" badge
 // (renderApps). Shows the same version-delta detail already computed for
 // the badge's tooltip so the confirm dialog isn't just a bare "are you
@@ -2113,20 +2148,6 @@ async function toggleAppSchedule(id) {
   }
 }
 
-// Container Control page — full start/stop/restart/pause access per app,
-// split out from Applications so that page can stay focused on backups
-// (see renderApps' lifecycleBtn comment). Reuses the same
-// /api/apps/{id}/lifecycle action and S.containerHealth state Applications
-// already populates via pollContainerHealth/refreshContainerHealth.
-// Tracks which app groups are expanded across re-renders (health polling
-// re-renders this every 30s — without this, an open group would snap shut
-// on every poll).
-const _ctrlOpen = new Set();
-function toggleCtrlGroup(id) {
-  if (_ctrlOpen.has(id)) _ctrlOpen.delete(id); else _ctrlOpen.add(id);
-  renderCtrl();
-}
-
 function ctrlStatusLabel(state, health, exitCode) {
   if (state === 'running') {
     if (health === 'unhealthy') return ['var(--red)', 'var(--rd)', '● running · unhealthy'];
@@ -2138,57 +2159,79 @@ function ctrlStatusLabel(state, health, exitCode) {
   return ['var(--txt3)', 'var(--bg4)', '● ' + state];
 }
 
-function ctrlActionButtons(appId, appName, state, containerName) {
+function ctrlActionButtons(names, label, state) {
   const actions = [];
   if (state === 'running') {
-    actions.push(`<button class="btn btn-g btn-sm" title="Restart" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','restart'${containerName?`,'${esc(containerName)}'`:''})">↻ Restart</button>`);
-    actions.push(`<button class="btn btn-g btn-sm" title="Pause (docker pause — SIGSTOP)" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','pause'${containerName?`,'${esc(containerName)}'`:''})">⏸ Pause</button>`);
-    actions.push(`<button class="btn btn-d btn-sm" title="Stop" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','stop'${containerName?`,'${esc(containerName)}'`:''})">⏹ Stop</button>`);
+    actions.push(`<button class="btn btn-g btn-sm" title="Restart" onclick='event.stopPropagation();containerLifecycle(${JSON.stringify(names)},${JSON.stringify(label)},"restart")'>↻ Restart</button>`);
+    actions.push(`<button class="btn btn-g btn-sm" title="Pause (docker pause — SIGSTOP)" onclick='event.stopPropagation();containerLifecycle(${JSON.stringify(names)},${JSON.stringify(label)},"pause")'>⏸ Pause</button>`);
+    actions.push(`<button class="btn btn-d btn-sm" title="Stop" onclick='event.stopPropagation();containerLifecycle(${JSON.stringify(names)},${JSON.stringify(label)},"stop")'>⏹ Stop</button>`);
   } else if (state === 'paused') {
-    actions.push(`<button class="btn btn-g btn-sm" title="Resume (docker unpause)" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','unpause'${containerName?`,'${esc(containerName)}'`:''})">▶ Unpause</button>`);
-    actions.push(`<button class="btn btn-d btn-sm" title="Stop" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','stop'${containerName?`,'${esc(containerName)}'`:''})">⏹ Stop</button>`);
-  } else if (state === 'exited') {
-    actions.push(`<button class="btn btn-g btn-sm" title="Start container" onclick="event.stopPropagation();appLifecycle('${appId}','${esc(appName)}','start'${containerName?`,'${esc(containerName)}'`:''})">▶ Start</button>`);
+    actions.push(`<button class="btn btn-g btn-sm" title="Resume (docker unpause)" onclick='event.stopPropagation();containerLifecycle(${JSON.stringify(names)},${JSON.stringify(label)},"unpause")'>▶ Unpause</button>`);
+    actions.push(`<button class="btn btn-d btn-sm" title="Stop" onclick='event.stopPropagation();containerLifecycle(${JSON.stringify(names)},${JSON.stringify(label)},"stop")'>⏹ Stop</button>`);
+  } else {
+    actions.push(`<button class="btn btn-g btn-sm" title="Start" onclick='event.stopPropagation();containerLifecycle(${JSON.stringify(names)},${JSON.stringify(label)},"start")'>▶ Start</button>`);
   }
   return actions.join('');
 }
 
-// Container Control page — grouped like Portainer/Dockge show a compose
-// stack: one card per app, expandable when it actually matches more than
-// one real container (e.g. Immich's app matches immich_server,
-// immich_machine_learning, immich_redis, immich_postgres — all four used
-// to collapse into a single, misleading "primary container" status). The
-// bulk restart/pause/stop buttons on the group header hit every container
-// in the group at once (same /lifecycle endpoint apps already used); the
-// per-container buttons inside the expanded group target just that one
-// container via the new `container` field.
+// Container Control page — one card per compose dependency group (see
+// containercontrol.go: grouped by depends_on, not by compose "project" —
+// a whole stack is usually one project, so project-only grouping would
+// just be one giant flat list — and not by container-name prefixes either,
+// since e.g. "immich_postgres"'s compose SERVICE name is just "database",
+// no naming heuristic would ever catch that). Shows every real container
+// on the host, not just ones tied to a registered PrestoBack app — each
+// carries a "backed up via X" badge when PrestoBack covers it, or an
+// "unmanaged" badge when it doesn't, so gaps in backup coverage are visible
+// right here instead of only discoverable by comparing two separate pages.
+const _ctrlOpen = new Set();
+function toggleCtrlGroup(anchor) {
+  if (_ctrlOpen.has(anchor)) _ctrlOpen.delete(anchor); else _ctrlOpen.add(anchor);
+  renderCtrl();
+}
+
 function renderCtrl() {
   const empty = document.getElementById('ctrl-empty');
   const list = document.getElementById('ctrl-list');
   if (!empty || !list) return;
-  if (!S.apps.length) { empty.style.display=''; list.style.display='none'; return; }
+
+  if (S.ctrlGroups === null) {
+    empty.style.display=''; list.style.display='none';
+    empty.querySelector('.et').textContent = 'Docker unreachable';
+    empty.querySelector('.es').textContent = 'Could not reach the Docker socket — check the mount and try refreshing.';
+    return;
+  }
+  if (!S.ctrlGroups || !S.ctrlGroups.length) {
+    empty.style.display=''; list.style.display='none';
+    empty.querySelector('.et').textContent = 'No containers found';
+    empty.querySelector('.es').textContent = 'Nothing is running yet.';
+    return;
+  }
   empty.style.display='none'; list.style.display='';
 
-  list.innerHTML = S.apps.map(a => {
-    const ch = S.containerHealth[a.id];
-    const items = (ch && ch.containers && ch.containers.length) ? ch.containers : (ch ? [{name: ch.name || a.name, state: ch.state, health: ch.health, exit_code: ch.exit_code}] : [{name: a.name, state: 'unknown'}]);
+  list.innerHTML = S.ctrlGroups.map(g => {
+    const items = g.containers || [];
+    const backedBadge = (it) => it.backed_up_as
+      ? `<span class="ctrl-backed-badge" title="Backed up as part of the '${esc(it.backed_up_as)}' app">✓ ${esc(it.backed_up_as)}</span>`
+      : `<span class="ctrl-unmanaged-badge" title="No PrestoBack app covers this container">not backed up</span>`;
 
-    // Single real container — no group chrome needed, just a plain row.
+    // Single container — no group chrome needed, just a plain row.
     if (items.length <= 1) {
-      const it = items[0];
+      const it = items[0] || {name: g.anchor, state: 'unknown'};
       const [col, bg, label] = ctrlStatusLabel(it.state, it.health, it.exit_code);
       return `<div class="ctrl-group">
         <div class="ctrl-head" style="cursor:default">
-          <span class="ctrl-head-name">${esc(a.name)}</span>
+          <span class="ctrl-head-name">${esc(it.name)}</span>
+          ${it.service ? `<span class="ctrl-head-count">${esc(it.service)}</span>` : ''}
+          <span class="ctrl-image">${esc(it.image||'')}</span>
+          ${backedBadge(it)}
           <span class="ctrl-status-pill" style="color:${col};background:${bg}">${label}</span>
-          <div class="ctrl-row-actions">${ctrlActionButtons(a.id, a.name, it.state)}</div>
+          <div class="ctrl-row-actions">${ctrlActionButtons([it.name], it.name, it.state)}</div>
         </div>
       </div>`;
     }
 
-    // Multiple real containers — expandable group. Aggregate summary is the
-    // worst state present (red > amber > green) so a single stopped sidecar
-    // isn't hidden behind an otherwise-healthy-looking summary.
+    // Multiple containers in a dependency group — expandable, anchor first.
     const running = items.filter(i => i.state === 'running').length;
     const worst = items.some(i => i.state === 'exited') ? 'exited'
       : items.some(i => i.state === 'paused') ? 'paused'
@@ -2197,27 +2240,32 @@ function renderCtrl() {
     const sumLabel = worst === 'exited' || worst === 'paused'
       ? `${sumLabelBase} · ${running}/${items.length} running`
       : `${running}/${items.length} running`;
-    const isOpen = _ctrlOpen.has(a.id);
+    const isOpen = _ctrlOpen.has(g.anchor);
+    const allNames = items.map(i => i.name);
+    const unbackedCount = items.filter(i => !i.backed_up_as).length;
 
     const childrenHtml = items.map(it => {
       const [col, bg, label] = ctrlStatusLabel(it.state, it.health, it.exit_code);
       return `<div class="ctrl-child">
         <span class="ctrl-child-name">${esc(it.name)}</span>
+        ${it.service ? `<span class="ctrl-image">${esc(it.service)}</span>` : ''}
+        <span class="ctrl-image">${esc(it.image||'')}</span>
+        ${backedBadge(it)}
         <span class="ctrl-status-pill" style="color:${col};background:${bg};margin-left:0">${label}</span>
-        <div class="ctrl-row-actions">${ctrlActionButtons(a.id, a.name, it.state, it.name)}</div>
+        <div class="ctrl-row-actions">${ctrlActionButtons([it.name], it.name, it.state)}</div>
       </div>`;
     }).join('');
 
     return `<div class="ctrl-group${isOpen?' open':''}">
-      <div class="ctrl-head" onclick="toggleCtrlGroup('${a.id}')">
+      <div class="ctrl-head" onclick="toggleCtrlGroup('${esc(g.anchor)}')">
         <svg class="ctrl-chev" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
-        <span class="ctrl-head-name">${esc(a.name)}</span>
-        <span class="ctrl-head-count">${items.length} containers</span>
+        <span class="ctrl-head-name">${esc(g.anchor)}</span>
+        <span class="ctrl-head-count">${items.length} containers${unbackedCount ? ` · ${unbackedCount} unmanaged` : ''}</span>
         <span class="ctrl-status-pill" style="color:${sumCol};background:${sumBg}">${sumLabel}</span>
         <div class="ctrl-row-actions" onclick="event.stopPropagation()">
-          <button class="btn btn-g btn-sm" title="Restart every container in this group" onclick="appLifecycle('${a.id}','${esc(a.name)}','restart')">↻ Restart all</button>
-          <button class="btn btn-g btn-sm" title="Pause every container in this group (docker pause — SIGSTOP)" onclick="appLifecycle('${a.id}','${esc(a.name)}','pause')">⏸ Pause all</button>
-          <button class="btn btn-d btn-sm" title="Stop every container in this group" onclick="appLifecycle('${a.id}','${esc(a.name)}','stop')">⏹ Stop all</button>
+          <button class="btn btn-g btn-sm" title="Restart every container in this group" onclick='containerLifecycle(${JSON.stringify(allNames)},${JSON.stringify(g.anchor)},"restart")'>↻ Restart all</button>
+          <button class="btn btn-g btn-sm" title="Pause every container in this group (docker pause — SIGSTOP)" onclick='containerLifecycle(${JSON.stringify(allNames)},${JSON.stringify(g.anchor)},"pause")'>⏸ Pause all</button>
+          <button class="btn btn-d btn-sm" title="Stop every container in this group" onclick='containerLifecycle(${JSON.stringify(allNames)},${JSON.stringify(g.anchor)},"stop")'>⏹ Stop all</button>
         </div>
       </div>
       <div class="ctrl-children">${childrenHtml}</div>

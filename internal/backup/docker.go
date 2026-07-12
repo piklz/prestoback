@@ -207,6 +207,7 @@ type psEntry struct {
 	State  string `json:"state"`
 	Status string `json:"status"`
 	Labels string `json:"labels"`
+	Image  string `json:"image"`
 }
 
 // dockerPsSnapshot runs exactly one `docker ps -a` and returns every
@@ -217,7 +218,7 @@ type psEntry struct {
 // FindContainers re-run `docker ps` per app per name-candidate.
 func dockerPsSnapshot() ([]psEntry, error) {
 	out, err := exec.Command("docker", "ps", "-a",
-		"--format", `{"id":"{{.ID}}","name":"{{.Names}}","state":"{{.State}}","status":"{{.Status}}","labels":"{{.Labels}}"}`,
+		"--format", `{"id":"{{.ID}}","name":"{{.Names}}","state":"{{.State}}","status":"{{.Status}}","labels":"{{.Labels}}","image":"{{.Image}}"}`,
 	).Output()
 	if err != nil {
 		return nil, err

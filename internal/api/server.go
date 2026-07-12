@@ -150,6 +150,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/validate-path", s.authJWT(s.handleValidatePath))
 	s.mux.HandleFunc("/api/dir-size", s.authJWT(s.handleDirSize))
 	s.mux.HandleFunc("/api/container-health", s.authJWT(s.handleContainerHealth))
+	s.mux.HandleFunc("/api/container-control", s.authJWT(s.handleContainerControl))
+	s.mux.HandleFunc("/api/containers/lifecycle", s.adminForWrites(s.handleContainerControlLifecycle))
 	s.mux.HandleFunc("/api/history", s.authJWT(s.handleHistory))
 	s.mux.HandleFunc("/api/apikey", s.authJWT(s.handleAPIKey)) // masked fingerprint only, never the live key
 	s.mux.HandleFunc("/api/pairing/status", s.authJWT(s.handlePairingStatus))
@@ -1001,6 +1003,140 @@ func (s *Server) handleContainerHealth(w http.ResponseWriter, r *http.Request) {
 		result = append(result, h)
 	}
 	respond(w, 200, result)
+}
+
+// ContainerControlGroupOut adds backup-ownership annotation on top of
+// backup.ContainerControlGroup — which PrestoBack app (if any) covers each
+// container, so the Container Control page can show "backed up via X" next
+// to containers PrestoBack manages and flag the rest as unmanaged, without
+// the frontend needing to cross-reference two separate API responses itself.
+type ContainerControlItemOut struct {
+	backup.ContainerControlItem
+	BackedUpAs string `json:"backed_up_as,omitempty"` // PrestoBack app name, "" if not backed up
+	AppID      string `json:"app_id,omitempty"`
+}
+type ContainerControlGroupOut struct {
+	Anchor     string                    `json:"anchor"`
+	Containers []ContainerControlItemOut `json:"containers"`
+}
+
+// GET /api/container-control — every real container on the host (not just
+// ones tied to a registered app), grouped by compose depends_on
+// relationships (see containercontrol.go), each annotated with which
+// PrestoBack app backs it up, if any. This is the data source for the
+// Container Control page — deliberately a separate endpoint and separate
+// frontend state from /api/container-health above, which stays exactly as
+// it was for the Applications page's inline per-app status badges (keyed by
+// app_id, one entry per registered app) so that existing behavior can't
+// regress just because this page also needed container data.
+func (s *Server) handleContainerControl(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	groups, err := backup.ListContainerControlGroups()
+	if err != nil {
+		errOut(w, 503, "Docker isn't reachable right now: "+err.Error())
+		return
+	}
+
+	// Reuse the same "longest match wins" app-ownership resolution
+	// updatecheck.go's checkForUpdates already uses for update reporting —
+	// same tool, same tie-break rule, applied here for the same reason: a
+	// container must be attributed to exactly one app, not zero or several.
+	apps := s.cfg.ListApps()
+	owned := ownedContainers(apps)
+	backedUpAs := map[string]struct{ name, id string }{} // containerID -> owning app
+	appNames := map[string]string{}
+	for _, a := range apps {
+		appNames[a.ID] = a.Name
+	}
+	for appID, containers := range owned {
+		for _, c := range containers {
+			backedUpAs[c.ID] = struct{ name, id string }{name: appNames[appID], id: appID}
+		}
+	}
+
+	out := make([]ContainerControlGroupOut, 0, len(groups))
+	for _, g := range groups {
+		og := ContainerControlGroupOut{Anchor: g.Anchor}
+		for _, c := range g.Containers {
+			item := ContainerControlItemOut{ContainerControlItem: c}
+			if owner, ok := backedUpAs[c.ID]; ok {
+				item.BackedUpAs = owner.name
+				item.AppID = owner.id
+			}
+			og.Containers = append(og.Containers, item)
+		}
+		out = append(out, og)
+	}
+	respond(w, 200, out)
+}
+
+// POST /api/containers/lifecycle — start/stop/restart/pause/unpause acting
+// directly on container names, not scoped to a registered PrestoBack app.
+// This is what makes the Container Control page able to act on EVERY
+// container it now shows (see handleContainerControl above), including
+// ones with no PrestoBack app at all — handleAppLifecycle's /api/apps/{id}/
+// lifecycle route still exists unchanged for the Applications page, which
+// legitimately only ever needs to act within one app's matched containers.
+// Both routes funnel into the same runLifecycleAction, so a container
+// started here and one started via the Applications page go through
+// identical code.
+func (s *Server) handleContainerControlLifecycle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	var body struct {
+		Names  []string `json:"names"`
+		Action string   `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Names) == 0 {
+		errOut(w, 400, "invalid request body — expected {names: [...], action: ...}")
+		return
+	}
+	action := strings.ToLower(strings.TrimSpace(body.Action))
+	if !validLifecycleActions[action] {
+		errOut(w, 400, "unknown action: "+action)
+		return
+	}
+
+	s.stateMu.Lock()
+	busy := s.updateRunning
+	s.stateMu.Unlock()
+	if busy {
+		errOut(w, 409, "an update or stack operation is in progress — please wait for it to finish first")
+		return
+	}
+	if ok, errMsg := backup.DockerReachable(); !ok {
+		errOut(w, 503, "Docker isn't reachable right now (daemon may be restarting): "+errMsg)
+		return
+	}
+
+	containers := backup.DedupeContainers(backup.ContainersByName(body.Names))
+	if len(containers) == 0 {
+		errOut(w, 404, "none of the requested containers were found")
+		return
+	}
+
+	target := strings.Join(body.Names, ", ")
+	emit := func(msg string) {
+		log.Printf("[lifecycle:control] %s", msg)
+	}
+	emit(fmt.Sprintf("━━━ %s (from Container Control): %s ━━━", action, target))
+	start := time.Now()
+	failed := s.runLifecycleAction(containers, action, emit)
+	dur := time.Since(start)
+	emit(fmt.Sprintf("━━━ %s %s: %s (%s) ━━━", action, map[bool]string{true: "complete", false: "failed"}[len(failed) == 0], target, formatDuration(dur)))
+
+	respond(w, 200, map[string]any{
+		"names":       body.Names,
+		"action":      action,
+		"success":     len(failed) == 0,
+		"failed":      failed,
+		"duration_ms": dur.Milliseconds(),
+	})
 }
 
 func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
