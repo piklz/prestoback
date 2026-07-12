@@ -1228,7 +1228,7 @@ func estimateDownloadSize(image string) int64 {
 	if err != nil || remoteDigest == "" {
 		return 0
 	}
-	size, _, err := fetchImageDetails(registry, repository, remoteDigest)
+	size, _, _, err := fetchImageDetails(registry, repository, remoteDigest)
 	if err != nil {
 		return 0
 	}
