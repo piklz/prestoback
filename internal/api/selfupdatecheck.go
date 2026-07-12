@@ -36,7 +36,7 @@ type PendingSelfUpdate struct {
 	ChangelogErr string          `json:"changelog_err,omitempty"`
 	// LocalCreatedDate / RemoteCreatedDate / RemoteSizeBytes mirror
 	// ImageMeta's own build-date/size fields (imagemeta.go) — same
-	// registry-manifest lookups, reused here via LocalImageCreatedDate /
+	// registry-manifest lookups, reused here via LocalImageCreatedAt /
 	// RemoteImageDetails so the Settings > Updates digest table can show
 	// "Built" dates for both rows instead of sitting empty.
 	LocalCreatedDate  string `json:"local_created_date,omitempty"`
@@ -125,7 +125,7 @@ func (s *Server) checkSelfUpdate(notifyUser, force bool) (pending *PendingSelfUp
 	}
 	// Cheap, local-only lookup — always populate regardless of what the
 	// remote lookup below finds.
-	p.LocalCreatedDate = backup.LocalImageCreatedDate(s.image)
+	p.LocalCreatedDate = backup.LocalImageCreatedAt(s.image)
 	if size, created, derr := backup.RemoteImageDetails(s.image, remote); derr == nil {
 		p.RemoteCreatedDate = created
 		p.RemoteSizeBytes = size

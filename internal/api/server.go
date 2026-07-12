@@ -2982,7 +2982,7 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	// Always cheap/local — populated on every response, including errors, so
 	// the digest table's "local" row can show a build date even when the
 	// registry side of the check failed.
-	localCreated := backup.LocalImageCreatedDate(s.image)
+	localCreated := backup.LocalImageCreatedAt(s.image)
 	if err != nil {
 		respond(w, 200, map[string]any{"available": false, "error": err.Error(), "local_created": localCreated})
 		return

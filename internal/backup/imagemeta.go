@@ -122,7 +122,7 @@ func CheckImageMeta(c ContainerInfo, force bool, cache map[string]ImageMeta) Ima
 	res.UpdateAvailable = hasUpdate
 
 	if hasUpdate {
-		if size, created, err2 := fetchImageDetails(registry, repository, remoteDigest); err2 == nil {
+		if size, created, _, err2 := fetchImageDetails(registry, repository, remoteDigest); err2 == nil {
 			res.SizeBytes = size
 			res.CreatedDate = created
 		} else {
@@ -154,12 +154,12 @@ var manifestAccept = strings.Join([]string{
 	"application/vnd.oci.image.manifest.v1+json",
 }, ", ")
 
-func fetchImageDetails(registry, repository, digest string) (sizeBytes int64, createdDate string, err error) {
+func fetchImageDetails(registry, repository, digest string) (sizeBytes int64, createdDate string, createdAt string, err error) {
 	token, _ := fetchBearerToken(registry, repository) // best-effort; "" is fine for no-auth registries
 
 	body, _, err := getRegistryJSON(fmt.Sprintf("https://%s/v2/%s/manifests/%s", registry, repository, digest), token, manifestAccept)
 	if err != nil {
-		return 0, "", err
+		return 0, "", "", err
 	}
 
 	var probe struct {
@@ -189,11 +189,11 @@ func fetchImageDetails(registry, repository, digest string) (sizeBytes int64, cr
 			break
 		}
 		if platDigest == "" {
-			return 0, "", fmt.Errorf("no manifest for platform linux/%s in list", arch)
+			return 0, "", "", fmt.Errorf("no manifest for platform linux/%s in list", arch)
 		}
 		body, _, err = getRegistryJSON(fmt.Sprintf("https://%s/v2/%s/manifests/%s", registry, repository, platDigest), token, manifestAccept)
 		if err != nil {
-			return 0, "", err
+			return 0, "", "", err
 		}
 	}
 
@@ -206,7 +206,7 @@ func fetchImageDetails(registry, repository, digest string) (sizeBytes int64, cr
 		} `json:"layers"`
 	}
 	if err := json.Unmarshal(body, &single); err != nil {
-		return 0, "", err
+		return 0, "", "", err
 	}
 	for _, l := range single.Layers {
 		sizeBytes += l.Size
@@ -220,13 +220,15 @@ func fetchImageDetails(registry, repository, digest string) (sizeBytes int64, cr
 			if json.Unmarshal(cbody, &cfg) == nil && cfg.Created != "" {
 				if t, perr := time.Parse(time.RFC3339, cfg.Created); perr == nil {
 					createdDate = t.Format("2006-01-02")
+					createdAt = t.Format("2006-01-02 15:04")
 				} else {
 					createdDate = cfg.Created
+					createdAt = cfg.Created
 				}
 			}
 		}
 	}
-	return sizeBytes, createdDate, nil
+	return sizeBytes, createdDate, createdAt, nil
 }
 
 func getRegistryJSON(url, token, accept string) ([]byte, *http.Response, error) {
@@ -299,23 +301,46 @@ func hostPlatform() (arch, variant string) {
 // or unrecognized registry just means the field stays "", never breaks the
 // check itself.
 
-// LocalImageCreatedDate is the exported form of localImageCreatedDate, for
-// callers outside this package — namely the self-update flow
-// (selfupdatecheck.go), which wants the same "build date of the image
-// running right now" lookup this file already does for per-app update
-// checks, rather than a second implementation of the same docker-inspect
-// call.
-func LocalImageCreatedDate(image string) string {
-	return localImageCreatedDate(image)
+// LocalImageCreatedAt is the exported, time-of-day-precision form used by
+// the self-update flow (selfupdatecheck.go). Deliberately NOT
+// LocalImageCreatedDate/localImageCreatedDate's "YYYY-MM-DD" — this repo's
+// dev-track images (see changelog.go's DevTrackInfo) can be rebuilt several
+// times in one day, and the Settings > Updates digest table showing the
+// same date for two genuinely different builds (a real bug reported
+// against this exact table) is exactly what date-only granularity causes.
+// The per-app cards that use LocalImageCreatedDate keep the compact date —
+// they're comparing tagged releases, which don't reuse a date the way dev
+// builds do, so the coarser format is fine there.
+func LocalImageCreatedAt(image string) string {
+	if t, ok := localImageCreatedTime(image); ok {
+		return t.Format("2006-01-02 15:04")
+	}
+	return ""
 }
 
 // RemoteImageDetails is the exported form of fetchImageDetails, resolving
-// image into its registry+repository first — same reasoning as
-// LocalImageCreatedDate above, for the "what does the NEW image on the
-// registry look like" half of the same self-update use case.
-func RemoteImageDetails(image, digest string) (sizeBytes int64, createdDate string, err error) {
+// image into its registry+repository first and returning time-of-day
+// precision (createdAt) rather than fetchImageDetails' own date-only
+// return value — same reasoning as LocalImageCreatedAt above, for the "what
+// does the NEW image on the registry look like" half of the same
+// self-update use case.
+func RemoteImageDetails(image, digest string) (sizeBytes int64, createdAt string, err error) {
 	registry, repository, _ := parseImageRef(image)
-	return fetchImageDetails(registry, repository, digest)
+	size, _, at, ferr := fetchImageDetails(registry, repository, digest)
+	return size, at, ferr
+}
+
+// localImageCreatedTime is the shared docker-inspect + parse step behind
+// localImageCreatedDate and LocalImageCreatedAt — one subprocess call, two
+// different display granularities of the same timestamp for two different
+// UI needs.
+func localImageCreatedTime(image string) (time.Time, bool) {
+	out, err := exec.Command("docker", "image", "inspect", "--format={{.Created}}", image).Output()
+	if err != nil {
+		return time.Time{}, false
+	}
+	t, perr := time.Parse(time.RFC3339, strings.TrimSpace(string(out)))
+	return t, perr == nil
 }
 
 // localImageCreatedDate returns the build date of the image reference as it
@@ -323,11 +348,7 @@ func RemoteImageDetails(image, digest string) (sizeBytes int64, createdDate stri
 // registry round trip, so it's cheap enough to always compute, independent
 // of whether an update was found.
 func localImageCreatedDate(image string) string {
-	out, err := exec.Command("docker", "image", "inspect", "--format={{.Created}}", image).Output()
-	if err != nil {
-		return ""
-	}
-	if t, perr := time.Parse(time.RFC3339, strings.TrimSpace(string(out))); perr == nil {
+	if t, ok := localImageCreatedTime(image); ok {
 		return t.Format("2006-01-02")
 	}
 	return ""
