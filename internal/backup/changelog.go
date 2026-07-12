@@ -113,6 +113,7 @@ func FetchLatestRelease(repo string) (GithubRelease, error) {
 var (
 	semverTagRe      = regexp.MustCompile(`^v?\d+(\.\d+){0,2}$`)
 	devVersionSHARe  = regexp.MustCompile(`(?i)-([0-9a-f]{6,40})$`)
+	shaTagRe         = regexp.MustCompile(`^(sha-)?[0-9a-f]{7,40}$`)
 	mainTrackTagsSet = map[string]bool{"": true, "latest": true, "stable": true, "main": true, "master": true}
 )
 
@@ -125,8 +126,22 @@ var (
 //   - isDev is true for anything else (e.g. "dev", "staging", "nightly"),
 //     treating the tag itself as the GitHub branch name to compare commits
 //     against, unless PRESTOBACK_GITHUB_BRANCH overrides that guess.
+//   - A tag that's a bare or "sha-"-prefixed commit hash (e.g. the
+//     `type=sha` tag docker/metadata-action also pushes on every build,
+//     "sha-252ee28e") is NOT a valid git ref on its own — using it as a
+//     branch name would send a bogus "compare to branch sha-252ee28e" call
+//     to GitHub. Treated as isDev=true with an empty branch instead, so
+//     FetchCommitsSince fails with a clear "set PRESTOBACK_GITHUB_BRANCH"
+//     error rather than a confusing "not found".
+//   - Caveat: for any branch name Docker tags can't represent as-is (a
+//     slash, uppercase letters, etc. — docker/metadata-action sanitizes
+//     these into the tag, e.g. branch "Feature/Foo" becomes tag
+//     "feature-foo"), the original branch name generally can't be
+//     reconstructed from the tag. PRESTOBACK_GITHUB_BRANCH is the escape
+//     hatch for that case; "dev" itself needs no sanitizing so this
+//     doesn't affect the common case.
 //   - baseSHA is the short commit SHA this build was made from, parsed off
-//     the tail of currentVersion (e.g. "vdev-252ee28e" -> "252ee28e").
+//     the tail of currentVersion (e.g. "dev-252ee28e" -> "252ee28e").
 //     Empty if the version string doesn't carry one, in which case
 //     FetchCommitsSince falls back to "most recent commits on the branch"
 //     instead of a precise since-comparison.
@@ -141,6 +156,9 @@ func DevTrackInfo(image, currentVersion string) (branch, baseSHA string, isDev b
 	tag = strings.ToLower(strings.TrimSpace(tag))
 	if mainTrackTagsSet[tag] || semverTagRe.MatchString(tag) {
 		return "", baseSHA, false
+	}
+	if shaTagRe.MatchString(tag) {
+		return "", baseSHA, true // dev track, but no usable branch name — see FetchCommitsSince's error
 	}
 	return tag, baseSHA, true
 }
