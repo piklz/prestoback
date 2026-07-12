@@ -345,7 +345,7 @@ func registryWebURL(registry, repository string) string {
 
 // ── Version tag lookup ────────────────────────────────────────────────────────
 
-var semverTagRe = regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)$`)
+var imageSemverTagRe = regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)$`)
 
 type semver struct {
 	major, minor, patch int
@@ -353,7 +353,7 @@ type semver struct {
 }
 
 func parseSemverTag(tag string) (semver, bool) {
-	m := semverTagRe.FindStringSubmatch(tag)
+	m := imageSemverTagRe.FindStringSubmatch(tag)
 	if m == nil {
 		return semver{}, false
 	}
