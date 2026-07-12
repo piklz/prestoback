@@ -200,6 +200,41 @@ func SendWebhook(webhookURL string, ev Event) error {
 	return sendGeneric(webhookURL, ev)
 }
 
+// SendDiscordEmbed posts a title + long-form description embed — used for
+// update/changelog notifications (release notes or, for a dev-track build,
+// commit history — see backup.FetchCommitsSince) where the generic
+// Event-based sendDiscord below (one fixed-shape line, built for backup/
+// restore results) isn't expressive enough. Exported so internal/api can
+// call it directly for self-update and app-update alerts, which aren't
+// modeled as Event values.
+func SendDiscordEmbed(webhookURL, title, description string, color int) error {
+	if webhookURL == "" {
+		return fmt.Errorf("discord webhook URL not configured")
+	}
+	// Discord's embed description hard limit is 4096 chars; leave headroom.
+	if len(description) > 4000 {
+		description = description[:4000] + "…"
+	}
+	data, err := json.Marshal(map[string]any{
+		"embeds": []map[string]any{{
+			"title":       title,
+			"description": description,
+			"color":       color,
+			"footer":      map[string]string{"text": "PrestoBack"},
+			"timestamp":   time.Now().UTC().Format(time.RFC3339),
+		}},
+	})
+	if err != nil {
+		return err
+	}
+	resp, err := httpPost(webhookURL, "application/json", data)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
 func sendDiscord(url string, ev Event) error {
 	color := 0x3dd68c
 	if ev.IsError {

@@ -1538,13 +1538,15 @@ function renderSelfUpdateBanner() {
   if (!banner) return;
   banner.style.display = 'flex';
   const detail = document.getElementById('selfupdate-banner-detail');
+  const branchTag = p.is_dev_build && p.source_branch ? ' (dev · ' + p.source_branch + ') ' : '';
   if (p.releases && p.releases.length) {
     const latest = p.releases[0];
-    detail.textContent = p.releases.length === 1
-      ? (latest.tag_name || latest.name || 'new version')
-      : p.releases.length + ' new versions — latest ' + (latest.tag_name || latest.name || '');
+    const unit = p.is_dev_build ? 'new commits' : 'new versions';
+    detail.textContent = branchTag + (p.releases.length === 1
+      ? (latest.tag_name || latest.name || (p.is_dev_build ? 'new commit' : 'new version'))
+      : p.releases.length + ' ' + unit + ' — latest ' + (latest.tag_name || latest.name || ''));
   } else {
-    detail.textContent = 'New image available';
+    detail.textContent = branchTag + 'New image available';
   }
 }
 
@@ -1568,8 +1570,11 @@ function openChangelogModal() {
     OM('m-changelog');
     return;
   }
-  document.getElementById('changelog-title').textContent =
-    releases.length === 1 ? 'What\'s new' : releases.length + ' new versions';
+  const isDev = !!p.is_dev_build;
+  const unit = isDev ? 'commits' : 'versions';
+  let title = releases.length === 1 ? 'What\'s new' : releases.length + ' new ' + unit;
+  if (isDev && p.source_branch) title += ' on ' + p.source_branch;
+  document.getElementById('changelog-title').textContent = title;
   body.innerHTML = releases.map(r => `
     <div style="margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--line)">
       <div style="font-weight:600;font-size:14px;margin-bottom:4px">${esc(r.tag_name || r.name || '')}</div>

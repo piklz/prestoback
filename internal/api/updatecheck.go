@@ -177,11 +177,12 @@ func (s *Server) checkForUpdates(notifyUser bool) ([]AppUpdateReport, bool) {
 	}
 
 	nc := s.cfg.GetNotify()
-	if !nc.TelegramEnabled || nc.TelegramToken == "" || nc.TelegramChatID == "" {
-		log.Printf("[updatecheck] %d app(s) have updates available but Telegram is not configured: %v", len(toAlertNames), toAlertNames)
+	telegramReady := nc.TelegramEnabled && nc.TelegramToken != "" && nc.TelegramChatID != ""
+	discordReady := nc.DiscordEnabled && nc.DiscordURL != ""
+	if !telegramReady && !discordReady {
+		log.Printf("[updatecheck] %d app(s) have updates available but no notify channel is configured: %v", len(toAlertNames), toAlertNames)
 		return reports, true
 	}
-	tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
 
 	alertSet := map[string]bool{}
 	for _, n := range toAlertNames {
@@ -194,17 +195,72 @@ func (s *Server) checkForUpdates(notifyUser bool) ([]AppUpdateReport, bool) {
 		}
 	}
 
-	text, btns := buildUpdateReportMessage(toAlertReports)
-	s.stateMu.Lock()
-	s.dismissSeq++
-	batchID := fmt.Sprintf("%d", s.dismissSeq)
-	s.dismissBatches[batchID] = toAlertNames
-	s.stateMu.Unlock()
-	btns = append(btns, notify.ButtonAction{Label: "👀 Remind me later", Data: "updatecheck:dismiss:" + batchID})
-	if err := notify.SendRawWithButtons(tgCfg, text, btns); err != nil {
-		log.Printf("[updatecheck] notify failed: %v", err)
+	if telegramReady {
+		tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
+		text, btns := buildUpdateReportMessage(toAlertReports)
+		s.stateMu.Lock()
+		s.dismissSeq++
+		batchID := fmt.Sprintf("%d", s.dismissSeq)
+		s.dismissBatches[batchID] = toAlertNames
+		s.stateMu.Unlock()
+		btns = append(btns, notify.ButtonAction{Label: "👀 Remind me later", Data: "updatecheck:dismiss:" + batchID})
+		if err := notify.SendRawWithButtons(tgCfg, text, btns); err != nil {
+			log.Printf("[updatecheck] notify failed: %v", err)
+		}
 	}
+
+	if discordReady {
+		title, desc := buildUpdateReportDiscordMessage(toAlertReports)
+		if err := notify.SendDiscordEmbed(nc.DiscordURL, title, desc, 0xf5a524); err != nil {
+			log.Printf("[updatecheck] discord notify failed: %v", err)
+		}
+	}
+
 	return reports, true
+}
+
+// buildUpdateReportDiscordMessage is the Discord-embed equivalent of
+// buildUpdateReportMessage — same per-app/per-image content, rendered with
+// Discord's own lightweight markdown instead of Telegram's MarkdownV2 (no
+// EscapeMD needed) and no per-app buttons, since Discord embeds don't
+// support inline actions the way Telegram messages do.
+func buildUpdateReportDiscordMessage(reports []AppUpdateReport) (title, description string) {
+	var updatableApps []string
+	for _, r := range reports {
+		for _, img := range r.Images {
+			if img.UpdateAvailable {
+				updatableApps = append(updatableApps, r.AppName)
+				break
+			}
+		}
+	}
+	switch {
+	case len(updatableApps) == 1:
+		title = "⬆️ Update available — " + updatableApps[0]
+	case len(updatableApps) > 1:
+		title = fmt.Sprintf("⬆️ %d app(s) have updates", len(updatableApps))
+	default:
+		title = "ℹ️ Update check complete"
+	}
+
+	var sb strings.Builder
+	for _, r := range reports {
+		sb.WriteString(fmt.Sprintf("**%s**\n", r.AppName))
+		for _, img := range r.Images {
+			switch {
+			case img.Err != "" && img.Skipped:
+				sb.WriteString(fmt.Sprintf("ℹ️ `%s` — %s (tracked manually)\n", img.ContainerName, img.Err))
+			case img.Err != "":
+				sb.WriteString(fmt.Sprintf("⚠️ `%s` — %s\n", img.ContainerName, img.Err))
+			case img.CurrentVersion != "" && img.LatestVersion != "" && img.CurrentVersion != img.LatestVersion:
+				sb.WriteString(fmt.Sprintf("• `%s` %s → %s\n", img.ContainerName, img.CurrentVersion, img.LatestVersion))
+			default:
+				sb.WriteString(fmt.Sprintf("• `%s` update available (tag: %s)\n", img.ContainerName, img.CurrentTag))
+			}
+		}
+		sb.WriteString("\n")
+	}
+	return title, strings.TrimSpace(sb.String())
 }
 
 // buildUpdateReportMessage renders a Docksentry-style Telegram report: a

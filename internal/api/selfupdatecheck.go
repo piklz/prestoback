@@ -34,7 +34,14 @@ type PendingSelfUpdate struct {
 	RemoteDigest string          `json:"remote_digest"`
 	Releases     []GithubRelease `json:"releases,omitempty"` // newest first; may be empty if changelog fetch failed
 	ChangelogErr string          `json:"changelog_err,omitempty"`
-	CheckedAt    time.Time       `json:"checked_at"`
+	// IsDevBuild and SourceBranch record which changelog source was used —
+	// GitHub Releases (IsDevBuild false) or commits on SourceBranch
+	// (IsDevBuild true) — see backup.DevTrackInfo. Surfaced in the
+	// dashboard/Telegram/Discord changelog views so it's clear a dev build
+	// is showing commits, not tagged release notes.
+	IsDevBuild   bool      `json:"is_dev_build,omitempty"`
+	SourceBranch string    `json:"source_branch,omitempty"`
+	CheckedAt    time.Time `json:"checked_at"`
 }
 
 // GithubRelease mirrors backup.GithubRelease for the JSON the frontend sees
@@ -106,15 +113,26 @@ func (s *Server) checkSelfUpdate(notifyUser, force bool) (pending *PendingSelfUp
 		CheckedAt:    time.Now(),
 	}
 	if repo := githubRepo(); repo != "" {
-		releases, cerr := backup.FetchReleasesSince(repo, config.Version)
+		branch, baseSHA, isDev := backup.DevTrackInfo(s.image, config.Version)
+
+		var releases []GithubRelease
+		var cerr error
+		if isDev {
+			releases, cerr = backup.FetchCommitsSince(repo, branch, baseSHA)
+		} else {
+			releases, cerr = backup.FetchReleasesSince(repo, config.Version)
+		}
+
 		if cerr != nil {
 			p.ChangelogErr = cerr.Error()
-			log.Printf("[selfupdate] changelog fetch failed: %v", cerr)
+			log.Printf("[selfupdate] changelog fetch failed (dev=%v branch=%q): %v", isDev, branch, cerr)
 		} else {
 			for i := range releases {
 				releases[i].Body = stripReleaseBoilerplate(releases[i].Body)
 			}
 			p.Releases = releases
+			p.IsDevBuild = isDev
+			p.SourceBranch = branch
 		}
 	} else {
 		p.ChangelogErr = "PRESTOBACK_GITHUB_REPO not configured — set it to show release notes here"
@@ -142,6 +160,12 @@ func (s *Server) checkSelfUpdate(notifyUser, force bool) (pending *PendingSelfUp
 				log.Printf("[selfupdate] notify failed: %v", err)
 			}
 		}
+		if nc.DiscordEnabled && nc.DiscordURL != "" {
+			title, desc := buildSelfUpdateDiscordMessage(p)
+			if err := notify.SendDiscordEmbed(nc.DiscordURL, title, desc, 0xf5a524); err != nil {
+				log.Printf("[selfupdate] discord notify failed: %v", err)
+			}
+		}
 	}
 
 	return p, local, remote, nil
@@ -155,24 +179,48 @@ func (s *Server) checkSelfUpdate(notifyUser, force bool) (pending *PendingSelfUp
 func buildSelfUpdateMessage(p *PendingSelfUpdate) string {
 	var sb strings.Builder
 	sb.WriteString("⬆️ *PrestoBack update available*\n\n")
+	if p.IsDevBuild && p.SourceBranch != "" {
+		sb.WriteString(fmt.Sprintf("_Dev build — tracking `%s`_\n\n", notify.EscapeMD(p.SourceBranch)))
+	}
+	unit := changelogUnit(p)
 	if len(p.Releases) == 1 {
 		r := p.Releases[0]
 		sb.WriteString(fmt.Sprintf("*%s*\n", notify.EscapeMD(displayVersion(r))))
 		sb.WriteString(renderReleaseBodyTelegram(truncateRaw(r.Body, 500)))
 	} else if len(p.Releases) > 1 {
-		sb.WriteString(fmt.Sprintf("*%d new version\\(s\\)* since `%s`:\n\n", len(p.Releases), notify.EscapeMD(config.Version)))
+		sb.WriteString(fmt.Sprintf("*%d new %s* since `%s`:\n\n", len(p.Releases), unit, notify.EscapeMD(config.Version)))
 		for _, r := range p.Releases {
 			sb.WriteString(fmt.Sprintf("• *%s*\n", notify.EscapeMD(displayVersion(r))))
 		}
-		sb.WriteString("\nTap 📋 for full release notes\\.")
+		fullLabel := "release notes"
+		if p.IsDevBuild {
+			fullLabel = "commit log"
+		}
+		sb.WriteString(fmt.Sprintf("\nTap 📋 for the full %s\\.", notify.EscapeMD(fullLabel)))
 	} else {
-		sb.WriteString("A new image is available\\. \\(Release notes unavailable")
+		label := "Release notes"
+		if p.IsDevBuild {
+			label = "Commit history"
+		}
+		sb.WriteString(fmt.Sprintf("A new image is available\\. \\(%s unavailable", notify.EscapeMD(label)))
 		if p.ChangelogErr != "" {
 			sb.WriteString(": " + notify.EscapeMD(p.ChangelogErr))
 		}
 		sb.WriteString("\\)")
 	}
 	return sb.String()
+}
+
+// changelogUnit names what a batch of PendingSelfUpdate.Releases actually
+// contains — real GitHub releases on the main track, or synthesized
+// commit entries on a dev/branch track (see backup.FetchCommitsSince) —
+// so messages say "commits" instead of misleadingly saying "versions" for
+// a dev build.
+func changelogUnit(p *PendingSelfUpdate) string {
+	if p.IsDevBuild {
+		return "commit\\(s\\)"
+	}
+	return "version\\(s\\)"
 }
 
 // buildFullChangelogMessage renders every pending release's full notes —
@@ -185,13 +233,48 @@ func buildFullChangelogMessage(p *PendingSelfUpdate) string {
 		return "✅ No pending PrestoBack update\\."
 	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("📋 *%d new version\\(s\\) since `%s`*\n\n", len(p.Releases), notify.EscapeMD(config.Version)))
+	if p.IsDevBuild && p.SourceBranch != "" {
+		sb.WriteString(fmt.Sprintf("📋 *%d new commit\\(s\\) on `%s`*\n\n", len(p.Releases), notify.EscapeMD(p.SourceBranch)))
+	} else {
+		sb.WriteString(fmt.Sprintf("📋 *%d new version\\(s\\) since `%s`*\n\n", len(p.Releases), notify.EscapeMD(config.Version)))
+	}
 	for _, r := range p.Releases {
 		sb.WriteString(fmt.Sprintf("*%s* — %s\n", notify.EscapeMD(displayVersion(r)), notify.EscapeMD(r.PublishedAt.Format("2006-01-02"))))
 		sb.WriteString(renderReleaseBodyTelegram(truncateRaw(r.Body, 800)))
 		sb.WriteString("\n\n")
 	}
 	return strings.TrimRight(sb.String(), "\n")
+}
+
+// buildSelfUpdateDiscordMessage renders the Discord-embed equivalent of
+// buildSelfUpdateMessage — same content, but Discord embeds use their own
+// lightweight markdown (no MarkdownV2 escaping needed) and have no button
+// mechanism, so the full changelog is included inline rather than gated
+// behind a "tap for more" action.
+func buildSelfUpdateDiscordMessage(p *PendingSelfUpdate) (title, description string) {
+	title = "⬆️ PrestoBack update available"
+	if p.IsDevBuild && p.SourceBranch != "" {
+		title = fmt.Sprintf("⬆️ PrestoBack update available — dev build (%s)", p.SourceBranch)
+	}
+
+	var sb strings.Builder
+	if len(p.Releases) == 0 {
+		sb.WriteString("A new image is available.")
+		if p.ChangelogErr != "" {
+			sb.WriteString(" (" + p.ChangelogErr + ")")
+		}
+		return title, sb.String()
+	}
+
+	unit := "version(s)"
+	if p.IsDevBuild {
+		unit = "commit(s)"
+	}
+	sb.WriteString(fmt.Sprintf("**%d new %s** since `%s`\n\n", len(p.Releases), unit, config.Version))
+	for _, r := range p.Releases {
+		sb.WriteString(fmt.Sprintf("**%s**\n%s\n\n", displayVersion(r), truncateRaw(r.Body, 300)))
+	}
+	return title, strings.TrimSpace(sb.String())
 }
 
 func displayVersion(r GithubRelease) string {

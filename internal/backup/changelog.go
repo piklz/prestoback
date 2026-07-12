@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -95,11 +97,174 @@ func FetchLatestRelease(repo string) (GithubRelease, error) {
 	return GithubRelease{}, fmt.Errorf("no published releases found for %s", repo)
 }
 
-func fetchReleases(repo string) ([]GithubRelease, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=10", repo)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+// ── Branch-aware changelog (dev/CI builds vs tagged releases) ─────────────────
+//
+// FetchReleasesSince (above) only makes sense for the main/release track:
+// GitHub Releases in this repo's own workflow are cut from tagged commits
+// on main, so a dev-tag image (built by CI on every push to a feature/dev
+// branch, versioned as e.g. "vdev-252ee28e" — see docker-build.yml) never
+// has a matching release tag. Previously that meant FetchReleasesSince's
+// "current version not found in the page" fallback fired and it returned
+// every release for the WHOLE page — i.e. main's changelog — even though
+// the running image has nothing to do with main. DevTrackInfo +
+// FetchCommitsSince give the dev track its own comparison: actual commits
+// on the branch it was built from, since the commit it was built at.
+
+var (
+	semverTagRe      = regexp.MustCompile(`^v?\d+(\.\d+){0,2}$`)
+	devVersionSHARe  = regexp.MustCompile(`(?i)-([0-9a-f]{6,40})$`)
+	mainTrackTagsSet = map[string]bool{"": true, "latest": true, "stable": true, "main": true, "master": true}
+)
+
+// DevTrackInfo inspects the running image's tag (and, as a fallback, an
+// explicit PRESTOBACK_GITHUB_BRANCH override) to decide whether this build
+// tracks a non-release branch rather than a tagged version.
+//
+//   - isDev is false for an untagged/`latest`/`stable`/`main`/`master` tag,
+//     or a semver-looking tag (e.g. "v1.0.2") — the normal release track.
+//   - isDev is true for anything else (e.g. "dev", "staging", "nightly"),
+//     treating the tag itself as the GitHub branch name to compare commits
+//     against, unless PRESTOBACK_GITHUB_BRANCH overrides that guess.
+//   - baseSHA is the short commit SHA this build was made from, parsed off
+//     the tail of currentVersion (e.g. "vdev-252ee28e" -> "252ee28e").
+//     Empty if the version string doesn't carry one, in which case
+//     FetchCommitsSince falls back to "most recent commits on the branch"
+//     instead of a precise since-comparison.
+func DevTrackInfo(image, currentVersion string) (branch, baseSHA string, isDev bool) {
+	baseSHA = extractShortSHA(currentVersion)
+
+	if override := strings.TrimSpace(os.Getenv("PRESTOBACK_GITHUB_BRANCH")); override != "" {
+		return override, baseSHA, true
+	}
+
+	_, _, tag := parseImageRef(image)
+	tag = strings.ToLower(strings.TrimSpace(tag))
+	if mainTrackTagsSet[tag] || semverTagRe.MatchString(tag) {
+		return "", baseSHA, false
+	}
+	return tag, baseSHA, true
+}
+
+func extractShortSHA(version string) string {
+	m := devVersionSHARe.FindStringSubmatch(strings.TrimSpace(version))
+	if len(m) == 2 {
+		return m[1]
+	}
+	return ""
+}
+
+// FetchCommitsSince returns commits on `branch` newer than baseSHA, newest
+// first, reshaped as GithubRelease entries — TagName/Name carry the short
+// SHA and commit headline, Body carries the full commit message. Reusing
+// GithubRelease's shape (rather than a separate type) means the existing
+// rendering pipeline — Telegram, Discord, and index.html's changelog modal
+// — needs no changes to display commit-based changelogs; it's already
+// generic over "a list of things with a tag, a name, a body, and a date".
+//
+// If baseSHA is unknown (couldn't be parsed from the running version), or
+// the compare call fails (e.g. baseSHA no longer reachable after a
+// force-push/rebase on the branch), falls back to the most recent commits
+// on the branch rather than erroring out — a few extra/irrelevant entries
+// beats no changelog at all.
+func FetchCommitsSince(repo, branch, baseSHA string) ([]GithubRelease, error) {
+	if repo == "" {
+		return nil, fmt.Errorf("no GitHub repo configured (set PRESTOBACK_GITHUB_REPO)")
+	}
+	if branch == "" {
+		return nil, fmt.Errorf("no branch to compare against (set PRESTOBACK_GITHUB_BRANCH)")
+	}
+
+	var entries []githubCommitEntry
+	var err error
+	if baseSHA != "" {
+		entries, err = fetchCompareCommits(repo, baseSHA, branch)
+		if err != nil {
+			entries, err = fetchBranchCommits(repo, branch, 10)
+		}
+	} else {
+		entries, err = fetchBranchCommits(repo, branch, 10)
+	}
 	if err != nil {
 		return nil, err
+	}
+
+	out := make([]GithubRelease, 0, len(entries))
+	for i := len(entries) - 1; i >= 0; i-- { // API returns oldest-first; want newest-first, same as FetchReleasesSince
+		c := entries[i]
+		headline := c.Commit.Message
+		if idx := strings.IndexByte(headline, '\n'); idx >= 0 {
+			headline = headline[:idx]
+		}
+		short := c.SHA
+		if len(short) > 8 {
+			short = short[:8]
+		}
+		out = append(out, GithubRelease{
+			TagName:     short,
+			Name:        headline,
+			Body:        c.Commit.Message,
+			PublishedAt: c.Commit.Author.Date,
+			HTMLURL:     c.HTMLURL,
+		})
+	}
+	return out, nil
+}
+
+type githubCommitEntry struct {
+	SHA    string `json:"sha"`
+	Commit struct {
+		Message string `json:"message"`
+		Author  struct {
+			Date time.Time `json:"date"`
+		} `json:"author"`
+	} `json:"commit"`
+	HTMLURL string `json:"html_url"`
+}
+
+// fetchCompareCommits lists commits reachable from `head` but not `base` —
+// exactly "what's new since the commit this build was made from", via
+// GitHub's compare API (oldest-first in the response, same as the commits
+// API below).
+func fetchCompareCommits(repo, base, head string) ([]githubCommitEntry, error) {
+	var resp struct {
+		Commits []githubCommitEntry `json:"commits"`
+	}
+	url := fmt.Sprintf("https://api.github.com/repos/%s/compare/%s...%s", repo, base, head)
+	if err := githubAPIGet(url, &resp); err != nil {
+		return nil, fmt.Errorf("compare %s...%s: %w", base, head, err)
+	}
+	return resp.Commits, nil
+}
+
+// fetchBranchCommits lists the most recent commits on a branch, with no
+// "since" comparison — the fallback when there's no baseSHA to compare
+// from, or the compare call itself failed.
+func fetchBranchCommits(repo, branch string, perPage int) ([]githubCommitEntry, error) {
+	var entries []githubCommitEntry
+	url := fmt.Sprintf("https://api.github.com/repos/%s/commits?sha=%s&per_page=%d", repo, branch, perPage)
+	if err := githubAPIGet(url, &entries); err != nil {
+		return nil, fmt.Errorf("list commits on %s: %w", branch, err)
+	}
+	return entries, nil
+}
+
+func fetchReleases(repo string) ([]GithubRelease, error) {
+	var releases []GithubRelease
+	url := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=10", repo)
+	if err := githubAPIGet(url, &releases); err != nil {
+		return nil, fmt.Errorf("fetch releases for %s: %w", repo, err)
+	}
+	return releases, nil
+}
+
+// githubAPIGet is the shared HTTP-GET-and-decode helper for every GitHub
+// REST call this file makes (releases, compare, commits) — same auth
+// header, same timeout, same error shaping, so a rate-limit or a typo'd
+// PRESTOBACK_GITHUB_REPO reads identically no matter which endpoint hit it.
+func githubAPIGet(url string, out any) error {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
 	}
 	// GitHub's API rejects requests with no User-Agent.
 	req.Header.Set("User-Agent", "PrestoBack-selfupdate")
@@ -108,24 +273,23 @@ func fetchReleases(repo string) ([]GithubRelease, error) {
 	client := &http.Client{Timeout: githubAPITimeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch releases for %s: %w", repo, err)
+		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("repo %q not found (check PRESTOBACK_GITHUB_REPO)", repo)
+		return fmt.Errorf("not found (check PRESTOBACK_GITHUB_REPO and, for a branch, PRESTOBACK_GITHUB_BRANCH)")
 	}
 	if resp.StatusCode == http.StatusForbidden {
-		return nil, fmt.Errorf("GitHub API rate-limited — try again shortly")
+		return fmt.Errorf("GitHub API rate-limited — try again shortly")
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return nil, fmt.Errorf("GitHub API %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return fmt.Errorf("GitHub API %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	var releases []GithubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
-		return nil, fmt.Errorf("parse releases response: %w", err)
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("parse response: %w", err)
 	}
-	return releases, nil
+	return nil
 }
