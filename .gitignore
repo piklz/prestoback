@@ -33,3 +33,5 @@ vendor/
 
 # Git-related
 .git/
+
+GITHUB_ACTIONS_SETUP.*
