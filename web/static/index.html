@@ -983,6 +983,7 @@ select.fi{cursor:pointer}
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:4px">
         <div class="divlbl">Scheduled backup</div>
         <div class="ftog" onclick="togEditSched()"><div class="ftog-sw" id="edit-sched-tog"><div class="ftog-kn"></div></div><div class="ftog-lbl">Enable scheduled backup</div></div>
+        <div id="edit-sched-paused-hint" style="display:none;font-size:11px;color:var(--amber,#f0a020);margin-top:6px;padding:6px 10px;background:var(--bg4);border-radius:6px"></div>
         <div id="edit-sched-fields" style="display:none">
           <div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:10px">
             <button type="button" class="btn btn-g btn-sm" onclick="setCronPreset('ea-cron','0 3 * * *')">Daily 3am</button>
@@ -2153,9 +2154,22 @@ function renderApps() {
       else                            { col='var(--txt3)';  label='● '+state; }
       return `<div style="font-size:10px;color:${col};margin-top:2px;font-family:var(--mono)">${label}</div>`;
     })() : '';
-    const schedPill = a.schedule?.enabled && !a.pinned
-      ? `<span class="pill pg"><span class="pd"></span>${esc(a.schedule.cron_expr)}</span>`
-      : `<span class="pill" style="background:var(--bg4);color:var(--txt3)">manual</span>`;
+    // config.Schedule (Enabled + CronExpr) is shared state — Telegram's
+    // /schedpause, Discord, and the ⏸ button below all write the exact
+    // same field, so whichever one changed it, this pill has to be honest
+    // about it. Previously "enabled:false" collapsed to the same generic
+    // "manual" pill regardless of whether a real cron_expr existed — an
+    // app paused via /schedpause looked IDENTICAL to one that was never
+    // scheduled at all, which is the actual gap being fixed here: the web
+    // UI is the source of truth for this state, so it needs to keep
+    // showing what the schedule *was* even while paused, not go blank.
+    const schedPill = !a.schedule?.cron_expr
+      ? `<span class="pill" style="background:var(--bg4);color:var(--txt3)">manual</span>`
+      : a.pinned
+        ? `<span class="pill" style="background:var(--bg4);color:var(--txt3)" title="Pinned — scheduled backups are frozen regardless of this cron schedule"><span style="opacity:.65">${esc(a.schedule.cron_expr)}</span></span>`
+        : a.schedule.enabled
+          ? `<span class="pill pg"><span class="pd"></span>${esc(a.schedule.cron_expr)}</span>`
+          : `<span class="pill" style="background:var(--bg4);color:var(--txt3);border:1px solid var(--amber,#f0a020)" title="Schedule paused (via Telegram/Discord /schedpause or the ⏸ button here) — was ${esc(a.schedule.cron_expr)}. Resume with ▶ or /schedresume ${esc(a.name)}"><span style="opacity:.65;text-decoration:line-through">${esc(a.schedule.cron_expr)}</span>&nbsp;⏸</span>`;
     // Real next-run time under the cron pill, sourced from S.nextRuns
     // (populated by loadStatus from /api/status's next_runs — the scheduler's
     // own computed next fire time, not re-derived client-side, so it's always
@@ -2532,6 +2546,20 @@ function openEditApp(id) {
   _doPreviewCron('ea-cron', 'ea-cron-preview');
   S.editSchedOn=a.schedule?.enabled||false; setTog('edit-sched-tog',S.editSchedOn);
   document.getElementById('edit-sched-fields').style.display=S.editSchedOn?'':'none';
+  const pausedHint = document.getElementById('edit-sched-paused-hint');
+  if (pausedHint) {
+    // A cron_expr on file with enabled:false means this was paused, not
+    // never-scheduled — most often via Telegram/Discord's /schedpause,
+    // since that's a one-liner from chat where the web UI (this modal)
+    // wasn't open to see it happen. Surface it here so re-opening this
+    // toggle isn't the first time the user learns the schedule changed.
+    if (!S.editSchedOn && a.schedule?.cron_expr) {
+      pausedHint.style.display = '';
+      pausedHint.textContent = `⏸ This was paused (schedule kept: ${a.schedule.cron_expr}) — likely via /schedpause or the ⏸ button on Applications. Toggle back on to resume it.`;
+    } else {
+      pausedHint.style.display = 'none';
+    }
+  }
   S.editPinOn=a.pinned||false; setTog('edit-pin-tog',S.editPinOn);
   const maintNote = document.getElementById('edit-maint-note');
   if (maintNote) {
@@ -2563,7 +2591,12 @@ function openEditApp(id) {
   }
   OM('m-edit-app');
 }
-function togEditSched() { S.editSchedOn=!S.editSchedOn; setTog('edit-sched-tog',S.editSchedOn); document.getElementById('edit-sched-fields').style.display=S.editSchedOn?'':'none'; }
+function togEditSched() {
+  S.editSchedOn=!S.editSchedOn; setTog('edit-sched-tog',S.editSchedOn);
+  document.getElementById('edit-sched-fields').style.display=S.editSchedOn?'':'none';
+  const pausedHint = document.getElementById('edit-sched-paused-hint');
+  if (pausedHint) pausedHint.style.display = 'none'; // acted on it — the reminder's done its job
+}
 function togEditPin() { S.editPinOn=!S.editPinOn; setTog('edit-pin-tog',S.editPinOn); }
 async function submitEditApp() {
   const excludesRaw = (document.getElementById('ea-excludes').value||'')

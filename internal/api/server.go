@@ -3601,6 +3601,22 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ App not found: `%s`", notify.EscapeMD(arg)))
 			return
 		}
+		// /schedresume already refuses when there's no CronExpr to resume
+		// ("edit the app first") — /schedpause never had the matching
+		// check, so pausing an app with no schedule at all still flipped
+		// Schedule.Enabled to false, a config change with nothing behind
+		// it. The Applications page and /apps both read that same field as
+		// ground truth, so this silently produced a "paused" state for an
+		// app that was never scheduled in the first place, with no way to
+		// see why. Refusing here — rather than accepting a no-op and
+		// claiming success — is what actually fixes that, upstream of any
+		// UI change to how paused state is displayed.
+		if app.Schedule.CronExpr == "" {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+				"⚠️ `%s` has no backup schedule configured — nothing to pause\\.\nSet one up on the Applications page first, then /schedpause will have something to disable\\.",
+				notify.EscapeMD(app.Name)))
+			return
+		}
 		if !app.Schedule.Enabled {
 			_ = notify.SendRaw(tgCfg, fmt.Sprintf("⚠️ `%s` schedule is already paused", notify.EscapeMD(app.Name)))
 			return
@@ -3612,7 +3628,7 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 		}
 		_ = s.cfg.Save()
 		s.syncSchedule(*app) // removes the job from the scheduler
-		_ = notify.SendRaw(tgCfg, fmt.Sprintf("⏸ *%s* — schedule paused\nUse /schedresume %s to re\\-enable\\.",
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf("⏸ *%s* — schedule paused\nUse /schedresume %s to re\\-enable\\. The Applications page will show this too\\.",
 			notify.EscapeMD(app.Name), notify.EscapeMD(app.Name)))
 
 	case "/schedresume":
