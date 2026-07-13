@@ -1610,11 +1610,36 @@ function renderSelfUpdateBanner() {
 // Falls back to a plain "new image available" message if the changelog
 // itself couldn't be fetched (e.g. PRESTOBACK_GITHUB_REPO not set) — the
 // update is still real and applyable even without release notes.
+//
+// When there's no pending update at all, this used to just say "No pending
+// update." and stop there. S.currentVersionInfo (populated by checkUpdate's
+// up-to-date branch from /api/update/check's current_release) gives it
+// something real to show instead: what's actually in the version you're
+// running right now, with a link back to it on GitHub.
 function openChangelogModal() {
   const p = S.pendingSelfUpdate;
   const body = document.getElementById('changelog-body');
+  const ghLink = (url) => url
+    ? `<a href="${esc(url)}" target="_blank" rel="noopener" style="font-size:12px;color:var(--accent);text-decoration:none">View on GitHub →</a>`
+    : '';
   if (!p) {
-    body.innerHTML = '<p style="color:var(--txt3);font-size:13px">No pending update.</p>';
+    const cv = S.currentVersionInfo;
+    if (!cv) {
+      body.innerHTML = '<p style="color:var(--txt3);font-size:13px">No pending update, and no release notes are available for the running version (check PRESTOBACK_GITHUB_REPO is set).</p>';
+      document.getElementById('changelog-title').textContent = 'Up to date';
+      OM('m-changelog');
+      return;
+    }
+    const r = cv.release;
+    document.getElementById('changelog-title').textContent = '✅ Up to date';
+    body.innerHTML = `
+      <div style="margin-bottom:10px;font-size:12px;color:var(--green)">You're running the latest ${cv.isDev ? 'commit' : 'version'} already.</div>
+      <div style="padding-bottom:14px">
+        <div style="font-weight:600;font-size:14px;margin-bottom:4px">${esc(r.tag_name || r.name || '')}</div>
+        <div style="font-size:11px;color:var(--txt3);margin-bottom:8px">${r.published_at ? new Date(r.published_at).toLocaleDateString() : ''}</div>
+        <div style="font-size:13px;color:var(--txt2);line-height:1.6;margin-bottom:10px">${mdLite(r.body) || '<span style="color:var(--txt3)">(no description)</span>'}</div>
+        ${ghLink(r.html_url)}
+      </div>`;
     OM('m-changelog');
     return;
   }
@@ -1635,7 +1660,8 @@ function openChangelogModal() {
     <div style="margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--line)">
       <div style="font-weight:600;font-size:14px;margin-bottom:4px">${esc(r.tag_name || r.name || '')}</div>
       <div style="font-size:11px;color:var(--txt3);margin-bottom:8px">${r.published_at ? new Date(r.published_at).toLocaleDateString() : ''}</div>
-      <div style="font-size:13px;color:var(--txt2);line-height:1.6">${mdLite(r.body) || '<span style="color:var(--txt3)">(no description)</span>'}</div>
+      <div style="font-size:13px;color:var(--txt2);line-height:1.6;margin-bottom:8px">${mdLite(r.body) || '<span style="color:var(--txt3)">(no description)</span>'}</div>
+      ${ghLink(r.html_url)}
     </div>`).join('');
   OM('m-changelog');
 }
@@ -1755,17 +1781,36 @@ async function checkForUpdatesNow() {
     S.pendingUpdates = S.lastUpdateReports
       .filter(r => r.images.some(im => im.update_available))
       .map(r => r.app_name);
+
+    // Self-update used to be entirely invisible to this button — it only
+    // ever checked app images, so a new PrestoBack release sat undetected
+    // here until the background self-update loop's own 6h schedule caught
+    // up. The backend now folds a real self-update check into the same
+    // /api/updates/check call, so one Check Now covers both — the
+    // dashboard banner (renderSelfUpdateBanner) reflects it right away,
+    // same as the digest table on Settings > Updates would.
+    const su = data.self_update || {};
+    if (su.available) {
+      S.pendingSelfUpdate = {
+        releases: su.releases || [], changelog_err: su.changelog_err || '',
+        is_dev_build: su.is_dev_build, source_branch: su.source_branch
+      };
+    } else if (!su.error) {
+      S.pendingSelfUpdate = null;
+    }
+    renderSelfUpdateBanner();
     renderUpdatesBanner();
     renderApps();
     const nUpdates = S.pendingUpdates.length;
     const nIssues = S.lastUpdateReports.filter(r => r.images.some(im => im.err && !im.skipped)).length;
-    if (nUpdates === 0 && nIssues === 0) {
+    if (nUpdates === 0 && nIssues === 0 && !su.available) {
       toast('Everything up to date');
     } else {
       const parts = [];
       if (nUpdates) parts.push(`${nUpdates} app(s) have updates`);
+      if (su.available) parts.push('PrestoBack update available');
       if (nIssues) parts.push(`${nIssues} check issue(s)`);
-      toast(parts.join(' · '), nUpdates ? 'success' : 'error');
+      toast(parts.join(' · '), (nUpdates || su.available) ? 'success' : 'error');
     }
   } catch (e) {
     toast('Update check failed: ' + (e.message || e), 'error');
@@ -4342,6 +4387,11 @@ async function checkUpdate() {
       document.getElementById('upd-update-btn-row').style.display = 'none';
       document.getElementById('upd-dot').classList.remove('show');
       S.pendingSelfUpdate = null;
+      // Cached for openChangelogModal's fallback — "up to date" used to
+      // mean the modal just said "No pending update." with nothing else.
+      S.currentVersionInfo = r.current_release
+        ? { release: r.current_release, isDev: !!r.current_release_is_dev }
+        : null;
       renderSelfUpdateBanner();
       toast('Already up to date ✓', 'info');
     }

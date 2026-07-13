@@ -97,6 +97,44 @@ func FetchLatestRelease(repo string) (GithubRelease, error) {
 	return GithubRelease{}, fmt.Errorf("no published releases found for %s", repo)
 }
 
+// FetchReleaseByTag fetches a single named release — the currently RUNNING
+// version's own notes, as opposed to FetchReleasesSince/FetchLatestRelease
+// which only ever look at what's newer. Used when there's no pending
+// update: rather than a bare "you're up to date" with nothing else,
+// /changelog and the changelog modal fall back to showing what's actually
+// in the version you're running right now. Tries both the tag as given and
+// with/without a leading "v", same tolerance FetchReleasesSince already
+// applies when comparing tags against config.Version.
+func FetchReleaseByTag(repo, tag string) (GithubRelease, error) {
+	if repo == "" {
+		return GithubRelease{}, fmt.Errorf("no GitHub repo configured (set PRESTOBACK_GITHUB_REPO)")
+	}
+	tag = strings.TrimSpace(tag)
+	candidates := []string{tag}
+	if strings.HasPrefix(tag, "v") {
+		candidates = append(candidates, strings.TrimPrefix(tag, "v"))
+	} else {
+		candidates = append(candidates, "v"+tag)
+	}
+	var lastErr error
+	for _, t := range candidates {
+		if t == "" {
+			continue
+		}
+		var r GithubRelease
+		url := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, t)
+		if err := githubAPIGet(url, &r); err == nil {
+			return r, nil
+		} else {
+			lastErr = err
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no release found matching %q", tag)
+	}
+	return GithubRelease{}, lastErr
+}
+
 // ── Branch-aware changelog (dev/CI builds vs tagged releases) ─────────────────
 //
 // FetchReleasesSince (above) only makes sense for the main/release track:
@@ -226,6 +264,40 @@ func FetchCommitsSince(repo, branch, baseSHA string) ([]GithubRelease, error) {
 		})
 	}
 	return out, nil
+}
+
+// FetchCommitByHash fetches a single commit's own info — the dev-track
+// equivalent of FetchReleaseByTag, shaped into the same GithubRelease
+// struct as FetchCommitsSince's entries so the same rendering code handles
+// both. Used for "what's in the commit I'm currently running", when
+// there's nothing newer to show.
+func FetchCommitByHash(repo, sha string) (GithubRelease, error) {
+	if repo == "" {
+		return GithubRelease{}, fmt.Errorf("no GitHub repo configured (set PRESTOBACK_GITHUB_REPO)")
+	}
+	if sha == "" {
+		return GithubRelease{}, fmt.Errorf("no commit SHA to look up")
+	}
+	var c githubCommitEntry
+	url := fmt.Sprintf("https://api.github.com/repos/%s/commits/%s", repo, sha)
+	if err := githubAPIGet(url, &c); err != nil {
+		return GithubRelease{}, err
+	}
+	headline := c.Commit.Message
+	if idx := strings.IndexByte(headline, '\n'); idx >= 0 {
+		headline = headline[:idx]
+	}
+	short := c.SHA
+	if len(short) > 8 {
+		short = short[:8]
+	}
+	return GithubRelease{
+		TagName:     short,
+		Name:        headline,
+		Body:        c.Commit.Message,
+		PublishedAt: c.Commit.Author.Date,
+		HTMLURL:     c.HTMLURL,
+	}, nil
 }
 
 type githubCommitEntry struct {

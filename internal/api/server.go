@@ -3019,7 +3019,12 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		// digests). Local and remote are the same image here, so the remote
 		// row reuses localCreated rather than spending another registry
 		// round trip just to confirm what's already known.
-		respond(w, 200, map[string]any{
+		//
+		// current_release is what the changelog modal falls back to
+		// showing instead of a bare "No pending update." — the currently
+		// running version/commit's own notes, since there's nothing newer
+		// to display.
+		resp := map[string]any{
 			"available":      false,
 			"local_digest":   localDigest,
 			"remote_digest":  remoteDigest,
@@ -3027,7 +3032,12 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 			"locally_built":  localDigest == "local-build",
 			"local_created":  localCreated,
 			"remote_created": localCreated,
-		})
+		}
+		if rel, isDev, ok := s.CurrentVersionInfo(); ok {
+			resp["current_release"] = rel
+			resp["current_release_is_dev"] = isDev
+		}
+		respond(w, 200, resp)
 		return
 	}
 	respond(w, 200, map[string]any{
@@ -3057,11 +3067,22 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 // can do; Telegram/Discord/ntfy are notification front-ends on top of it, not
 // a separate feature surface — so this closes that gap.
 //
-// notifyUser is false here: the dashboard rendering the result on-screen IS
-// the notification for this request. It still updates s.pendingUpdates /
-// s.pendingUpdateDetails under the hood (checkForUpdates always does that
-// regardless of notifyUser), so the compact dashboard badges reflect this
-// check immediately too, same as they would after the background loop runs.
+// notifyUser is false for the per-app check here: the dashboard rendering
+// the result on-screen IS the notification for this request. It still
+// updates s.pendingUpdates / s.pendingUpdateDetails under the hood
+// (checkForUpdates always does that regardless of notifyUser), so the
+// compact dashboard badges reflect this check immediately too, same as they
+// would after the background loop runs.
+//
+// PrestoBack's own image used to be entirely invisible to this button — it
+// only ever checked app images, so a new PrestoBack release sat undetected
+// until the background self-update loop's own schedule caught up (every
+// 6h) or someone ran /selfupdate by hand. checkSelfUpdate is now folded in
+// here too, WITH notifyUser=true: a genuinely new self-update find still
+// reaches Telegram/Discord/ntfy from a manual Check Now, not just the
+// dashboard — while checkSelfUpdate's own alreadyAlerted debounce (force is
+// still false) stops that from re-notifying an update someone was already
+// told about.
 func (s *Server) handleUpdatesCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		errOut(w, 405, "method not allowed")
@@ -3075,7 +3096,22 @@ func (s *Server) handleUpdatesCheck(w http.ResponseWriter, r *http.Request) {
 	if reports == nil {
 		reports = []AppUpdateReport{}
 	}
-	respond(w, 200, map[string]any{"docker_ok": true, "reports": reports})
+
+	selfResp := map[string]any{"available": false}
+	if s.image != "" {
+		pending, _, _, err := s.checkSelfUpdate(true, false)
+		if err != nil {
+			selfResp["error"] = err.Error()
+		} else if pending != nil {
+			selfResp["available"] = true
+			selfResp["releases"] = pending.Releases
+			selfResp["changelog_err"] = pending.ChangelogErr
+			selfResp["is_dev_build"] = pending.IsDevBuild
+			selfResp["source_branch"] = pending.SourceBranch
+		}
+	}
+
+	respond(w, 200, map[string]any{"docker_ok": true, "reports": reports, "self_update": selfResp})
 }
 
 func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
@@ -3414,7 +3450,18 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Changelog check failed: `%s`", notify.EscapeMD(err.Error())))
 			return
 		}
-		if err := notify.SendRaw(tgCfg, buildFullChangelogMessage(pending)); err != nil {
+		// No pending update used to just mean buildFullChangelogMessage(nil)
+		// — "No pending PrestoBack update." and nothing else. Falling back
+		// to what's actually running (CurrentVersionInfo) is what makes
+		// this command useful even when there's nothing new: you still get
+		// the current version's own notes and a link to it.
+		var msg string
+		if pending == nil || len(pending.Releases) == 0 {
+			msg = s.buildCurrentVersionMessage()
+		} else {
+			msg = buildFullChangelogMessage(pending)
+		}
+		if err := notify.SendRaw(tgCfg, msg); err != nil {
 			log.Printf("[bot] changelog reply: %v", err)
 		}
 
@@ -4031,7 +4078,11 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 				// instead (see runTelegramBot's startup notification).
 			}()
 		case "changelog":
-			_ = notify.SendRaw(tgCfg, buildFullChangelogMessage(pending))
+			if pending == nil || len(pending.Releases) == 0 {
+				_ = notify.SendRaw(tgCfg, s.buildCurrentVersionMessage())
+			} else {
+				_ = notify.SendRaw(tgCfg, buildFullChangelogMessage(pending))
+			}
 		case "dismiss":
 			s.stateMu.Lock()
 			s.selfUpdateAlertSent = false

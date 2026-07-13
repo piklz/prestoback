@@ -191,11 +191,54 @@ func (s *Server) checkSelfUpdate(notifyUser, force bool) (pending *PendingSelfUp
 	return p, local, remote, nil
 }
 
-// buildSelfUpdateMessage renders a short "update available" summary —
-// version delta plus the first release's headline notes, trimmed. Full
-// per-version notes are available via the "📋 Full changelog" button
-// (handleTelegramCallback → "selfupdate:changelog") rather than crammed in
-// here, since a multi-version gap can be long.
+// CurrentVersionInfo looks up the CURRENTLY RUNNING version's own release
+// or commit info — not what's newer, what's already here. Used when
+// checkSelfUpdate finds nothing pending: rather than a bare "you're up to
+// date," /changelog, the changelog modal, and any other output that would
+// otherwise show nothing fall back to displaying what's actually in the
+// running build, with a link back to it on GitHub.
+//
+// ok is false when there's nothing to show — no GitHub repo configured, or
+// the lookup itself failed (network error, tag/commit not found, etc.) —
+// callers should fall back to a plain "up to date" message rather than
+// treating that as a hard error.
+func (s *Server) CurrentVersionInfo() (release GithubRelease, isDev bool, ok bool) {
+	repo := githubRepo()
+	if repo == "" {
+		return GithubRelease{}, false, false
+	}
+	_, baseSHA, isDev := backup.DevTrackInfo(s.image, config.Version)
+	if isDev {
+		if baseSHA == "" {
+			return GithubRelease{}, true, false
+		}
+		r, err := backup.FetchCommitByHash(repo, baseSHA)
+		if err != nil {
+			log.Printf("[selfupdate] current commit lookup failed: %v", err)
+			return GithubRelease{}, true, false
+		}
+		r.Body = stripReleaseBoilerplate(r.Body)
+		return r, true, true
+	}
+	r, err := backup.FetchReleaseByTag(repo, config.Version)
+	if err != nil {
+		log.Printf("[selfupdate] current release lookup failed: %v", err)
+		return GithubRelease{}, false, false
+	}
+	r.Body = stripReleaseBoilerplate(r.Body)
+	return r, false, true
+}
+
+// buildSelfUpdateMessage renders a short "update available" summary — just
+// the version delta, never the release body. Full per-version notes live
+// in exactly one place: the "📋 Full changelog" button
+// (handleTelegramCallback → "selfupdate:changelog") / buildFullChangelogMessage.
+// This used to also inline the first release's body (truncated) for the
+// single-release case specifically — which meant tapping "Full changelog"
+// right after reproduced almost the same text a second time, just
+// truncated differently (500 chars here vs 800 there). Keeping this
+// summary body-free in every case, not just the multi-release one, is what
+// actually fixes that duplication rather than just moving it around.
 func buildSelfUpdateMessage(p *PendingSelfUpdate) string {
 	var sb strings.Builder
 	sb.WriteString("⬆️ *PrestoBack update available*\n\n")
@@ -203,18 +246,18 @@ func buildSelfUpdateMessage(p *PendingSelfUpdate) string {
 		sb.WriteString(fmt.Sprintf("_Dev build — tracking `%s`_\n\n", notify.EscapeMD(p.SourceBranch)))
 	}
 	unit := changelogUnit(p)
+	fullLabel := "release notes"
+	if p.IsDevBuild {
+		fullLabel = "commit log"
+	}
 	if len(p.Releases) == 1 {
 		r := p.Releases[0]
-		sb.WriteString(fmt.Sprintf("*%s*\n", notify.EscapeMD(displayVersion(r))))
-		sb.WriteString(renderReleaseBodyTelegram(truncateRaw(r.Body, 500)))
+		sb.WriteString(fmt.Sprintf("*%s* — %s\n\n", notify.EscapeMD(displayVersion(r)), notify.EscapeMD(r.PublishedAt.Format("2006-01-02"))))
+		sb.WriteString(fmt.Sprintf("Tap 📋 for the full %s\\.", notify.EscapeMD(fullLabel)))
 	} else if len(p.Releases) > 1 {
 		sb.WriteString(fmt.Sprintf("*%d new %s* since `%s`:\n\n", len(p.Releases), unit, notify.EscapeMD(config.Version)))
 		for _, r := range p.Releases {
 			sb.WriteString(fmt.Sprintf("• *%s*\n", notify.EscapeMD(displayVersion(r))))
-		}
-		fullLabel := "release notes"
-		if p.IsDevBuild {
-			fullLabel = "commit log"
 		}
 		sb.WriteString(fmt.Sprintf("\nTap 📋 for the full %s\\.", notify.EscapeMD(fullLabel)))
 	} else {
@@ -243,8 +286,26 @@ func changelogUnit(p *PendingSelfUpdate) string {
 	return "version\\(s\\)"
 }
 
+// telegramLink renders a MarkdownV2 inline link. Per Telegram's spec, only
+// ')' and '\' need escaping inside the URL portion of a link — unlike link
+// text, which needs the full MarkdownV2 escape set notify.EscapeMD already
+// handles. Returns just the escaped text with no link if url is empty,
+// rather than emitting a broken `[text]()`.
+func telegramLink(text, url string) string {
+	if url == "" {
+		return notify.EscapeMD(text)
+	}
+	safeURL := strings.NewReplacer(`\`, `\\`, `)`, `\)`).Replace(url)
+	return fmt.Sprintf("[%s](%s)", notify.EscapeMD(text), safeURL)
+}
+
 // buildFullChangelogMessage renders every pending release's full notes —
-// what the "📋 Full changelog" button and the /changelog command both show.
+// what the "📋 Full changelog" button and the /changelog command both show
+// when there IS a pending update. Callers should use
+// Server.buildCurrentVersionMessage instead when pending is nil/empty —
+// kept as a separate function (rather than folded in here) since that
+// fallback needs *Server for the CurrentVersionInfo lookup, which this
+// function deliberately doesn't take.
 func buildFullChangelogMessage(p *PendingSelfUpdate) string {
 	if p == nil || len(p.Releases) == 0 {
 		if p != nil && p.ChangelogErr != "" {
@@ -261,7 +322,40 @@ func buildFullChangelogMessage(p *PendingSelfUpdate) string {
 	for _, r := range p.Releases {
 		sb.WriteString(fmt.Sprintf("*%s* — %s\n", notify.EscapeMD(displayVersion(r)), notify.EscapeMD(r.PublishedAt.Format("2006-01-02"))))
 		sb.WriteString(renderReleaseBodyTelegram(truncateRaw(r.Body, 800)))
+		if r.HTMLURL != "" {
+			sb.WriteString("\n" + telegramLink("View on GitHub →", r.HTMLURL))
+		}
 		sb.WriteString("\n\n")
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// buildCurrentVersionMessage renders what's actually running right now —
+// the useful fallback for /changelog and the "Full changelog" button when
+// checkSelfUpdate found no pending update. This used to just be a bare
+// "No pending PrestoBack update," which is accurate but tells you nothing
+// — CurrentVersionInfo gives it something real instead: the running
+// version/commit's own release notes and a link back to it on GitHub.
+func (s *Server) buildCurrentVersionMessage() string {
+	r, isDev, ok := s.CurrentVersionInfo()
+	if !ok {
+		return fmt.Sprintf("✅ Already up to date — running `%s`\\.", notify.EscapeMD(config.Version))
+	}
+	var sb strings.Builder
+	if isDev {
+		sb.WriteString(fmt.Sprintf("✅ *Up to date* — running commit `%s`\n\n", notify.EscapeMD(r.TagName)))
+	} else {
+		sb.WriteString(fmt.Sprintf("✅ *Up to date* — running *%s*\n\n", notify.EscapeMD(displayVersion(r))))
+	}
+	if !r.PublishedAt.IsZero() {
+		sb.WriteString(fmt.Sprintf("_%s_\n\n", notify.EscapeMD(r.PublishedAt.Format("2006-01-02"))))
+	}
+	if r.Body != "" {
+		sb.WriteString(renderReleaseBodyTelegram(truncateRaw(r.Body, 800)))
+		sb.WriteString("\n\n")
+	}
+	if r.HTMLURL != "" {
+		sb.WriteString(telegramLink("View on GitHub →", r.HTMLURL))
 	}
 	return strings.TrimRight(sb.String(), "\n")
 }
@@ -292,7 +386,11 @@ func buildSelfUpdateDiscordMessage(p *PendingSelfUpdate) (title, description str
 	}
 	sb.WriteString(fmt.Sprintf("**%d new %s** since `%s`\n\n", len(p.Releases), unit, config.Version))
 	for _, r := range p.Releases {
-		sb.WriteString(fmt.Sprintf("**%s**\n%s\n\n", displayVersion(r), truncateRaw(r.Body, 300)))
+		sb.WriteString(fmt.Sprintf("**%s**\n%s\n", displayVersion(r), truncateRaw(r.Body, 300)))
+		if r.HTMLURL != "" {
+			sb.WriteString(fmt.Sprintf("[View on GitHub](%s)\n", r.HTMLURL))
+		}
+		sb.WriteString("\n")
 	}
 	return title, strings.TrimSpace(sb.String())
 }
