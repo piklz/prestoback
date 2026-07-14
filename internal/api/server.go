@@ -690,17 +690,17 @@ func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if nc.DiscordEnabled && nc.DiscordURL != "" {
-		if err := notify.SendWebhook(nc.DiscordURL, ev); err != nil {
+		if err := notify.SendDiscordWebhook(nc.DiscordURL, ev); err != nil {
 			errs = append(errs, "discord: "+err.Error())
 		}
 	}
 	if nc.NtfyEnabled && nc.NtfyURL != "" {
-		if err := notify.SendWebhook(nc.NtfyURL, ev); err != nil {
+		if err := notify.SendNtfyWebhook(nc.NtfyURL, ev); err != nil {
 			errs = append(errs, "ntfy: "+err.Error())
 		}
 	}
 	if nc.WebhookEnabled && nc.WebhookURL != "" {
-		if err := notify.SendWebhook(nc.WebhookURL, ev); err != nil {
+		if err := notify.SendGenericWebhook(nc.WebhookURL, ev); err != nil {
 			errs = append(errs, "webhook: "+err.Error())
 		}
 	}

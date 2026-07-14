@@ -26,7 +26,6 @@ package config
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"time"
@@ -53,11 +52,6 @@ func generatePairingCode() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
-}
-
-func hashKey(key string) string {
-	sum := sha256.Sum256([]byte(key))
-	return hex.EncodeToString(sum[:])
 }
 
 // sweepExpiredPairings drops anything past its TTL. Called lazily from
@@ -143,12 +137,12 @@ func (c *Config) ClaimPairing(code, name string) (apiKey string, err error) {
 		return "", fmt.Errorf("too many attempts for this code — generate a new one")
 	}
 
-	newKey := generateKey()
+	newKey := GenerateAPIKey()
 	id := generatePairedKeyID()
 	c.pairedKeys[id] = PairedKey{
 		ID:        id,
 		Name:      name,
-		KeyHash:   hashKey(newKey),
+		KeyHash:   HashAPIKey(newKey),
 		CreatedAt: now,
 	}
 	p.Claimed = true
@@ -169,16 +163,20 @@ func generatePairedKeyID() string {
 
 // ValidatePairedKey checks key against every stored paired key by hash.
 // Linear scan is fine here — this app expects a handful of paired keys at
-// most, not hundreds.
+// most, not hundreds. Uses SecureEquals (apikey.go) rather than `==`, same
+// as ValidateAPIKey — a paired key grants the same admin-equivalent access
+// as the master key (see internal/api/auth.go's authJWT), so it gets the
+// same comparison guarantees, not a weaker one just because it's the
+// "secondary" credential.
 func (c *Config) ValidatePairedKey(key string) (PairedKey, bool) {
 	if key == "" {
 		return PairedKey{}, false
 	}
-	h := hashKey(key)
+	h := HashAPIKey(key)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for _, pk := range c.pairedKeys {
-		if pk.KeyHash == h {
+		if SecureEquals(pk.KeyHash, h) {
 			return pk, true
 		}
 	}

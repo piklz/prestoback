@@ -187,6 +187,24 @@ func AnswerCallbackQuery(token, callbackQueryID, text string) error {
 
 // ── Webhook (Ntfy, Gotify, Discord, generic) ──────────────────────────────────
 
+// SendWebhook is a best-effort dispatcher for a single URL of UNKNOWN
+// channel type — it guesses Discord vs ntfy.sh vs "some other generic
+// endpoint" from the URL shape. Prefer the explicit, typed senders below
+// (SendDiscordWebhook / SendNtfyWebhook / SendGenericWebhook) whenever the
+// caller already knows which channel a URL belongs to — which is every
+// caller in this codebase today (see handleNotifyTest in internal/api,
+// which knows exactly whether it's testing the Discord, Ntfy, or generic
+// Webhook field). Guessing should only ever be a fallback for a genuinely
+// unknown URL, never the primary way a known channel gets routed.
+//
+// The only URL shape this can identify with real confidence is Discord's
+// (a fixed, documented path) and ntfy's public instance. Anything else
+// defaults to sendGeneric — a JSON POST is the safer unknown-default: most
+// self-hosted ingestion endpoints (Gotify, n8n, a custom script, Slack's
+// own incoming-webhook URLs) expect JSON, so a wrong guess there still
+// produces a payload many receivers can parse, whereas guessing "ntfy"
+// wrongly sends a plain-text body with ntfy-specific headers that nothing
+// else understands.
 func SendWebhook(webhookURL string, ev Event) error {
 	if webhookURL == "" {
 		return fmt.Errorf("webhook URL not configured")
@@ -194,8 +212,34 @@ func SendWebhook(webhookURL string, ev Event) error {
 	if strings.Contains(webhookURL, "discord.com/api/webhooks") {
 		return sendDiscord(webhookURL, ev)
 	}
-	if strings.Contains(webhookURL, "ntfy.sh") || isNtfyURL(webhookURL) {
+	if isNtfyURL(webhookURL) {
 		return sendNtfy(webhookURL, ev)
+	}
+	return sendGeneric(webhookURL, ev)
+}
+
+// SendDiscordWebhook, SendNtfyWebhook, and SendGenericWebhook are explicit,
+// type-safe equivalents of SendWebhook's three branches — exported so a
+// caller who already knows a URL's channel (e.g. because it came from
+// Config.DiscordURL specifically, not a generic "webhook_url" field) can
+// send to it directly without going through any URL-shape guessing at all.
+func SendDiscordWebhook(webhookURL string, ev Event) error {
+	if webhookURL == "" {
+		return fmt.Errorf("discord webhook URL not configured")
+	}
+	return sendDiscord(webhookURL, ev)
+}
+
+func SendNtfyWebhook(topicURL string, ev Event) error {
+	if topicURL == "" {
+		return fmt.Errorf("ntfy URL not configured")
+	}
+	return sendNtfy(topicURL, ev)
+}
+
+func SendGenericWebhook(webhookURL string, ev Event) error {
+	if webhookURL == "" {
+		return fmt.Errorf("webhook URL not configured")
 	}
 	return sendGeneric(webhookURL, ev)
 }
@@ -482,6 +526,15 @@ func httpPost(url, contentType string, body []byte) (*http.Response, error) {
 	return client.Post(url, contentType, bytes.NewReader(body))
 }
 
+// isNtfyURL positively identifies ntfy's public instance. Self-hosted ntfy
+// on a custom domain has no distinguishing URL shape to detect, so it's
+// deliberately NOT guessed here — a self-hosted ntfy user should use
+// SendNtfyWebhook directly (as handleNotifyTest's Ntfy branch does) rather
+// than relying on SendWebhook's guess. This used to be
+// "!strings.Contains(url, "discord") && !strings.Contains(url, "webhook")",
+// which is true for almost any URL (Gotify, Slack, a plain custom script)
+// and silently sent them all in ntfy's plain-text-body-plus-headers format
+// instead of sendGeneric's JSON payload.
 func isNtfyURL(url string) bool {
-	return !strings.Contains(url, "discord") && !strings.Contains(url, "webhook")
+	return strings.Contains(url, "ntfy.sh")
 }

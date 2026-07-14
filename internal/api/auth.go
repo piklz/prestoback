@@ -40,7 +40,7 @@ const (
 	roleAdmin = "admin"
 	// roleViewer can log in and read state, but every mutating endpoint
 	// (backup/restore/container/stack control, settings changes) rejects it.
-	// See requireAdmin() below — this is intentionally a single coarse
+	// See adminForWrites() below — this is intentionally a single coarse
 	// read/write boundary, not a granular permission matrix.
 	roleViewer = "viewer"
 )
@@ -169,26 +169,6 @@ func jwtVerify(token string, secret []byte) (*jwtClaims, error) {
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 
-// requireAdmin wraps a handler that's already behind authJWT and additionally
-// rejects any request whose X-Auth-Role isn't admin. Use this on every
-// mutating endpoint (backup/restore/delete, container/stack control, settings
-// changes); leave plain authJWT on read-only (GET) endpoints so a viewer
-// account can still see everything, just not change anything.
-//
-// This is a coarse read/write boundary, not a granular permission system —
-// deliberately so. A homelab tool with one operator plus maybe one or two
-// people who just want to check status doesn't need per-endpoint ACLs; it
-// needs "can look" vs "can touch," and that's what this gives.
-func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Auth-Role") != roleAdmin {
-			errOut(w, 403, "this action requires an admin account")
-			return
-		}
-		next(w, r)
-	}
-}
-
 // adminForWrites wraps authJWT(next) and additionally requires an admin role
 // for any non-GET request, while any authenticated role (including viewer)
 // can still GET. This lets a single route/handler serve both a read (e.g.
@@ -230,7 +210,7 @@ func (s *Server) authJWT(next http.HandlerFunc) http.HandlerFunc {
 			key = r.URL.Query().Get("api_key")
 		}
 		if key != "" {
-			if key == s.cfg.APIKey() {
+			if s.cfg.ValidateAPIKey(key) {
 				r.Header.Set("X-Auth-User", "api-key")
 				r.Header.Set("X-Auth-Role", roleAdmin)
 				next(w, r)

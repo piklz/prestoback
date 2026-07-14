@@ -1,8 +1,6 @@
 package config
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -350,7 +348,7 @@ func Load(dataDir string) (*Config, error) {
 	path := filepath.Join(dataDir, "config.json")
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		c.apiKey = generateKey()
+		c.apiKey = GenerateAPIKey()
 		return c, nil
 	}
 	if err != nil {
@@ -362,7 +360,7 @@ func Load(dataDir string) (*Config, error) {
 	}
 	c.apiKey = d.APIKey
 	if c.apiKey == "" {
-		c.apiKey = generateKey()
+		c.apiKey = GenerateAPIKey()
 	}
 	for _, a := range d.Apps {
 		if a.Retain <= 0 {
@@ -460,15 +458,39 @@ func (c *Config) save() error {
 
 // ── API key ───────────────────────────────────────────────────────────────────
 
+// APIKey returns the raw master key. Used only where the raw value is
+// actually required — signing/verifying JWTs (it doubles as the HMAC
+// secret, see internal/api/auth.go's jwtSecret) and displaying/regenerating
+// it in the settings UI. Anything that's checking a caller-supplied
+// candidate against this must call ValidateAPIKey instead of comparing the
+// return value directly — see that method's doc comment for why.
 func (c *Config) APIKey() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.apiKey
 }
 
+// ValidateAPIKey reports whether candidate matches the current master API
+// key. This is the ONLY sanctioned way to check a caller-supplied key
+// against the stored one — it compares via SecureEquals (apikey.go),
+// which is constant-time and doesn't leak the key's length the way a
+// plain `candidate == c.APIKey()` would. Every credential check in
+// PrestoBack (this one, and ValidatePairedKey in pairing.go) goes through
+// SecureEquals for exactly this reason; a new credential type added later
+// should do the same rather than reintroducing a bare `==`.
+func (c *Config) ValidateAPIKey(candidate string) bool {
+	if candidate == "" {
+		return false
+	}
+	c.mu.RLock()
+	key := c.apiKey
+	c.mu.RUnlock()
+	return SecureEquals(candidate, key)
+}
+
 func (c *Config) RegenerateAPIKey() string {
 	c.mu.Lock()
-	c.apiKey = generateKey()
+	c.apiKey = GenerateAPIKey()
 	c.revokedTokens = make(map[string]struct{})
 	c.mu.Unlock()
 	_ = c.Save()
@@ -672,12 +694,6 @@ func (c *Config) SetRemote(r RemoteConfig) {
 
 func (c *Config) BackupDir() string   { return filepath.Join(c.DataDir, "backups") }
 func (c *Config) HistoryFile() string { return filepath.Join(c.DataDir, "history.json") }
-
-func generateKey() string {
-	b := make([]byte, 32)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
-}
 
 // slugFromPath derives a short identifier from the last component of a path.
 // "/volumes/mosquitto/config" → "config"
