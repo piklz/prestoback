@@ -1717,6 +1717,15 @@ func extractTarGz(archivePath, destPath string, onBytes func(int64)) error {
 
 	tr := tar.NewReader(gr)
 	fileCount := 0
+	// chownFailures counts entries whose original owner could NOT be
+	// restored (summarized once at the end, not logged per-file, so a
+	// restore onto a filesystem/user that can't chown — e.g. not running as
+	// root, or a target FS like some NFS/CIFS mounts that reject arbitrary
+	// ownership — doesn't flood the log for every entry in a large
+	// archive). This is never fatal to the restore itself: the file is
+	// still written with its original permission bits either way, just not
+	// necessarily its original owner.
+	chownFailures := 0
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -1745,6 +1754,9 @@ func extractTarGz(archivePath, destPath string, onBytes func(int64)) error {
 			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)|0755); err != nil {
 				return fmt.Errorf("mkdir %s: %w", target, err)
 			}
+			if err := restoreOwnership(target, hdr); err != nil {
+				chownFailures++
+			}
 		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return fmt.Errorf("mkdir parent for %s: %w", target, err)
@@ -1758,14 +1770,40 @@ func extractTarGz(archivePath, destPath string, onBytes func(int64)) error {
 				return fmt.Errorf("write %s: %w", target, err)
 			}
 			out.Close()
+			if err := restoreOwnership(target, hdr); err != nil {
+				chownFailures++
+			}
 			fileCount++
 		case tar.TypeSymlink:
 			_ = os.Remove(target)
 			if err := os.Symlink(hdr.Linkname, target); err != nil {
 				log.Printf("warn: symlink %s → %s: %v", target, hdr.Linkname, err)
+				continue
+			}
+			// Lchown, not Chown — a symlink's own ownership is a distinct
+			// attribute from its target's; Chown here would follow the
+			// link and (mis)chown whatever it points at instead.
+			if err := restoreOwnership(target, hdr); err != nil {
+				chownFailures++
 			}
 		}
 	}
 	log.Printf("Extracted %d files to %s", fileCount, destPath)
+	if chownFailures > 0 {
+		log.Printf("warn: restored %d entries without their original owner (uid/gid) — permission bits were still restored. "+
+			"This usually means prestoback isn't running as root (chown to an arbitrary uid/gid requires it) or the destination filesystem doesn't support it. "+
+			"Affected apps may need a manual chown if they run as a non-root user.", chownFailures)
+	}
 	return nil
+}
+
+// restoreOwnership applies hdr's original uid/gid to the just-created entry
+// at target, using Lchown so a symlink's own ownership is set rather than
+// its target's (see the TypeSymlink case above). The tar header already
+// carries this — tarGz's own writer populates it automatically via
+// tar.FileInfoHeader on Linux — extraction just wasn't using it. Errors are
+// intentionally non-fatal to the overall restore (see chownFailures above);
+// the caller is responsible for counting/reporting them.
+func restoreOwnership(target string, hdr *tar.Header) error {
+	return os.Lchown(target, hdr.Uid, hdr.Gid)
 }
