@@ -1576,7 +1576,26 @@ func tarGz(srcDir, destFile string, excludes []string, onBytes func(int64)) (int
 			log.Printf("walk warning: %v — skipping %s", walkErr, path)
 			return nil
 		}
-		if !info.Mode().IsDir() && !info.Mode().IsRegular() {
+		// info comes from Lstat (filepath.Walk never follows symlinks for
+		// its own traversal), so a symlink's mode has ModeSymlink set and
+		// previously failed both the IsDir() and IsRegular() checks below
+		// — meaning every symlink was silently dropped from every backup,
+		// with no log line and no trace it ever existed. Confirmed this
+		// isn't just theoretical: a real scan of this stack's volumes
+		// turned up rolling-log and latest-snapshot symlinks (overseerr,
+		// motioneye) that were vanishing on every single backup.
+		//
+		// Symlinks are archived as their literal target string (via
+		// os.Readlink, unresolved) — not followed, not verified to exist,
+		// not required to point inside srcDir. That matches what tar/rsync
+		// do, and what extractTarGz already expects on the restore side
+		// (os.Symlink(hdr.Linkname, target), which likewise doesn't care
+		// whether the target exists). A symlink pointing at a directory is
+		// archived as a leaf, same as any other symlink — Walk doesn't
+		// descend through it, so there's no directory-cycle risk from a
+		// self-referential or circular symlink chain.
+		isSymlink := info.Mode()&os.ModeSymlink != 0
+		if !info.Mode().IsDir() && !info.Mode().IsRegular() && !isSymlink {
 			return nil
 		}
 		rel, err := filepath.Rel(parentDir, path)
@@ -1595,6 +1614,19 @@ func tarGz(srcDir, destFile string, excludes []string, onBytes func(int64)) (int
 				return filepath.SkipDir
 			}
 			return nil
+		}
+		if isSymlink {
+			linkTarget, err := os.Readlink(path)
+			if err != nil {
+				log.Printf("warn: cannot read symlink target for %s: %v — skipping", path, err)
+				return nil
+			}
+			hdr, err := tar.FileInfoHeader(info, linkTarget)
+			if err != nil {
+				return err
+			}
+			hdr.Name = filepath.ToSlash(rel)
+			return tw.WriteHeader(hdr)
 		}
 		hdr, err := tar.FileInfoHeader(info, "")
 		if err != nil {
