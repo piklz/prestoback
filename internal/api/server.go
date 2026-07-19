@@ -139,11 +139,15 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/auth/status", s.handleAuthStatus)
 	s.mux.HandleFunc("/api/auth/setup", s.handleAuthSetup)
 	s.mux.HandleFunc("/api/auth/login", s.handleAuthLogin)
+	s.mux.HandleFunc("/api/auth/mfa/verify", s.handleAuthMFAVerify) // public — this IS the second half of login, no session exists yet
 	s.mux.HandleFunc("/api/events", s.authJWT(s.handleSSE))
 
 	// Auth-required — read-only for any authenticated role (including viewer)
 	s.mux.HandleFunc("/api/auth/logout", s.authJWT(s.handleAuthLogout)) // self-service, not privilege-gated
 	s.mux.HandleFunc("/api/auth/me", s.authJWT(s.handleAuthMe))
+	s.mux.HandleFunc("/api/auth/mfa/setup", s.authJWT(s.handleAuthMFASetup))     // self-service — enrolls the calling account only
+	s.mux.HandleFunc("/api/auth/mfa/confirm", s.authJWT(s.handleAuthMFAConfirm)) // self-service
+	s.mux.HandleFunc("/api/auth/mfa/disable", s.authJWT(s.handleAuthMFADisable)) // self-service, but re-checks password itself
 	s.mux.HandleFunc("/api/volumes", s.authJWT(s.handleListVolumes))
 	s.mux.HandleFunc("/api/discover", s.authJWT(s.handleDiscover))
 	s.mux.HandleFunc("/api/suggest-excludes", s.authJWT(s.handleSuggestExcludes))

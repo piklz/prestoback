@@ -265,6 +265,35 @@ type User struct {
 	Username string `json:"username"`
 	Hash     string `json:"hash"`
 	Role     string `json:"role"`
+
+	// MFA fields — all zero-value ("", false, nil) for an account that
+	// hasn't enabled a second factor, which is the common case and the
+	// default for every existing account after an upgrade (no migration
+	// needed: an absent/empty MFASecret is exactly equivalent to "MFA was
+	// never set up").
+	//
+	// MFASecret is the raw base32 TOTP secret — kept raw, not hashed,
+	// because TOTP verification requires recomputing HMAC(secret, time)
+	// and comparing to the submitted code; there's no way to verify a TOTP
+	// code against a one-way hash of its secret. Same category of
+	// exception as Config.apiKey itself (see apikey.go) — a value that
+	// must stay raw because the algorithm that consumes it needs the raw
+	// form, not because it's exempt from the "don't store secrets you
+	// don't have to" principle.
+	MFASecret string `json:"mfa_secret,omitempty"`
+	// MFAEnabled is the actual on/off switch. MFASecret can be non-empty
+	// while this is false — that's the "setup in progress, not yet
+	// confirmed" state (see Config.BeginMFAEnrollment/ConfirmMFAEnrollment
+	// in mfa.go) — so login must check MFAEnabled, never just
+	// MFASecret != "".
+	MFAEnabled bool `json:"mfa_enabled,omitempty"`
+	// MFABackupCodeHashes are HashAPIKey(normalizeBackupCode(code)) for
+	// each still-unused recovery code. A code is removed from this slice
+	// the moment it's successfully used (see
+	// Config.VerifyAndConsumeBackupCode) — single-use, enforced under the
+	// same write-lock as every other mutation here, so two concurrent
+	// requests racing to use the same code can't both succeed.
+	MFABackupCodeHashes []string `json:"mfa_backup_code_hashes,omitempty"`
 }
 
 // PairedKey is one API key issued through the device-pairing flow (see
@@ -331,6 +360,12 @@ type Config struct {
 	// keeping them out of config.json means a stale one can never linger
 	// across restarts either.
 	pending map[string]*pendingPairing
+
+	// mfaPending holds in-progress two-step logins: password already
+	// verified, second-factor code not yet submitted. Same
+	// deliberately-not-persisted, short-TTL posture as pending above, for
+	// the same reasons — see mfa.go.
+	mfaPending map[string]*pendingMFALogin
 }
 
 func Load(dataDir string) (*Config, error) {
@@ -344,6 +379,7 @@ func Load(dataDir string) (*Config, error) {
 		revokedTokens: make(map[string]struct{}),
 		pairedKeys:    make(map[string]PairedKey),
 		pending:       make(map[string]*pendingPairing),
+		mfaPending:    make(map[string]*pendingMFALogin),
 	}
 	path := filepath.Join(dataDir, "config.json")
 	data, err := os.ReadFile(path)

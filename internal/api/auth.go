@@ -5,18 +5,25 @@ package api
 // JWT-based browser login + legacy X-API-Key for scripts/automations.
 //
 // Endpoints (all public — no auth required):
-//   GET  /api/auth/status  → {setup_required, version}
-//   POST /api/auth/setup   → first-run only: create admin account → JWT
-//   POST /api/auth/login   → credentials → JWT
+//   GET  /api/auth/status     → {setup_required, version}
+//   POST /api/auth/setup      → first-run only: create admin account → JWT
+//   POST /api/auth/login      → credentials → JWT, or {mfa_required, mfa_token} if MFA is on
+//   POST /api/auth/mfa/verify → {mfa_token, code} → JWT (second half of login for MFA accounts)
 //
 // Endpoints (auth required):
-//   POST /api/auth/logout  → revokes current token
-//   GET  /api/auth/me      → {username, role}
+//   POST /api/auth/logout      → revokes current token
+//   GET  /api/auth/me          → {username, role}
+//   POST /api/auth/mfa/setup   → generate a TOTP secret + backup codes (not yet active)
+//   POST /api/auth/mfa/confirm → {code} → activates MFA for the current account
+//   POST /api/auth/mfa/disable → {password} → deactivates MFA for the current account
 //
 // JWT: HS256, 12-hour TTL, signed with HMAC of existing APIKey.
 // Password: bcrypt (golang.org/x/crypto/bcrypt), cost 12.
 // Token revocation: small in-memory set, cleared on restart
 //   (acceptable — tokens expire in 12h anyway).
+// MFA: optional per-account TOTP (RFC 6238) second factor plus one-time
+//   backup codes — see internal/config/mfa.go for the actual crypto and
+//   state machine; this file is just the HTTP surface over it.
 
 import (
 	"crypto/hmac"
@@ -348,6 +355,21 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	recordLoginSuccess(req.Username)
+
+	if user.MFAEnabled {
+		token, expiresAt, err := s.cfg.BeginMFALogin(user.Username, user.Role)
+		if err != nil {
+			errOut(w, 500, "could not start MFA login: "+err.Error())
+			return
+		}
+		respond(w, 200, map[string]any{
+			"mfa_required": true,
+			"mfa_token":    token,
+			"expires":      expiresAt.Unix(),
+		})
+		return
+	}
+
 	token := s.issueToken(user.Username, user.Role)
 	respond(w, 200, map[string]any{
 		"token":    token,
@@ -355,6 +377,118 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		"role":     user.Role,
 		"expires":  time.Now().Add(jwtTTL).Unix(),
 	})
+}
+
+// POST /api/auth/mfa/verify — second half of login for an MFA-enabled
+// account. Takes the pending token BeginMFALogin issued plus a TOTP or
+// backup code; on success, issues the same real JWT handleAuthLogin would
+// have issued directly for a non-MFA account.
+func (s *Server) handleAuthMFAVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	var req struct {
+		MFAToken string `json:"mfa_token"`
+		Code     string `json:"code"`
+	}
+	if err := parseJSON(r, &req); err != nil {
+		errOut(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	username, role, err := s.cfg.CompleteMFALogin(req.MFAToken, req.Code)
+	if err != nil {
+		// Same constant-time-ish delay as a failed password check — an MFA
+		// code is exactly the kind of thing a timing side-channel or rapid
+		// brute force should not get an edge on.
+		time.Sleep(400 * time.Millisecond)
+		errOut(w, 401, err.Error())
+		return
+	}
+	token := s.issueToken(username, role)
+	respond(w, 200, map[string]any{
+		"token":    token,
+		"username": username,
+		"role":     role,
+		"expires":  time.Now().Add(jwtTTL).Unix(),
+	})
+}
+
+// POST /api/auth/mfa/setup — begins MFA enrollment for the CURRENT
+// authenticated account (the username comes from the JWT, never from the
+// request body — you can only enroll yourself). Returns a secret, its QR
+// provisioning URI, and one-time backup codes, all shown exactly once.
+// MFA is not active yet at this point — see handleAuthMFAConfirm.
+func (s *Server) handleAuthMFASetup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	username := r.Header.Get("X-Auth-User")
+	secret, backupCodes, err := s.cfg.BeginMFAEnrollment(username)
+	if err != nil {
+		errOut(w, 400, err.Error())
+		return
+	}
+	respond(w, 200, map[string]any{
+		"secret":       secret,
+		"otpauth_uri":  config.TOTPProvisioningURI(secret, username+"@prestoback", "PrestoBack"),
+		"backup_codes": backupCodes,
+	})
+}
+
+// POST /api/auth/mfa/confirm — {code} activates MFA for the current
+// account, proving the secret from handleAuthMFASetup actually synced to
+// a working authenticator before it becomes a login requirement.
+func (s *Server) handleAuthMFAConfirm(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := parseJSON(r, &req); err != nil {
+		errOut(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	username := r.Header.Get("X-Auth-User")
+	if err := s.cfg.ConfirmMFAEnrollment(username, req.Code); err != nil {
+		errOut(w, 400, err.Error())
+		return
+	}
+	respond(w, 200, map[string]string{"status": "mfa enabled"})
+}
+
+// POST /api/auth/mfa/disable — {password} deactivates MFA for the current
+// account. Requires re-entering the password even though the caller is
+// already authenticated — removing a security control shouldn't be
+// possible from a bare active session alone (e.g. an unattended logged-in
+// browser tab), the same reasoning most services apply to disabling 2FA.
+func (s *Server) handleAuthMFADisable(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := parseJSON(r, &req); err != nil {
+		errOut(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	username := r.Header.Get("X-Auth-User")
+	user, ok := s.cfg.GetUser(username)
+	if !ok || bcrypt.CompareHashAndPassword([]byte(user.Hash), []byte(req.Password)) != nil {
+		time.Sleep(400 * time.Millisecond)
+		errOut(w, 401, "incorrect password")
+		return
+	}
+	if err := s.cfg.DisableMFA(username); err != nil {
+		errOut(w, 500, err.Error())
+		return
+	}
+	respond(w, 200, map[string]string{"status": "mfa disabled"})
 }
 
 // ── Protected auth handlers ───────────────────────────────────────────────────
