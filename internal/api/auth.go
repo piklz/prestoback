@@ -508,9 +508,15 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/auth/me — returns the authenticated user's info.
 func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
-	respond(w, 200, map[string]string{
-		"username": r.Header.Get("X-Auth-User"),
-		"role":     r.Header.Get("X-Auth-Role"),
+	username := r.Header.Get("X-Auth-User")
+	mfaEnabled := false
+	if u, ok := s.cfg.GetUser(username); ok {
+		mfaEnabled = u.MFAEnabled
+	}
+	respond(w, 200, map[string]any{
+		"username":    username,
+		"role":        r.Header.Get("X-Auth-Role"),
+		"mfa_enabled": mfaEnabled,
 	})
 }
 
