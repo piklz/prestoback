@@ -1022,6 +1022,16 @@ func encryptArchiveInPlace(path, passphrase string, onBytes func(int64)) (int64,
 // No byte-progress callback here — see countingReader's doc comment above
 // for why DecryptStream's two-pass read (verify-then-decrypt) makes a naive
 // percentage misleading rather than useful.
+// DecryptArchiveToTempForPreview is decryptArchiveToTemp exported for
+// handleRestorePreview's use — a preview needs to decrypt an encrypted
+// archive to inspect it, exactly like a real restore does, so it reuses
+// the same temp-file decrypt helper rather than a second copy of it.
+// Caller must os.Remove the returned path when done, same contract as the
+// unexported version.
+func DecryptArchiveToTempForPreview(archivePath, passphrase string) (string, error) {
+	return decryptArchiveToTemp(archivePath, passphrase)
+}
+
 func decryptArchiveToTemp(archivePath, passphrase string) (string, error) {
 	src, err := os.Open(archivePath)
 	if err != nil {

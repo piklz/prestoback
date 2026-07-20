@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -1969,6 +1970,7 @@ func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 //	DELETE /api/apps/{id}[?purge=1]        → remove app; purge=1 also deletes backup dir
 //	POST   /api/apps/{id}/backup           → trigger backup of all enabled volumes
 //	POST   /api/apps/{id}/restore/{backupID} → restore a single volume archive
+//	POST   /api/apps/{id}/restore/{backupID}/preview → dry-run: what would restoring this archive change? Writes nothing.
 //	POST   /api/apps/{id}/volumes          → add a volume to an existing app
 //	DELETE /api/apps/{id}/volumes/{slug}   → remove a volume from an app
 //	POST   /api/apps/{id}/update           → pull + recreate this app's container(s)
@@ -1985,6 +1987,11 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 	// POST /api/apps/{id}/restore/{backupID}
 	if len(parts) == 3 && parts[1] == "restore" && r.Method == http.MethodPost {
 		s.handleRestore(w, r, appID, parts[2])
+		return
+	}
+	// POST /api/apps/{id}/restore/{backupID}/preview — dry-run, writes nothing
+	if len(parts) == 4 && parts[1] == "restore" && parts[3] == "preview" && r.Method == http.MethodPost {
+		s.handleRestorePreview(w, r, appID, parts[2])
 		return
 	}
 	// POST /api/apps/{id}/volumes  — add volume to existing app
@@ -2454,24 +2461,34 @@ func volumeNames(vols []config.VolumeConfig) string {
 // We look up the app, find which volume the archive belongs to (by slug),
 // and restore into that volume's path.
 
-func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, backupID string) {
+// restoreTarget is what resolveRestoreTarget figures out from an
+// appID/backupID pair: where the archive lives, where it would be
+// restored to, and whether it needs a passphrase. Shared by handleRestore
+// and handleRestorePreview so the (fairly subtle, 3-pass fallback) path
+// resolution logic exists in exactly one place.
+type restoreTarget struct {
+	ArchivePath string
+	DestPath    string
+	VolumeSlug  string
+	Encrypted   bool
+}
+
+// resolveRestoreTarget resolves an archive+backupID into everything needed
+// to either restore it for real or preview it. See handleRestore's
+// original inline comments (now here) for why this needs 3 fallback
+// passes rather than a single lookup — app renames, parent-path adoption,
+// and slug drift between what's registered and what a manifest recorded
+// are all real, previously-encountered cases, not hypothetical ones.
+func (s *Server) resolveRestoreTarget(appID, backupID string, pathOverride string) (restoreTarget, error) {
 	app, ok := s.cfg.GetApp(appID)
 	if !ok {
-		errOut(w, 404, "app not found")
-		return
-	}
-	if s.engine.IsRunning(appID) {
-		errOut(w, 409, "a job is already running for this app")
-		return
+		return restoreTarget{}, fmt.Errorf("app not found")
 	}
 	archivePath := filepath.Join(s.cfg.BackupDir(), appID, backupID+".tar.gz")
 	if _, err := os.Stat(archivePath); os.IsNotExist(err) {
-		errOut(w, 404, "backup archive not found")
-		return
+		return restoreTarget{}, fmt.Errorf("backup archive not found")
 	}
 
-	// Determine which volume this archive belongs to, and thus its restore path.
-	// backupID format: {appID}_{volumeSlug}_{timestamp}[_prerestore]
 	volumeSlug := volumeSlugFromBackupID(appID, backupID)
 	destPath := ""
 
@@ -2483,12 +2500,7 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, ba
 		}
 	}
 
-	// Pass 2: if no exact slug match (common after adopt-at-parent-path where
-	// the registered slug is "caddy" but the archive slug is "caddy_data"),
-	// read the manifest to get the original source_path and use that instead —
-	// the user told us where they want things to go during adopt, so
-	// we pick the volume whose registered path is the best parent match for
-	// the manifest's source_path.
+	// Pass 2: manifest source_path fallback (parent-path adoption case).
 	if destPath == "" {
 		manifestPath := filepath.Join(s.cfg.BackupDir(), appID, backupID+"_manifest.json")
 		if manifestData, err := os.ReadFile(manifestPath); err == nil {
@@ -2496,10 +2508,6 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, ba
 			if err := json.Unmarshal(manifestData, &mf); err == nil {
 				for _, ent := range mf.Entries {
 					if ent.VolumeSlug == volumeSlug && ent.SourcePath != "" {
-						// Find the registered volume whose path is the best
-						// match — either an exact match, or is a parent of the
-						// original source path (e.g. registered=/volumes/caddy,
-						// source=/volumes/caddy/caddy_data → use /volumes/caddy).
 						bestLen := -1
 						for _, v := range app.Volumes {
 							vClean := filepath.Clean(v.Path)
@@ -2518,42 +2526,115 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, ba
 		}
 	}
 
-	// Pass 3: single-volume app — just use the one registered path regardless
-	// of slug. Handles the case where slug naming drifted from what was archived
-	// (e.g. app renamed, or parent-path adoption changed the derived slug).
+	// Pass 3: single-volume app fallback.
 	if destPath == "" && len(app.Volumes) == 1 {
 		destPath = app.Volumes[0].Path
 		log.Printf("[restore] slug %q not matched, using single-volume fallback path %s", volumeSlug, destPath)
 	}
 
 	if destPath == "" {
-		// Last resort: let the caller supply ?path=
-		destPath = r.URL.Query().Get("path")
+		destPath = pathOverride
 		if destPath == "" {
-			errOut(w, 400, fmt.Sprintf(
+			return restoreTarget{}, fmt.Errorf(
 				"cannot determine restore path for volume slug %q — no matching volume in app config, and no manifest source_path available. Add ?path=/volumes/... to override",
-				volumeSlug))
-			return
+				volumeSlug)
 		}
 	}
 
-	// Look up whether this specific archive was written encrypted (manifest
-	// records this per volume; RestoreVolume must never guess from file
-	// bytes) and, if so, require a passphrase on THIS request — restore
-	// never falls back to the auto-stored global passphrase (see
-	// EncryptionConfig's doc comment in internal/config/config.go).
-	archiveIsEncrypted := false
+	encrypted := false
 	if manifestData, mErr := os.ReadFile(filepath.Join(s.cfg.BackupDir(), appID, backupID+"_manifest.json")); mErr == nil {
 		var mf backup.Manifest
 		if json.Unmarshal(manifestData, &mf) == nil {
 			for _, ent := range mf.Entries {
 				if ent.VolumeSlug == volumeSlug {
-					archiveIsEncrypted = ent.Encrypted
+					encrypted = ent.Encrypted
 					break
 				}
 			}
 		}
 	}
+
+	return restoreTarget{ArchivePath: archivePath, DestPath: destPath, VolumeSlug: volumeSlug, Encrypted: encrypted}, nil
+}
+
+// handleRestorePreview is the dry-run counterpart to handleRestore — same
+// target resolution (resolveRestoreTarget), but calls
+// backup.PreviewRestore instead of engine.RestoreVolume, so it reads and
+// stats only, never writes. Synchronous (unlike the real restore, which
+// runs in a goroutine and streams progress over SSE) — a preview is fast
+// enough (see restorepreview.go's own scale testing) that a synchronous
+// JSON response is the simpler, better fit.
+func (s *Server) handleRestorePreview(w http.ResponseWriter, r *http.Request, appID, backupID string) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	rt, err := s.resolveRestoreTarget(appID, backupID, r.URL.Query().Get("path"))
+	if err != nil {
+		if err.Error() == "app not found" || err.Error() == "backup archive not found" {
+			errOut(w, 404, err.Error())
+		} else {
+			errOut(w, 400, err.Error())
+		}
+		return
+	}
+
+	archivePath := rt.ArchivePath
+	if rt.Encrypted {
+		var req struct {
+			Passphrase string `json:"passphrase"`
+		}
+		if r.Body != nil {
+			_ = json.NewDecoder(r.Body).Decode(&req)
+		}
+		if req.Passphrase == "" {
+			errOut(w, 400, `this archive is encrypted — supply {"passphrase": "..."} in the request body to preview it`)
+			return
+		}
+		decPath, decErr := backup.DecryptArchiveToTempForPreview(archivePath, req.Passphrase)
+		if decErr != nil {
+			if errors.Is(decErr, backup.ErrAuthenticationFailed) {
+				errOut(w, 401, "wrong passphrase or corrupted archive")
+			} else {
+				errOut(w, 500, decErr.Error())
+			}
+			return
+		}
+		defer os.Remove(decPath)
+		archivePath = decPath
+	}
+
+	preview, err := backup.PreviewRestore(archivePath, rt.DestPath)
+	if err != nil {
+		errOut(w, 500, "could not generate restore preview: "+err.Error())
+		return
+	}
+	respond(w, 200, preview)
+}
+
+func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, appID, backupID string) {
+	app, ok := s.cfg.GetApp(appID)
+	if !ok {
+		errOut(w, 404, "app not found")
+		return
+	}
+	if s.engine.IsRunning(appID) {
+		errOut(w, 409, "a job is already running for this app")
+		return
+	}
+
+	rt, err := s.resolveRestoreTarget(appID, backupID, r.URL.Query().Get("path"))
+	if err != nil {
+		if err.Error() == "app not found" {
+			errOut(w, 404, err.Error())
+		} else if err.Error() == "backup archive not found" {
+			errOut(w, 404, err.Error())
+		} else {
+			errOut(w, 400, err.Error())
+		}
+		return
+	}
+	archivePath, destPath, volumeSlug, archiveIsEncrypted := rt.ArchivePath, rt.DestPath, rt.VolumeSlug, rt.Encrypted
 
 	var restoreReq struct {
 		Passphrase string `json:"passphrase"`
