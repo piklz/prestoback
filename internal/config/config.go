@@ -248,6 +248,18 @@ type RemoteTarget struct {
 	S3SecretKey string `json:"s3_secret_key,omitempty"`
 	S3Region    string `json:"s3_region,omitempty"`   // optional, defaults to "us-east-1"
 	S3BaseDir   string `json:"s3_base_dir,omitempty"` // optional key prefix
+
+	// Kind == "prestoback": push to ANOTHER PrestoBack instance, paired
+	// via the MITM-resistant handshake in nodeidentity.go/remotepairing.go
+	// — see those files' package comments for the full protocol. The three
+	// Pinned* fields are set ONCE, at pairing time, from the receiver's QR
+	// (an out-of-band, human-verified channel) — never updated silently
+	// afterward; see internal/backup/prestobackremote.go for how every
+	// subsequent push re-verifies against them.
+	PrestoBackURL             string `json:"prestoback_url,omitempty"`
+	PrestoBackPinnedNodeID    string `json:"prestoback_pinned_node_id,omitempty"`
+	PrestoBackPinnedPublicKey string `json:"prestoback_pinned_public_key,omitempty"`
+	PrestoBackPushCredential  string `json:"prestoback_push_credential,omitempty"`
 }
 
 // RemoteConfig holds every configured push destination. Push is additive to
@@ -320,13 +332,15 @@ type PairedKey struct {
 
 // disk is the on-disk JSON shape.
 type disk struct {
-	APIKey     string           `json:"api_key"`
-	Apps       []AppConfig      `json:"apps"`
-	Notify     NotifyConfig     `json:"notify"`
-	Users      []User           `json:"users,omitempty"`
-	Encryption EncryptionConfig `json:"encryption,omitempty"`
-	Remote     RemoteConfig     `json:"remote,omitempty"`
-	PairedKeys []PairedKey      `json:"paired_keys,omitempty"`
+	APIKey       string           `json:"api_key"`
+	Apps         []AppConfig      `json:"apps"`
+	Notify       NotifyConfig     `json:"notify"`
+	Users        []User           `json:"users,omitempty"`
+	Encryption   EncryptionConfig `json:"encryption,omitempty"`
+	Remote       RemoteConfig     `json:"remote,omitempty"`
+	PairedKeys   []PairedKey      `json:"paired_keys,omitempty"`
+	NodeIdentity *NodeIdentity    `json:"node_identity,omitempty"`
+	RemotePushers []RemotePusher  `json:"remote_pushers,omitempty"`
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -366,6 +380,25 @@ type Config struct {
 	// deliberately-not-persisted, short-TTL posture as pending above, for
 	// the same reasons — see mfa.go.
 	mfaPending map[string]*pendingMFALogin
+
+	// nodeIdentity is this instance's permanent Ed25519 keypair — see
+	// nodeidentity.go. Generated once on first run and never changed
+	// afterward except by explicit user action (RegenerateNodeIdentity),
+	// same posture as the master API key.
+	nodeIdentity *NodeIdentity
+
+	// remotePending holds in-progress PrestoBack-to-PrestoBack pairing
+	// sessions on the RECEIVING side (the instance whose QR is being
+	// scanned) — see remotepairing.go. Same deliberately-not-persisted,
+	// short-TTL posture as pending/mfaPending above.
+	remotePending map[string]*pendingRemotePairing
+
+	// remotePushers holds every OTHER PrestoBack instance that has
+	// successfully paired with THIS one as a receiver — i.e. the accepted
+	// pusher registry a receiving instance checks incoming pushes against.
+	// Persisted (unlike remotePending) — these are the actual long-lived
+	// authorization records, not in-progress handshakes.
+	remotePushers map[string]RemotePusher
 }
 
 func Load(dataDir string) (*Config, error) {
@@ -380,11 +413,18 @@ func Load(dataDir string) (*Config, error) {
 		pairedKeys:    make(map[string]PairedKey),
 		pending:       make(map[string]*pendingPairing),
 		mfaPending:    make(map[string]*pendingMFALogin),
+		remotePending: make(map[string]*pendingRemotePairing),
+		remotePushers: make(map[string]RemotePusher),
 	}
 	path := filepath.Join(dataDir, "config.json")
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		c.apiKey = GenerateAPIKey()
+		identity, err := GenerateNodeIdentity()
+		if err != nil {
+			return nil, fmt.Errorf("generate node identity: %w", err)
+		}
+		c.nodeIdentity = identity
 		return c, nil
 	}
 	if err != nil {
@@ -447,6 +487,24 @@ func Load(dataDir string) (*Config, error) {
 	for _, pk := range d.PairedKeys {
 		c.pairedKeys[pk.ID] = pk
 	}
+	for _, rp := range d.RemotePushers {
+		c.remotePushers[rp.ID] = rp
+	}
+	if d.NodeIdentity != nil {
+		c.nodeIdentity = d.NodeIdentity
+	} else {
+		// Upgrading from a version before node identities existed — mint
+		// one now rather than leaving it nil, same "heal on load" pattern
+		// as the volume-migration logic above. Existing remote pairings
+		// can't have referenced this instance's identity yet (the feature
+		// didn't exist), so there's nothing to invalidate by generating a
+		// fresh one here.
+		identity, genErr := GenerateNodeIdentity()
+		if genErr != nil {
+			return nil, fmt.Errorf("generate node identity: %w", genErr)
+		}
+		c.nodeIdentity = identity
+	}
 	// Persist migrated form immediately so next load is clean
 	_ = c.save()
 	return c, nil
@@ -461,10 +519,11 @@ func (c *Config) Save() error {
 // save is the internal (lock-free) version, called when the caller already holds a lock.
 func (c *Config) save() error {
 	d := disk{
-		APIKey:     c.apiKey,
-		Notify:     c.notify,
-		Encryption: c.encryption,
-		Remote:     c.remote,
+		APIKey:       c.apiKey,
+		Notify:       c.notify,
+		Encryption:   c.encryption,
+		Remote:       c.remote,
+		NodeIdentity: c.nodeIdentity,
 	}
 	for _, a := range c.apps {
 		d.Apps = append(d.Apps, a)
@@ -480,6 +539,9 @@ func (c *Config) save() error {
 	}
 	for _, pk := range c.pairedKeys {
 		d.PairedKeys = append(d.PairedKeys, pk)
+	}
+	for _, rp := range c.remotePushers {
+		d.RemotePushers = append(d.RemotePushers, rp)
 	}
 	data, err := json.MarshalIndent(d, "", "  ")
 	if err != nil {

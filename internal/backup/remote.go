@@ -93,6 +93,21 @@ type RemoteTarget struct {
 	S3SecretKey string `json:"s3_secret_key,omitempty"`
 	S3Region    string `json:"s3_region,omitempty"`   // optional — defaults to "us-east-1", many S3-compatible services ignore it entirely
 	S3BaseDir   string `json:"s3_base_dir,omitempty"` // optional key prefix, e.g. "presto-backups"
+
+	// Kind == "prestoback": push to ANOTHER PrestoBack instance's own API,
+	// paired via the MITM-resistant handshake in internal/config/nodeidentity.go
+	// and internal/config/remotepairing.go — see those files' package
+	// comments for the full protocol. The three Pinned* fields are set
+	// ONCE, at pairing time, from the receiver's QR (an out-of-band,
+	// human-verified channel) — never updated silently afterward. If the
+	// receiver's actual identity ever stops matching PrestoBackPinnedNodeID,
+	// every push and reachability check refuses rather than silently
+	// trusting whatever answers now, the same "host key changed" posture
+	// sftpconn.go's KnownHostsPath already takes for SSH.
+	PrestoBackURL             string `json:"prestoback_url,omitempty"`              // e.g. "http://192.168.1.50:8778"
+	PrestoBackPinnedNodeID    string `json:"prestoback_pinned_node_id,omitempty"`    // set once at pairing time, never updated silently
+	PrestoBackPinnedPublicKey string `json:"prestoback_pinned_public_key,omitempty"` // base64, set once at pairing time
+	PrestoBackPushCredential  string `json:"prestoback_push_credential,omitempty"`   // issued at pairing time, sent on every push
 }
 
 // RemoteFile describes one archive found on a remote target.
@@ -153,8 +168,11 @@ func RemoteReachable(t RemoteTarget) error {
 		}
 		return newS3Client(t).reachable(ctx)
 
+	case "prestoback":
+		return prestobackReachable(t)
+
 	default:
-		return fmt.Errorf("unknown remote kind %q (expected \"mount\", \"sftp\", or \"s3\")", t.Kind)
+		return fmt.Errorf("unknown remote kind %q (expected \"mount\", \"sftp\", \"s3\", or \"prestoback\")", t.Kind)
 	}
 }
 
@@ -234,6 +252,21 @@ func PushFile(localPath, appID string, t RemoteTarget, emit func(string)) (strin
 		}
 		emit(fmt.Sprintf("✓ %s pushed to %s", name, t.Name))
 		return key, nil
+
+	case "prestoback":
+		ctx, cancel := context.WithTimeout(context.Background(), remoteOpTimeout)
+		defer cancel()
+		emit(fmt.Sprintf("Verifying %s's identity…", t.Name))
+		if err := prestobackChallenge(ctx, t); err != nil {
+			return "", err
+		}
+		emit(fmt.Sprintf("Pushing %s to %s (prestoback)…", name, t.Name))
+		remotePath, err := prestobackPushFile(ctx, localPath, appID, t)
+		if err != nil {
+			return "", fmt.Errorf("prestoback push failed: %w", err)
+		}
+		emit(fmt.Sprintf("✓ %s pushed to %s", name, t.Name))
+		return remotePath, nil
 
 	default:
 		return "", fmt.Errorf("unknown remote kind %q", t.Kind)
@@ -358,6 +391,14 @@ func ListRemoteFiles(t RemoteTarget, appID string) ([]RemoteFile, error) {
 		}
 		return out, nil
 
+	case "prestoback":
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := prestobackChallenge(ctx, t); err != nil {
+			return nil, err
+		}
+		return prestobackListFiles(ctx, t, appID)
+
 	default:
 		return nil, fmt.Errorf("unknown remote kind %q", t.Kind)
 	}
@@ -434,6 +475,46 @@ func PullArchive(rf RemoteFile, t RemoteTarget, localDestDir string, emit func(s
 			out.Close()
 			_ = os.Remove(tmp)
 			return "", fmt.Errorf("s3 download failed: %w", err)
+		}
+		if err := out.Close(); err != nil {
+			_ = os.Remove(tmp)
+			return "", err
+		}
+		if err := os.Rename(tmp, destPath); err != nil {
+			return "", err
+		}
+
+	case "prestoback":
+		ctx, cancel := context.WithTimeout(context.Background(), remoteOpTimeout)
+		defer cancel()
+		if err := prestobackChallenge(ctx, t); err != nil {
+			return "", err
+		}
+		// rf.Path carries "appID/name" for this kind — RemoteFile.Path is
+		// documented as "whatever the backend needs to locate the file",
+		// and every other kind already uses it that way (sftp: the remote
+		// path; mount: the local-ish full path); a composite appID/name
+		// key is this kind's equivalent, since the receive-side API is
+		// organized by app.
+		appID := rf.Path
+		if idx := strings.Index(rf.Path, "/"); idx >= 0 {
+			appID = rf.Path[:idx]
+		}
+		emit(fmt.Sprintf("Downloading %s from %s (prestoback)…", rf.Name, t.Name))
+		body, err := prestobackOpenDownload(ctx, appID, rf.Name, t)
+		if err != nil {
+			return "", fmt.Errorf("prestoback download failed: %w", err)
+		}
+		defer body.Close()
+		tmp := destPath + ".partial"
+		out, err := os.Create(tmp)
+		if err != nil {
+			return "", err
+		}
+		if _, err := io.Copy(out, body); err != nil {
+			out.Close()
+			_ = os.Remove(tmp)
+			return "", fmt.Errorf("prestoback download failed: %w", err)
 		}
 		if err := out.Close(); err != nil {
 			_ = os.Remove(tmp)

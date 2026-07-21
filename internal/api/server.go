@@ -143,6 +143,19 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/auth/mfa/verify", s.handleAuthMFAVerify) // public — this IS the second half of login, no session exists yet
 	s.mux.HandleFunc("/api/events", s.authJWT(s.handleSSE))
 
+	// Public — PrestoBack-to-PrestoBack instance-to-instance endpoints.
+	// These are called by ANOTHER PrestoBack instance's backend, not a
+	// logged-in browser, so normal session/API-key auth doesn't apply —
+	// each has its own credential check instead (a pairing secret, a
+	// signature challenge, or a push credential — see
+	// internal/config/remotepairing.go and internal/config/nodeidentity.go
+	// for what each actually proves).
+	s.mux.HandleFunc("/api/remote-pairing/claim", s.handleRemotePairingClaim)
+	s.mux.HandleFunc("/api/remote-pairing/challenge", s.handleRemotePairingChallenge)
+	s.mux.HandleFunc("/api/remote-receive/backup", s.handleRemoteReceiveBackup)
+	s.mux.HandleFunc("/api/remote-receive/list", s.handleRemoteReceiveList)
+	s.mux.HandleFunc("/api/remote-receive/download", s.handleRemoteReceiveDownload)
+
 	// Auth-required — read-only for any authenticated role (including viewer)
 	s.mux.HandleFunc("/api/auth/logout", s.authJWT(s.handleAuthLogout)) // self-service, not privilege-gated
 	s.mux.HandleFunc("/api/auth/me", s.authJWT(s.handleAuthMe))
@@ -178,6 +191,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/encryption", s.adminForWrites(s.handleEncryption))
 	s.mux.HandleFunc("/api/remote", s.adminForWrites(s.handleRemote))
 	s.mux.HandleFunc("/api/remote/test", s.adminForWrites(s.handleRemoteTest))
+	s.mux.HandleFunc("/api/remote/pairing/start", s.adminForWrites(s.handleRemotePairingStart))
+	s.mux.HandleFunc("/api/remote/pairing/pair", s.adminForWrites(s.handleRemotePairAsPusher))
+	s.mux.HandleFunc("/api/remote/pushers", s.adminForWrites(s.handleRemotePushers))
+	s.mux.HandleFunc("/api/remote/pushers/", s.adminForWrites(s.handleRemotePusherByID))
 	s.mux.HandleFunc("/api/apikey/regenerate", s.adminForWrites(s.handleRegenKey))
 	s.mux.HandleFunc("/api/pairing/start", s.adminForWrites(s.handlePairingStart))
 	s.mux.HandleFunc("/api/pairing/claim", s.adminForWrites(s.handlePairingClaim))
@@ -513,6 +530,14 @@ type RemoteTargetView struct {
 	S3SecretKeyIsSet bool   `json:"s3_secret_key_is_set"`
 	S3Region         string `json:"s3_region,omitempty"`
 	S3BaseDir        string `json:"s3_base_dir,omitempty"`
+
+	// PrestoBackPinnedNodeID is NOT a secret (it's a public fingerprint —
+	// see nodeidentity.go) so it's safe to echo back, unlike every *IsSet
+	// field above. PrestoBackPushCredential is a real credential and is
+	// redacted the same way SFTPPassword/S3SecretKey are.
+	PrestoBackURL                string `json:"prestoback_url,omitempty"`
+	PrestoBackPinnedNodeID       string `json:"prestoback_pinned_node_id,omitempty"`
+	PrestoBackPushCredentialIsSet bool  `json:"prestoback_push_credential_is_set"`
 }
 
 // RemoteConfigView is the redacted GET/PUT response wrapper.
@@ -539,6 +564,9 @@ func redactRemoteTarget(t config.RemoteTarget) RemoteTargetView {
 		S3SecretKeyIsSet:        t.S3SecretKey != "",
 		S3Region:                t.S3Region,
 		S3BaseDir:               t.S3BaseDir,
+		PrestoBackURL:                 t.PrestoBackURL,
+		PrestoBackPinnedNodeID:        t.PrestoBackPinnedNodeID,
+		PrestoBackPushCredentialIsSet: t.PrestoBackPushCredential != "",
 	}
 }
 
@@ -575,6 +603,16 @@ func mergeRemoteSecrets(incoming, existing []config.RemoteTarget) []config.Remot
 			if t.S3SecretKey == "" {
 				t.S3SecretKey = old.S3SecretKey
 			}
+			// Pinned identity + push credential are never set by the
+			// generic settings save — they only ever come from a fresh
+			// pairing handshake (handleRemotePairAsPusher). Always carry
+			// them forward from the saved copy rather than merge-on-blank,
+			// so there's no path at all for a PUT here to silently move
+			// the pin (intentionally or by a client bug echoing a blank
+			// value back) — a re-pair is the only way to change it.
+			t.PrestoBackPinnedNodeID = old.PrestoBackPinnedNodeID
+			t.PrestoBackPinnedPublicKey = old.PrestoBackPinnedPublicKey
+			t.PrestoBackPushCredential = old.PrestoBackPushCredential
 		}
 		out[i] = t
 	}
@@ -620,8 +658,21 @@ func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
 					errOut(w, 400, fmt.Sprintf("target %q: s3_endpoint, s3_bucket, s3_access_key, and s3_secret_key are required for kind=s3", t.Name))
 					return
 				}
+			case "prestoback":
+				// No fields required directly from this request — a
+				// prestoback target only ever gets created via
+				// handleRemotePairAsPusher (a real pairing handshake), and
+				// mergeRemoteSecrets above always carries its pinned
+				// identity/credential forward from the saved copy. If
+				// somehow neither is present (shouldn't happen outside a
+				// hand-crafted API call), catch it here rather than saving
+				// a target with no way to ever push anything.
+				if t.PrestoBackURL == "" || t.PrestoBackPinnedNodeID == "" || t.PrestoBackPushCredential == "" {
+					errOut(w, 400, fmt.Sprintf("target %q: prestoback targets must be created via pairing, not added directly", t.Name))
+					return
+				}
 			default:
-				errOut(w, 400, fmt.Sprintf("target %q: kind must be \"mount\", \"sftp\", or \"s3\", got %q", t.Name, t.Kind))
+				errOut(w, 400, fmt.Sprintf("target %q: kind must be \"mount\", \"sftp\", \"s3\", or \"prestoback\", got %q", t.Name, t.Kind))
 				return
 			}
 		}
@@ -648,6 +699,10 @@ func toBackupTarget(t config.RemoteTarget) backup.RemoteTarget {
 		S3Endpoint:  t.S3Endpoint, S3Bucket: t.S3Bucket,
 		S3AccessKey: t.S3AccessKey, S3SecretKey: t.S3SecretKey,
 		S3Region: t.S3Region, S3BaseDir: t.S3BaseDir,
+		PrestoBackURL:             t.PrestoBackURL,
+		PrestoBackPinnedNodeID:    t.PrestoBackPinnedNodeID,
+		PrestoBackPinnedPublicKey: t.PrestoBackPinnedPublicKey,
+		PrestoBackPushCredential:  t.PrestoBackPushCredential,
 	}
 }
 
