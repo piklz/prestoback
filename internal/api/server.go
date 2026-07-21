@@ -192,6 +192,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/remote", s.adminForWrites(s.handleRemote))
 	s.mux.HandleFunc("/api/remote/test", s.adminForWrites(s.handleRemoteTest))
 	s.mux.HandleFunc("/api/remote/pairing/start", s.adminForWrites(s.handleRemotePairingStart))
+	s.mux.HandleFunc("/api/remote/pairing/nodeid", s.authJWT(s.handleRemoteNodeID)) // read-only, any authenticated role — no pairing session minted
 	s.mux.HandleFunc("/api/remote/pairing/pair", s.adminForWrites(s.handleRemotePairAsPusher))
 	s.mux.HandleFunc("/api/remote/pushers", s.adminForWrites(s.handleRemotePushers))
 	s.mux.HandleFunc("/api/remote/pushers/", s.adminForWrites(s.handleRemotePusherByID))

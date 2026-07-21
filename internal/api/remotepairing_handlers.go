@@ -242,6 +242,14 @@ func (s *Server) handleRemoteReceiveDownload(w http.ResponseWriter, r *http.Requ
 
 // ── Pusher side: admin-authenticated ─────────────────────────────────────────
 
+// handleRemoteNodeID is a lightweight, read-only endpoint for displaying
+// this instance's own Node ID in the UI — deliberately separate from
+// handleRemotePairingStart, which mints a fresh one-time pairing secret
+// on every call and would be the wrong thing to hit just to show a label.
+func (s *Server) handleRemoteNodeID(w http.ResponseWriter, r *http.Request) {
+	respond(w, 200, map[string]string{"node_id": s.cfg.NodeID()})
+}
+
 // handleRemotePairingStart is called on the RECEIVER, by its own admin —
 // mints a pairing session for display as a QR (StartRemotePairing).
 func (s *Server) handleRemotePairingStart(w http.ResponseWriter, r *http.Request) {
