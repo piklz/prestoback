@@ -28,12 +28,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/pi/prestoback/internal/backup"
 	"github.com/pi/prestoback/internal/config"
+	"github.com/pi/prestoback/internal/notify"
 )
 
 // ── Receiver side: public, instance-to-instance ─────────────────────────────
@@ -115,6 +117,24 @@ func (s *Server) receivedDir(pusherID, appID string) string {
 	return filepath.Join(s.cfg.DataDir, "received", pusherID, appID)
 }
 
+// minReceiveFreeSpaceBytes is the safety margin kept free on top of the
+// incoming upload's own size — mirrors the same "don't run a disk
+// completely dry" caution the low-disk-space warning elsewhere in this
+// codebase applies, just enforced at the point of accepting someone
+// else's data rather than just warning about it.
+const minReceiveFreeSpaceBytes = 500 * 1024 * 1024 // 500MB
+
+// defaultReceivedRetain is how many archives are kept per (pusher, app)
+// directory before older ones are pruned — see pruneReceivedBackups.
+const defaultReceivedRetain = 10
+
+// diskUsageFunc is a package-level indirection over diskUsage so tests
+// can simulate a low-disk-space condition without needing to genuinely
+// exhaust real disk space (not practical to do safely in a test). Only
+// tests ever reassign this; production code always goes through the real
+// diskUsage.
+var diskUsageFunc = diskUsage
+
 func (s *Server) handleRemoteReceiveBackup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errOut(w, 405, "method not allowed")
@@ -144,6 +164,35 @@ func (s *Server) handleRemoteReceiveBackup(w http.ResponseWriter, r *http.Reques
 		errOut(w, 500, "could not create storage directory: "+err.Error())
 		return
 	}
+
+	// Disk-space check BEFORE accepting the write — an unbounded incoming
+	// push (buggy or malicious pusher) shouldn't be able to run this
+	// instance's disk dry. Checked against whatever's actually declared in
+	// Content-Length; a request with no declared length still has to clear
+	// the flat safety margin on its own, so this can't be trivially
+	// bypassed by omitting the header.
+	if stat, statErr := diskUsageFunc(dir); statErr == nil {
+		needed := int64(minReceiveFreeSpaceBytes)
+		if r.ContentLength > 0 {
+			needed += r.ContentLength
+		}
+		if stat.free < uint64(needed) {
+			s.dispatchNotify(notify.Event{
+				Kind: "remote_receive_fail", IsError: true,
+				AppName: appID,
+				Detail:  fmt.Sprintf("rejected push from %s — insufficient disk space (%d MB free)", rp.Name, stat.free/1024/1024),
+			})
+			errOut(w, 507, fmt.Sprintf("insufficient disk space on receiver (%d MB free, need ~%d MB)", stat.free/1024/1024, needed/1024/1024))
+			return
+		}
+	}
+	// If diskUsage itself failed (statErr != nil), we deliberately still
+	// proceed rather than block the push — a stat failure is far more
+	// likely to mean "unexpected filesystem type" than "definitely out of
+	// space," and refusing every push because of a diagnostic that
+	// couldn't run would be a worse failure mode than occasionally
+	// skipping the check.
+
 	destPath := filepath.Join(dir, name)
 	tmp := destPath + ".partial"
 	out, err := os.Create(tmp)
@@ -155,6 +204,7 @@ func (s *Server) handleRemoteReceiveBackup(w http.ResponseWriter, r *http.Reques
 	out.Close()
 	if err != nil {
 		os.Remove(tmp)
+		s.dispatchNotify(notify.Event{Kind: "remote_receive_fail", IsError: true, AppName: appID, Detail: "write failed: " + err.Error()})
 		errOut(w, 500, "write failed: "+err.Error())
 		return
 	}
@@ -168,7 +218,78 @@ func (s *Server) handleRemoteReceiveBackup(w http.ResponseWriter, r *http.Reques
 		errOut(w, 500, "could not finalize upload: "+err.Error())
 		return
 	}
+
+	// Manifests are small and never counted against retention on their
+	// own (see pruneReceivedBackups) — only archives trigger a prune pass,
+	// keeping a manifest push itself cheap and side-effect-light.
+	if strings.HasSuffix(name, ".tar.gz") {
+		pruneReceivedBackups(dir, defaultReceivedRetain)
+		s.dispatchNotify(notify.Event{
+			Kind: "remote_receive_success", AppName: appID,
+			Detail: fmt.Sprintf("%s pushed %s (%s)", rp.Name, name, humanReceiveBytes(written)),
+		})
+	}
+
 	respond(w, 200, map[string]any{"path": destPath, "size_bytes": written})
+}
+
+// pruneReceivedBackups keeps only the newest `retain` archives (by mtime)
+// in dir, deleting older ones along with any manifest that shares the
+// same base filename. Deliberately simpler than the local engine's
+// PruneBackups (engine.go), which retains per-volume-slug: this retains
+// by count across the WHOLE app directory regardless of which volume
+// slug each archive belongs to. That's a real simplification, not an
+// oversight — the practical goal here is bounding a receiver's disk usage
+// from potentially many different pushing instances and volumes, not
+// exact parity with whatever retention policy governs the pusher's own
+// local copies (which already decided how many versions exist in the
+// first place; this is a mirror, not the source of truth for "how many
+// versions should exist").
+func pruneReceivedBackups(dir string, retain int) {
+	if retain <= 0 {
+		retain = defaultReceivedRetain
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type fileWithTime struct {
+		name    string
+		modTime time.Time
+	}
+	var archives []fileWithTime
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".tar.gz") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		archives = append(archives, fileWithTime{e.Name(), info.ModTime()})
+	}
+	sort.Slice(archives, func(i, j int) bool { return archives[i].modTime.After(archives[j].modTime) })
+	if len(archives) <= retain {
+		return
+	}
+	for _, a := range archives[retain:] {
+		_ = os.Remove(filepath.Join(dir, a.name))
+		manifestName := strings.TrimSuffix(a.name, ".tar.gz") + "_manifest.json"
+		_ = os.Remove(filepath.Join(dir, manifestName))
+	}
+}
+
+func humanReceiveBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 func (s *Server) handleRemoteReceiveList(w http.ResponseWriter, r *http.Request) {
@@ -307,16 +428,31 @@ func (s *Server) handleRemotePairAsPusher(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
-	rc.Targets = append(rc.Targets, config.RemoteTarget{
+	newTarget := config.RemoteTarget{
 		Name:                      req.Name,
 		Kind:                      "prestoback",
 		PrestoBackURL:             req.URL,
 		PrestoBackPinnedNodeID:    result.PinnedNodeID,
 		PrestoBackPinnedPublicKey: result.PinnedPublicKey,
 		PrestoBackPushCredential:  result.PushCredential,
-	})
+	}
+	rc.Targets = append(rc.Targets, newTarget)
 	s.cfg.SetRemote(rc)
-	respond(w, 200, redactRemoteTarget(rc.Targets[len(rc.Targets)-1]))
+
+	resp := map[string]any{"target": redactRemoteTarget(newTarget)}
+	if strings.HasPrefix(req.URL, "http://") {
+		// The identity-pinning handshake itself is MITM-resistant
+		// regardless of transport (see nodeidentity.go/remotepairing.go) —
+		// this warning is about a DIFFERENT property, confidentiality:
+		// over plain HTTP, an archive's actual bytes are readable by
+		// anyone positioned on the network path, even though they can't
+		// forge or redirect the connection. Encrypting archives at rest
+		// (Settings → Backup Encryption) closes that gap regardless of
+		// transport; a reverse proxy with TLS in front of either instance
+		// closes it at the transport layer instead.
+		resp["warning"] = "This target uses plain http://, not https://. Pairing itself is still protected against impersonation, but archive contents will be readable to anyone on the network path unless you also enable backup encryption or put a TLS reverse proxy in front of one or both instances."
+	}
+	respond(w, 200, resp)
 }
 
 // RemotePusherView is the redacted shape for GET /api/remote/pushers —
@@ -359,4 +495,125 @@ func (s *Server) handleRemotePusherByID(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	respond(w, 200, map[string]string{"status": "revoked"})
+}
+
+// ReceivedBackupGroup is one pusher+app directory's worth of received
+// archives, for the admin-facing browse/manage view.
+type ReceivedBackupGroup struct {
+	PusherID   string             `json:"pusher_id"`
+	PusherName string             `json:"pusher_name"`
+	AppID      string             `json:"app_id"`
+	Files      []ReceivedFileInfo `json:"files"`
+}
+
+type ReceivedFileInfo struct {
+	Name      string    `json:"name"`
+	SizeBytes int64     `json:"size_bytes"`
+	ModTime   time.Time `json:"mod_time"`
+}
+
+// handleReceivedBackupsList lists everything currently stored under
+// DataDir/received/, grouped by pusher and app — the admin's view into
+// what's actually accumulating on disk from paired instances, since
+// there's otherwise no visibility into this at all beyond SSHing into the
+// box and looking.
+func (s *Server) handleReceivedBackupsList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	pusherNames := map[string]string{}
+	for _, rp := range s.cfg.ListRemotePushers() {
+		name := rp.Name
+		if name == "" {
+			name = rp.PusherNodeID
+		}
+		pusherNames[rp.ID] = name
+	}
+
+	root := filepath.Join(s.cfg.DataDir, "received")
+	var groups []ReceivedBackupGroup
+	pusherDirs, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		respond(w, 200, []ReceivedBackupGroup{})
+		return
+	}
+	if err != nil {
+		errOut(w, 500, err.Error())
+		return
+	}
+	for _, pd := range pusherDirs {
+		if !pd.IsDir() {
+			continue
+		}
+		pusherID := pd.Name()
+		appDirs, err := os.ReadDir(filepath.Join(root, pusherID))
+		if err != nil {
+			continue
+		}
+		for _, ad := range appDirs {
+			if !ad.IsDir() {
+				continue
+			}
+			appID := ad.Name()
+			entries, err := os.ReadDir(filepath.Join(root, pusherID, appID))
+			if err != nil {
+				continue
+			}
+			var files []ReceivedFileInfo
+			for _, e := range entries {
+				if e.IsDir() || !strings.HasSuffix(e.Name(), ".tar.gz") {
+					continue
+				}
+				info, err := e.Info()
+				if err != nil {
+					continue
+				}
+				files = append(files, ReceivedFileInfo{Name: e.Name(), SizeBytes: info.Size(), ModTime: info.ModTime()})
+			}
+			if len(files) == 0 {
+				continue
+			}
+			sort.Slice(files, func(i, j int) bool { return files[i].ModTime.After(files[j].ModTime) })
+			name := pusherNames[pusherID]
+			if name == "" {
+				name = pusherID + " (revoked)"
+			}
+			groups = append(groups, ReceivedBackupGroup{PusherID: pusherID, PusherName: name, AppID: appID, Files: files})
+		}
+	}
+	respond(w, 200, groups)
+}
+
+// handleReceivedBackupDelete lets an admin manually remove one received
+// archive (and its manifest, if any) — the counterpart to the automatic
+// pruneReceivedBackups retention pass, for "I want this specific one gone
+// now" rather than waiting on count-based retention.
+func (s *Server) handleReceivedBackupDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, "/api/remote/received/")
+	parts := strings.SplitN(rest, "/", 3)
+	if len(parts) != 3 {
+		errOut(w, 400, "expected /api/remote/received/{pusherID}/{appID}/{filename}")
+		return
+	}
+	pusherID, appID, name := parts[0], parts[1], parts[2]
+	for _, component := range []string{pusherID, appID, name} {
+		if _, err := sanitizeRemotePathComponent(component); err != nil {
+			errOut(w, 400, err.Error())
+			return
+		}
+	}
+	dir := s.receivedDir(pusherID, appID)
+	if err := os.Remove(filepath.Join(dir, name)); err != nil {
+		errOut(w, 404, "file not found")
+		return
+	}
+	if strings.HasSuffix(name, ".tar.gz") {
+		_ = os.Remove(filepath.Join(dir, strings.TrimSuffix(name, ".tar.gz")+"_manifest.json"))
+	}
+	respond(w, 200, map[string]string{"status": "deleted"})
 }

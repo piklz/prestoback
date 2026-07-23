@@ -188,6 +188,7 @@ type NotifyConfig struct {
 	OnBackupFail     bool `json:"on_backup_fail"`
 	OnRestoreSuccess bool `json:"on_restore_success"`
 	OnRestoreFail    bool `json:"on_restore_fail"`
+	OnRemoteReceive  bool `json:"on_remote_receive"`
 }
 
 // EncryptionConfig holds the global default for backup-archive encryption.

@@ -196,6 +196,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/remote/pairing/pair", s.adminForWrites(s.handleRemotePairAsPusher))
 	s.mux.HandleFunc("/api/remote/pushers", s.adminForWrites(s.handleRemotePushers))
 	s.mux.HandleFunc("/api/remote/pushers/", s.adminForWrites(s.handleRemotePusherByID))
+	s.mux.HandleFunc("/api/remote/received", s.adminForWrites(s.handleReceivedBackupsList))
+	s.mux.HandleFunc("/api/remote/received/", s.adminForWrites(s.handleReceivedBackupDelete))
 	s.mux.HandleFunc("/api/apikey/regenerate", s.adminForWrites(s.handleRegenKey))
 	s.mux.HandleFunc("/api/pairing/start", s.adminForWrites(s.handlePairingStart))
 	s.mux.HandleFunc("/api/pairing/claim", s.adminForWrites(s.handlePairingClaim))
@@ -4790,6 +4792,7 @@ func (s *Server) dispatchNotify(ev notify.Event) {
 		OnBackupFail:     nc.OnBackupFail,
 		OnRestoreSuccess: nc.OnRestoreSuccess,
 		OnRestoreFail:    nc.OnRestoreFail,
+		OnRemoteReceive:  nc.OnRemoteReceive,
 	}, ev)
 }
 

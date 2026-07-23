@@ -721,6 +721,7 @@ select.fi{cursor:pointer}
       <div class="fg"><div class="ftog" onclick="togNotif('bk_fail')"><div class="ftog-sw" id="tog-bk_fail"><div class="ftog-kn"></div></div><div class="ftog-lbl">Backup failure</div></div></div>
       <div class="fg"><div class="ftog" onclick="togNotif('rs_ok')"><div class="ftog-sw" id="tog-rs_ok"><div class="ftog-kn"></div></div><div class="ftog-lbl">Restore success</div></div></div>
       <div class="fg"><div class="ftog" onclick="togNotif('rs_fail')"><div class="ftog-sw" id="tog-rs_fail"><div class="ftog-kn"></div></div><div class="ftog-lbl">Restore failure</div></div></div>
+      <div class="fg"><div class="ftog" onclick="togNotif('remote_recv')"><div class="ftog-sw" id="tog-remote_recv"><div class="ftog-kn"></div></div><div class="ftog-lbl">Received a backup from another PrestoBack instance</div></div></div>
     </div></div>
     <div style="display:flex;gap:8px;margin-top:4px">
       <button class="btn btn-p" onclick="saveNotify()">Save notification settings</button>
@@ -781,6 +782,10 @@ select.fi{cursor:pointer}
       <div style="margin-top:16px">
         <div class="fl" style="margin-bottom:6px">Instances allowed to push backups here</div>
         <div id="prestoback-pushers-list" style="font-size:12px;color:var(--txt3)">Loading…</div>
+      </div>
+      <div style="margin-top:16px">
+        <div class="fl" style="margin-bottom:6px">Backups received from paired instances</div>
+        <div id="prestoback-received-list" style="font-size:12px;color:var(--txt3)">Loading…</div>
       </div>
     </div></div>
   </div>
@@ -2128,7 +2133,7 @@ function settingsTab(name) {
       tab.style.borderBottomColor = t===name ? 'var(--accent)' : 'transparent';
     }
   });
-  if (name==='sec') { loadStatus(); loadEncryption(); loadRemote(); loadPairedKeys(); loadMfaStatus(); loadMyNodeID(); loadPrestoBackPushers(); }
+  if (name==='sec') { loadStatus(); loadEncryption(); loadRemote(); loadPairedKeys(); loadMfaStatus(); loadMyNodeID(); loadPrestoBackPushers(); loadPrestoBackReceived(); }
 }
 
 // Auto-hide the fixed hamburger button while scrolling down through page
@@ -4041,10 +4046,11 @@ async function loadNotify() {
     setTog('tog-bk_fail',  n.on_backup_fail);
     setTog('tog-rs_ok',    n.on_restore_success);
     setTog('tog-rs_fail',  n.on_restore_fail);
+    setTog('tog-remote_recv', n.on_remote_receive);
   } catch {}
 }
 function togNotif(key) {
-  const map={telegram:'telegram_enabled',discord:'discord_enabled',ntfy:'ntfy_enabled',webhook:'webhook_enabled',bk_ok:'on_backup_success',bk_fail:'on_backup_fail',rs_ok:'on_restore_success',rs_fail:'on_restore_fail'};
+  const map={telegram:'telegram_enabled',discord:'discord_enabled',ntfy:'ntfy_enabled',webhook:'webhook_enabled',bk_ok:'on_backup_success',bk_fail:'on_backup_fail',rs_ok:'on_restore_success',rs_fail:'on_restore_fail',remote_recv:'on_remote_receive'};
   const field=map[key]; if(!field)return;
   S.notif[field]=!S.notif[field]; setTog('tog-'+key,S.notif[field]);
 }
@@ -4667,6 +4673,51 @@ async function revokePrestoBackPusher(id, name) {
   }
 }
 
+function humanBytesJS(b) {
+  if (b < 1024) return b + ' B';
+  const units = ['KB','MB','GB','TB'];
+  let i = -1;
+  do { b /= 1024; i++; } while (b >= 1024 && i < units.length - 1);
+  return b.toFixed(1) + ' ' + units[i];
+}
+
+async function loadPrestoBackReceived() {
+  const el = document.getElementById('prestoback-received-list');
+  if (!el) return;
+  try {
+    const groups = await api('/api/remote/received');
+    if (!groups || !groups.length) {
+      el.innerHTML = '<span style="color:var(--txt3)">Nothing received yet.</span>';
+      return;
+    }
+    el.innerHTML = groups.map(g => `
+      <div style="margin-bottom:10px">
+        <div style="font-size:11.5px;color:var(--txt2);margin-bottom:4px"><strong>${escHtml(g.pusher_name)}</strong> → ${escHtml(g.app_id)} <span style="color:var(--txt3)">(${g.files.length} kept — older ones are pruned automatically)</span></div>
+        ${g.files.map(f => `
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;background:var(--bg3);border-radius:6px;margin-bottom:3px;font-size:11px">
+            <span style="font-family:var(--mono);color:var(--txt2)">${escHtml(f.name)}</span>
+            <span style="display:flex;align-items:center;gap:8px">
+              <span style="color:var(--txt3)">${humanBytesJS(f.size_bytes)} · ${new Date(f.mod_time).toLocaleString()}</span>
+              <button class="btn btn-d btn-sm btn-ic" style="padding:2px 6px" onclick="deletePrestoBackReceived('${g.pusher_id}','${g.app_id}','${escHtml(f.name)}')">🗑</button>
+            </span>
+          </div>`).join('')}
+      </div>`).join('');
+  } catch (e) {
+    el.innerHTML = '<span style="color:var(--red)">Could not load: ' + escHtml(e.message) + '</span>';
+  }
+}
+
+async function deletePrestoBackReceived(pusherId, appId, name) {
+  if (!confirm(`Delete ${name}? This cannot be undone.`)) return;
+  try {
+    await api(`/api/remote/received/${pusherId}/${appId}/${encodeURIComponent(name)}`, {method:'DELETE'});
+    toast('Deleted', 'info');
+    loadPrestoBackReceived();
+  } catch (e) {
+    toast('Could not delete: ' + e.message, 'error');
+  }
+}
+
 // ── Pusher side: pair with another instance ──────────────────────────────────
 
 function openPairPrestoBackModal() {
@@ -4707,9 +4758,16 @@ async function completePrestoBackPairing() {
   err.textContent = '';
   if (!url || !nodeId || !secret) { err.textContent = 'URL, Node ID, and Secret are all required'; return; }
   try {
-    await api('/api/remote/pairing/pair', {method:'POST', body: JSON.stringify({name, url, secret, node_id: nodeId})});
+    const r = await api('/api/remote/pairing/pair', {method:'POST', body: JSON.stringify({name, url, secret, node_id: nodeId})});
     CM('m-pair-prestoback');
     toast('Paired successfully ✓', 'success');
+    if (r.warning) {
+      // Shown as its own toast (not folded into the success one) since
+      // it's a distinct, worth-noticing caveat about transport
+      // confidentiality, not a reason pairing itself failed or is unsafe
+      // against impersonation.
+      setTimeout(() => toast(r.warning, 'info'), 600);
+    }
     document.getElementById('rt-kind').value = 'mount';
     onRtKindChange();
     loadRemote();

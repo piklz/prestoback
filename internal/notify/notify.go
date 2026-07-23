@@ -47,6 +47,10 @@ func (e Event) Title() string {
 		return "Remote push complete"
 	case "push_fail":
 		return "Remote push failed"
+	case "remote_receive_success":
+		return "Received backup from paired instance"
+	case "remote_receive_fail":
+		return "Rejected a push from a paired instance"
 	default:
 		return "PrestoBack event"
 	}
@@ -373,6 +377,13 @@ type Config struct {
 	OnBackupFail     bool
 	OnRestoreSuccess bool
 	OnRestoreFail    bool
+	// OnRemoteReceive controls notifications for this instance ACCEPTING a
+	// pushed backup from another paired PrestoBack instance — a distinct
+	// event from this instance's own local backup/restore activity, worth
+	// its own toggle rather than folding into OnBackupSuccess (a NAS
+	// running as a pure receiver might want this on while having nothing
+	// of its own to back up at all).
+	OnRemoteReceive bool
 }
 
 // Dispatch fires all enabled notification channels for the given event.
@@ -391,6 +402,8 @@ func Dispatch(cfg Config, ev Event) {
 			wantsNotify = cfg.OnRestoreSuccess
 		case "restore_fail":
 			wantsNotify = cfg.OnRestoreFail
+		case "remote_receive_success", "remote_receive_fail":
+			wantsNotify = cfg.OnRemoteReceive
 		default:
 			wantsNotify = true
 		}
