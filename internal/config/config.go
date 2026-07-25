@@ -27,6 +27,20 @@ var Version = "dev"
 type Schedule struct {
 	Enabled  bool   `json:"enabled"`
 	CronExpr string `json:"cron_expr"` // "0 3 * * *"
+	// PausedAt is set the moment Enabled transitions to false (see
+	// UpdateApp), and cleared the moment it transitions back to true —
+	// how long a paused schedule has actually been paused, for the
+	// "you've had this off for a week, still want that?" reminder
+	// (pausedScheduleReminderLoop in internal/api/server.go). Nil for an
+	// app that's never had its schedule paused, or one that was never
+	// scheduled in the first place.
+	PausedAt *time.Time `json:"paused_at,omitempty"`
+	// LastReminderAt tracks the last time a reminder was actually sent,
+	// separate from PausedAt, so reminders can repeat periodically (once
+	// a week, say) for as long as the schedule stays paused, rather than
+	// firing exactly once and then going silent even if it's still paused
+	// months later.
+	LastReminderAt *time.Time `json:"last_reminder_at,omitempty"`
 }
 
 // VolumeConfig is a single directory to back up within an app.
@@ -189,6 +203,7 @@ type NotifyConfig struct {
 	OnRestoreSuccess bool `json:"on_restore_success"`
 	OnRestoreFail    bool `json:"on_restore_fail"`
 	OnRemoteReceive  bool `json:"on_remote_receive"`
+	OnSchedulePausedReminder bool `json:"on_schedule_paused_reminder"`
 }
 
 // EncryptionConfig holds the global default for backup-archive encryption.
@@ -718,6 +733,31 @@ func (c *Config) UpdateApp(a AppConfig) error {
 		}
 	}
 	a.Path = a.PrimaryPath()
+
+	// Track when the backup schedule was paused, so a "you've had this
+	// paused for a week, still want that?" reminder (see
+	// pausedScheduleReminderLoop in internal/api/server.go) knows how long
+	// it's actually been, and doesn't need every one of the several places
+	// that can flip Schedule.Enabled (the dashboard's pause button,
+	// Telegram's /schedpause and /schedresume) to separately remember to
+	// stamp a timestamp — this is the one place ALL of them funnel through
+	// to persist the change, so it's the one place this needs to live.
+	if existing.Schedule.Enabled && !a.Schedule.Enabled {
+		now := time.Now()
+		a.Schedule.PausedAt = &now
+		a.Schedule.LastReminderAt = nil
+	} else if !existing.Schedule.Enabled && a.Schedule.Enabled {
+		a.Schedule.PausedAt = nil
+		a.Schedule.LastReminderAt = nil
+	} else if existing.Schedule.PausedAt != nil && a.Schedule.PausedAt == nil {
+		// The incoming request is a fresh struct from a form that has no
+		// field for this (same reasoning as CreatedAt above) — preserve
+		// it rather than silently losing track of how long a still-paused
+		// schedule has actually been paused.
+		a.Schedule.PausedAt = existing.Schedule.PausedAt
+		a.Schedule.LastReminderAt = existing.Schedule.LastReminderAt
+	}
+
 	c.apps[a.ID] = a
 	return nil
 }
@@ -736,6 +776,25 @@ func (c *Config) AppCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.apps)
+}
+
+// MarkScheduleReminderSent records that a paused-schedule reminder was
+// just sent for appID — a small, targeted update rather than routing
+// through the generic full-object UpdateApp, since this is called from a
+// background loop (pausedScheduleReminderLoop) that has no reason to
+// touch, or risk racing against, anything else about the app.
+func (c *Config) MarkScheduleReminderSent(appID string) error {
+	c.mu.Lock()
+	a, ok := c.apps[appID]
+	if !ok {
+		c.mu.Unlock()
+		return fmt.Errorf("app '%s' not found", appID)
+	}
+	now := time.Now()
+	a.Schedule.LastReminderAt = &now
+	c.apps[appID] = a
+	c.mu.Unlock()
+	return c.Save()
 }
 
 // ── Notifications ─────────────────────────────────────────────────────────────

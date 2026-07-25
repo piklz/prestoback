@@ -51,6 +51,8 @@ func (e Event) Title() string {
 		return "Received backup from paired instance"
 	case "remote_receive_fail":
 		return "Rejected a push from a paired instance"
+	case "schedule_paused_reminder":
+		return "Backup schedule still paused"
 	default:
 		return "PrestoBack event"
 	}
@@ -384,6 +386,12 @@ type Config struct {
 	// running as a pure receiver might want this on while having nothing
 	// of its own to back up at all).
 	OnRemoteReceive bool
+	// OnSchedulePausedReminder controls the "you've had backups paused for
+	// a week, still want that?" nudge — a distinct concern from the other
+	// toggles above (those are all about a backup/restore/push that
+	// actually RAN; this is about one that DIDN'T, on purpose, possibly
+	// forgotten about).
+	OnSchedulePausedReminder bool
 }
 
 // Dispatch fires all enabled notification channels for the given event.
@@ -404,6 +412,8 @@ func Dispatch(cfg Config, ev Event) {
 			wantsNotify = cfg.OnRestoreFail
 		case "remote_receive_success", "remote_receive_fail":
 			wantsNotify = cfg.OnRemoteReceive
+		case "schedule_paused_reminder":
+			wantsNotify = cfg.OnSchedulePausedReminder
 		default:
 			wantsNotify = true
 		}

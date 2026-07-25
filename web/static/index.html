@@ -198,6 +198,17 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
   50%{box-shadow:inset 0 0 0 1.5px rgba(61,214,140,1),0 0 20px rgba(61,214,140,.3)}
 }
 .bi-latest{border-radius:10px;animation:bi-latest-pulse 2.8s ease-in-out infinite}
+/* Same breathing shape as .bi-latest above, amber instead of green — used
+   on a "resume backups" button once a schedule has been paused long
+   enough to plausibly be forgotten rather than deliberate (see
+   checkPausedSchedulesAndRemind on the backend, and longPaused in
+   renderApps). One motion language for "this deserves a glance," reused
+   rather than invented twice. */
+@keyframes btn-pulse-amber-kf{
+  0%,100%{box-shadow:0 0 0 1.5px rgba(240,160,32,.55),0 0 8px rgba(240,160,32,.15)}
+  50%{box-shadow:0 0 0 1.5px rgba(240,160,32,1),0 0 16px rgba(240,160,32,.45)}
+}
+.btn-pulse-amber{animation:btn-pulse-amber-kf 2.8s ease-in-out infinite}
 .bic{width:34px;height:34px;border-radius:8px;background:var(--bg4);display:flex;align-items:center;justify-content:center;flex-shrink:0}
 .bm{flex:1;min-width:0}
 .bid{font-family:var(--mono);font-size:11px;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -292,6 +303,7 @@ select.fi{cursor:pointer}
 .user-badge:hover{color:var(--txt);border-color:var(--line2)}
 .toast.success{border-left:3px solid var(--green)}.toast.error{border-left:3px solid var(--red)}.toast.info{border-left:3px solid var(--accent)}.toast.warn{border-left:3px solid var(--amber)}
 @keyframes tin{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+@keyframes spin{to{transform:rotate(360deg)}}
 .view-hidden{display:none}
 ::-webkit-scrollbar{width:5px}
 ::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:3px}
@@ -599,7 +611,7 @@ select.fi{cursor:pointer}
     <div class="card">
       <div class="empty" id="apps-empty"><div class="ei"><svg width="22" height="22" fill="none" stroke="var(--txt3)" stroke-width="1.5" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg></div><div class="et">No apps configured</div><div class="es">Use Discover to auto-import, or add manually.</div></div>
       <table class="tbl" id="apps-tbl" style="display:none">
-        <thead><tr><th>Application</th><th>Path</th><th>Retain</th><th>Schedule</th><th style="text-align:right">Actions</th></tr></thead>
+        <thead><tr><th>Application</th><th style="text-align:right">Backups</th><th>Path</th><th>Retain</th><th>Schedule</th><th style="text-align:right">Actions</th></tr></thead>
         <tbody id="apps-tbody"></tbody>
       </table>
     </div>
@@ -722,6 +734,7 @@ select.fi{cursor:pointer}
       <div class="fg"><div class="ftog" onclick="togNotif('rs_ok')"><div class="ftog-sw" id="tog-rs_ok"><div class="ftog-kn"></div></div><div class="ftog-lbl">Restore success</div></div></div>
       <div class="fg"><div class="ftog" onclick="togNotif('rs_fail')"><div class="ftog-sw" id="tog-rs_fail"><div class="ftog-kn"></div></div><div class="ftog-lbl">Restore failure</div></div></div>
       <div class="fg"><div class="ftog" onclick="togNotif('remote_recv')"><div class="ftog-sw" id="tog-remote_recv"><div class="ftog-kn"></div></div><div class="ftog-lbl">Received a backup from another PrestoBack instance</div></div></div>
+      <div class="fg"><div class="ftog" onclick="togNotif('paused_reminder')"><div class="ftog-sw" id="tog-paused_reminder"><div class="ftog-kn"></div></div><div class="ftog-lbl">Reminder: a backup schedule has been paused a while</div></div></div>
     </div></div>
     <div style="display:flex;gap:8px;margin-top:4px">
       <button class="btn btn-p" onclick="saveNotify()">Save notification settings</button>
@@ -1224,8 +1237,11 @@ select.fi{cursor:pointer}
     <div class="mh"><div class="mt">Apply Update</div><button class="btn btn-g btn-ic" onclick="CM('m-upd')">✕</button></div>
     <div class="mb">
       <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">PrestoBack will stop and restart (~15–20s). Config and all backups are untouched — only the container is replaced.</div></div>
-      <p style="font-size:13px;color:var(--txt2)">After clicking <strong>Apply</strong>, the page will disconnect briefly. <strong>Wait ~20 seconds then refresh manually.</strong></p>
       <p style="font-size:12px;color:var(--txt3);margin-top:8px">The helper container (<code>prestoback-updater</code>) will appear briefly in your container list — this is expected and it will remove itself automatically.</p>
+      <label style="display:flex;align-items:center;gap:8px;margin-top:14px;font-size:13px;cursor:pointer">
+        <input type="checkbox" id="upd-auto-reload" checked>
+        Automatically reload this page once the update finishes
+      </label>
     </div>
     <div class="mf"><button class="btn btn-g" onclick="CM('m-upd')">Cancel</button><button class="btn btn-w" onclick="applyUpdate()">Apply Update</button></div>
   </div>
@@ -1325,13 +1341,16 @@ select.fi{cursor:pointer}
     <div class="mh"><div class="mt">Pairing Code for Another PrestoBack Instance</div><button class="btn btn-g btn-ic" onclick="closePairReceiveModal()">✕</button></div>
     <div class="mb">
       <div style="font-size:12.5px;color:var(--txt2);margin-bottom:14px">On the OTHER PrestoBack instance (the one that will push backups TO this one), go to Remote Backup Targets → Add target → "Another PrestoBack instance", and paste this code — or fill in the three fields manually.</div>
+      <div class="warn-b" style="margin-bottom:10px"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">This URL is prefilled from your browser's address bar — if that's a hostname (like a Docker container name, or a ".local"/mDNS name), the OTHER instance's container often can't resolve it, even though your browser can. If pairing fails with "no such host" or "dial tcp" errors, replace it with this instance's actual LAN IP address (e.g. <code>http://192.168.1.50:8778</code>) and regenerate.</div></div>
+      <div class="fg"><label class="fl">URL (edit if needed, then the code below updates automatically)</label>
+        <input class="fi" id="ppr-url" style="font-family:var(--mono);font-size:12px" oninput="updatePrestoBackPairingCode()">
+      </div>
       <div style="display:flex;justify-content:center;padding:8px 0"><div id="ppr-qr" style="background:#fff;padding:12px;border-radius:10px"></div></div>
       <div class="fg"><label class="fl">Pairing code (expires <span id="ppr-expiry">—</span>)</label>
         <div class="code-b" id="ppr-code" style="font-size:11px;word-break:break-all">—</div>
       </div>
       <button class="btn btn-g btn-sm copy-btn" onclick="copyPrestoBackPairingCode()">Copy pairing code</button>
       <div style="margin-top:14px;font-size:11px;color:var(--txt3)">
-        URL: <span id="ppr-url" style="font-family:var(--mono)">—</span><br>
         Node ID: <span id="ppr-nodeid" style="font-family:var(--mono)">—</span><br>
         Secret: <span id="ppr-secret" style="font-family:var(--mono)">—</span>
       </div>
@@ -1378,6 +1397,16 @@ select.fi{cursor:pointer}
 </div>
 
 <div id="toasts"></div>
+<!-- Persistent self-update status banner — distinct from the ephemeral
+     .toast elements above (which auto-dismiss after 4.5s) because this
+     needs to stay visible across the entire restart/reconnect window,
+     which can run 20-30+ seconds and shouldn't just quietly vanish while
+     the user is still waiting on it. -->
+<div id="update-status-banner" class="hidden" style="position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:9999;background:var(--bg3);border:1px solid var(--line2);border-radius:var(--r);padding:14px 18px;box-shadow:0 8px 24px rgba(0,0,0,.35);max-width:380px;text-align:center">
+  <div id="update-status-spinner" style="width:22px;height:22px;border:2.5px solid var(--line2);border-top-color:var(--accent);border-radius:50%;margin:0 auto 10px;animation:spin .8s linear infinite"></div>
+  <div id="update-status-text" style="font-size:13px;color:var(--txt)">Updating…</div>
+  <div id="update-status-actions" style="margin-top:10px"></div>
+</div>
 
 <script src="/qrcode.min.js"></script>
 <script>
@@ -2342,7 +2371,7 @@ function renderApps() {
     : S.apps;
   badge.textContent = appsFilter ? `${filtered.length} / ${S.apps.length} apps` : `${S.apps.length} apps`;
   if (!filtered.length) {
-    tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--txt3);padding:24px">No apps match "${esc(appsFilter)}"</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--txt3);padding:24px">No apps match "${esc(appsFilter)}"</td></tr>`;
     return;
   }
   tbody.innerHTML = filtered.map(a => {
@@ -2472,16 +2501,22 @@ function renderApps() {
     // existing --amber/--bg4 CSS variables rather than a hardcoded color,
     // so this stays correct automatically if/when a broader theme system
     // (light/dark, alternate palettes) changes what --amber resolves to.
+    const daysPaused = a.schedule?.paused_at ? Math.floor((Date.now() - new Date(a.schedule.paused_at).getTime()) / 86400000) : 0;
+    const longPaused = !a.schedule?.enabled && a.schedule?.cron_expr && daysPaused >= 7;
     const schedToggleBtn = a.schedule?.cron_expr
       ? a.schedule.enabled
         ? `<button class="btn btn-g btn-sm btn-ic" title="Pause backup schedule (/schedpause)" onclick="toggleAppSchedule('${a.id}')">⏸</button>`
-        : `<button class="btn btn-sm btn-ic" style="background:var(--bg4);color:var(--amber,#f0a020);border:1px solid var(--amber,#f0a020)" title="Resume backup schedule (/schedresume) — currently paused" onclick="toggleAppSchedule('${a.id}')">▶</button>`
+        : `<button class="btn btn-sm btn-ic${longPaused?' btn-pulse-amber':''}" style="background:var(--bg4);color:var(--amber,#f0a020);border:1px solid var(--amber,#f0a020)" title="Resume backup schedule (/schedresume) — paused ${daysPaused} day${daysPaused===1?'':'s'}" onclick="toggleAppSchedule('${a.id}')">▶</button>`
+      : '';
+    const longPausedHint = longPaused
+      ? `<div style="font-size:10.5px;color:var(--amber,#f0a020);margin-top:2px">Paused ${daysPaused}d — forgot to resume?</div>`
       : '';
     return `<tr class="${rowCls}">
-      <td data-label="Application"><div class="an">${esc(a.name)}${cntHtml}${updBadge}</div>${healthBadge}</td>
+      <td data-label="Application"><div class="an"><span style="cursor:pointer" title="Click to edit" onclick="openEditApp('${a.id}')">${esc(a.name)}</span>${updBadge}</div>${healthBadge}</td>
+      <td data-label="Backups" style="text-align:right">${cntHtml}</td>
       <td data-label="Path"><div style="display:flex;align-items:center;gap:4px"><span class="path-status-dot ${dotCls}" title="${dotTitle}"></span><span class="ap" style="margin-top:0">${esc(a.path)}</span></div>${pathSizeLine}</td>
       <td data-label="Retain"><span class="pill pb">${a.retain||5}</span></td>
-      <td data-label="Schedule">${schedPill}${pinPill}${nextRunLine}</td>
+      <td data-label="Schedule">${schedPill}${pinPill}${nextRunLine}${longPausedHint}</td>
       <td data-label="Actions"><div class="ra">
         <button class="btn btn-bk btn-sm" onclick="openBkModal('${a.id}','${esc(a.name)}')"${pathSt==='missing'?' title="Config path missing — backup may fail"':''}>▶ Backup</button>
         ${lifecycleBtn}
@@ -4047,10 +4082,11 @@ async function loadNotify() {
     setTog('tog-rs_ok',    n.on_restore_success);
     setTog('tog-rs_fail',  n.on_restore_fail);
     setTog('tog-remote_recv', n.on_remote_receive);
+    setTog('tog-paused_reminder', n.on_schedule_paused_reminder);
   } catch {}
 }
 function togNotif(key) {
-  const map={telegram:'telegram_enabled',discord:'discord_enabled',ntfy:'ntfy_enabled',webhook:'webhook_enabled',bk_ok:'on_backup_success',bk_fail:'on_backup_fail',rs_ok:'on_restore_success',rs_fail:'on_restore_fail',remote_recv:'on_remote_receive'};
+  const map={telegram:'telegram_enabled',discord:'discord_enabled',ntfy:'ntfy_enabled',webhook:'webhook_enabled',bk_ok:'on_backup_success',bk_fail:'on_backup_fail',rs_ok:'on_restore_success',rs_fail:'on_restore_fail',remote_recv:'on_remote_receive',paused_reminder:'on_schedule_paused_reminder'};
   const field=map[key]; if(!field)return;
   S.notif[field]=!S.notif[field]; setTog('tog-'+key,S.notif[field]);
 }
@@ -4548,7 +4584,7 @@ function mfaSetupGoToStep(step) {
 }
 
 function copyMfaBackupCodes() {
-  navigator.clipboard?.writeText(S_mfaBackupCodes.join('\n'));
+  copyToClipboard(S_mfaBackupCodes.join('\n'));
   toast('Backup codes copied', 'success');
 }
 
@@ -4611,19 +4647,29 @@ async function startPrestoBackReceivePairing() {
   try {
     const session = await api('/api/remote/pairing/start', {method:'POST'});
     S_pairReceiveSecret = session;
-    const payload = {url: window.location.origin, node_id: session.node_id, secret: session.secret};
-    S_pairReceiveCode = btoa(JSON.stringify(payload));
-
-    document.getElementById('ppr-url').textContent = payload.url;
+    document.getElementById('ppr-url').value = window.location.origin;
     document.getElementById('ppr-nodeid').textContent = session.node_id;
     document.getElementById('ppr-secret').textContent = session.secret;
-    document.getElementById('ppr-code').textContent = S_pairReceiveCode;
     document.getElementById('ppr-expiry').textContent = new Date(session.expires_at).toLocaleTimeString();
-    renderQR('ppr-qr', S_pairReceiveCode);
+    updatePrestoBackPairingCode();
     OM('m-pair-receive');
   } catch (e) {
     toast('Could not generate pairing code: ' + e.message, 'error');
   }
+}
+
+// Re-derives the pairing code blob + QR from whatever URL is currently in
+// the (editable) URL field — called on generation and again whenever the
+// admin edits it (e.g. swapping a hostname for an IP after a failed
+// pairing attempt — see the warning note above the field for why that's
+// sometimes necessary).
+function updatePrestoBackPairingCode() {
+  if (!S_pairReceiveSecret) return;
+  const url = document.getElementById('ppr-url').value.trim();
+  const payload = {url, node_id: S_pairReceiveSecret.node_id, secret: S_pairReceiveSecret.secret};
+  S_pairReceiveCode = btoa(JSON.stringify(payload));
+  document.getElementById('ppr-code').textContent = S_pairReceiveCode;
+  renderQR('ppr-qr', S_pairReceiveCode);
 }
 
 function closePairReceiveModal() {
@@ -4635,7 +4681,7 @@ function closePairReceiveModal() {
 }
 
 function copyPrestoBackPairingCode() {
-  navigator.clipboard?.writeText(S_pairReceiveCode);
+  copyToClipboard(S_pairReceiveCode);
   toast('Pairing code copied', 'success');
 }
 
@@ -4973,23 +5019,109 @@ async function checkUpdate() {
   btn.disabled = false; btn.textContent = '↺ Check for update';
 }
 function openUpdModal() { OM('m-upd'); }
+
+let S_updateInProgress = false;
+
 async function applyUpdate() {
   CM('m-upd');
-  toast('Update started — reconnect in ~20s','warn');
+  const autoReload = document.getElementById('upd-auto-reload').checked;
+  S_updateInProgress = true;
+  S_loggedUpdateDisconnect = false;
   addLog('_system','⬆ Self-update initiated — container will restart…','info');
+  showUpdateStatusBanner('Updating PrestoBack — this takes about 15–20 seconds…');
+
   try { await api('/api/update/apply',{method:'POST'}); }
   catch(e) {
-    // A network error here is expected — the container is restarting.
-    // Only show an error toast if we get a real error response.
+    // A network error here is expected — the container is restarting out
+    // from under this very request. Only surface a real error response.
     if (e.message && !e.message.includes('fetch') && !e.message.includes('Failed to fetch') && !e.message.includes('NetworkError')) {
       toast('Update error: '+e.message,'error');
+      hideUpdateStatusBanner();
+      S_updateInProgress = false;
+      return;
     }
   }
+  waitForServerBackOnline(autoReload);
+}
+
+// Polls the (unauthenticated, always-public) health endpoint until the
+// restarted container actually answers again, then either reloads
+// automatically or hands the user a one-click "Reload now" button —
+// replacing the old "wait ~20s and refresh manually" instruction, and the
+// wall of repeating "[_sys] SSE disconnected — retrying…" lines that used
+// to be the only visible sign anything was happening (see
+// connectSSE/addLog's S_updateInProgress check below for the other half
+// of that cleanup).
+async function waitForServerBackOnline(autoReload) {
+  const start = Date.now();
+  const maxWaitMs = 90000;
+  await new Promise(r => setTimeout(r, 8000)); // the container needs a few seconds to actually stop before it can come back
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      const r = await fetch('/healthz', {cache:'no-store'});
+      if (r.ok) {
+        S_updateInProgress = false;
+        if (autoReload) {
+          showUpdateStatusBanner('Update complete — reloading…', false);
+          setTimeout(() => location.reload(), 700);
+        } else {
+          showUpdateStatusBanner('Update complete ✓', false, [
+            {label: 'Reload now', onClick: () => location.reload()},
+          ]);
+        }
+        return;
+      }
+    } catch {} // still restarting — expected, keep polling
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  // Gave up after maxWaitMs — something may actually be wrong, so this
+  // stays visible with manual next-steps rather than silently disappearing.
+  S_updateInProgress = false;
+  showUpdateStatusBanner("Taking longer than expected. Check \"docker logs prestoback-updater\" on the host, or reload to see if it's actually back.", false, [
+    {label: 'Reload now', onClick: () => location.reload()},
+    {label: 'Dismiss', onClick: () => hideUpdateStatusBanner()},
+  ]);
+}
+
+function showUpdateStatusBanner(text, showSpinner=true, actions=[]) {
+  const banner = document.getElementById('update-status-banner');
+  document.getElementById('update-status-text').textContent = text;
+  document.getElementById('update-status-spinner').style.display = showSpinner ? '' : 'none';
+  const actionsEl = document.getElementById('update-status-actions');
+  actionsEl.innerHTML = '';
+  actions.forEach(a => {
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-p btn-sm';
+    btn.style.marginRight = '6px';
+    btn.textContent = a.label;
+    btn.onclick = a.onClick;
+    actionsEl.appendChild(btn);
+  });
+  banner.classList.remove('hidden');
+}
+
+function hideUpdateStatusBanner() {
+  document.getElementById('update-status-banner').classList.add('hidden');
 }
 
 // ════════════════════ SSE ════════════════════
+let S_eventSource = null;
+
 function connectSSE() {
+  // Idempotent: every prior call site (login, MFA verify, first-run setup,
+  // initial page load, pairing-link auto-login) called this with no guard
+  // against an already-open connection, so each one silently left its own
+  // EventSource running forever in the background (native EventSource
+  // auto-reconnects on its own unless explicitly closed) — every server
+  // message then got logged once per still-open connection, which is
+  // exactly the "lines showing twice" symptom. Closing any existing
+  // connection first means it no longer matters how many places call this.
+  if (S_eventSource) {
+    S_eventSource.close();
+    S_eventSource = null;
+  }
   const es=new EventSource('/api/events?'+authQueryParam());
+  S_eventSource = es;
   es.onmessage=e=>{
     try {
       const u=JSON.parse(e.data);
@@ -5017,8 +5149,29 @@ function connectSSE() {
       if (status==='failed') { loadHistory(); probeAllApps(); hideLiveProgressSoon(); }
     } catch {}
   };
-  es.onerror=()=>addLog('_sys','SSE disconnected — retrying…','warn');
+  es.onerror=()=>{
+    // Only the connection that's still actually current should log
+    // anything — if this exact EventSource has already been superseded
+    // (S_eventSource now points at a newer one), a stray error from the
+    // old one finishing its teardown shouldn't add a second log line.
+    if (S_eventSource !== es) return;
+    if (S_updateInProgress) {
+      // During a self-update, the container is DEFINITELY restarting —
+      // logging "disconnected, retrying" every few seconds for the whole
+      // 20-30s window (previously exactly what happened, since
+      // EventSource retries on its own) told the user nothing they didn't
+      // already know from the update-status banner, just repeated it
+      // uglily. Log it once, not once per retry.
+      if (!S_loggedUpdateDisconnect) {
+        addLog('_sys','Waiting for PrestoBack to restart…','warn');
+        S_loggedUpdateDisconnect = true;
+      }
+      return;
+    }
+    addLog('_sys','SSE disconnected — retrying…','warn');
+  };
 }
+let S_loggedUpdateDisconnect = false;
 // Persistent (survives the trigger modal closing) percentage bar for the
 // currently running large operation, shown above the activity log — see
 // internal/backup/engine.go's progressEmitter for where these samples come

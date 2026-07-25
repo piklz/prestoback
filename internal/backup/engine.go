@@ -718,10 +718,30 @@ func (e *Engine) PruneBackups(appID string, retain int) error {
 		return err
 	}
 
-	// Group regular (non-prerestore) backups by volume slug
+	// Group regular (non-prerestore) backups by volume slug, and
+	// pre-restore safety snapshots (see RestoreVolume's own doc comment
+	// for what these are) by volume slug SEPARATELY. These used to share
+	// nothing but the exclusion check below — regular backups were
+	// retained correctly, but pre-restore snapshots were never counted
+	// against ANY limit at all, anywhere, and so accumulated forever: one
+	// new one per restore ever performed on that volume, with no cap. An
+	// app restored 5 times ends up with retain (say 5) regular backups
+	// PLUS 5 pre-restore snapshots — 10 total archives on disk despite a
+	// retain setting of 5, which looks exactly like a retention bug from
+	// the outside because it is one. Pre-restore snapshots now respect
+	// the same retain count, counted independently of regular backups —
+	// independently because they answer a different question ("can I
+	// undo my last few restores") than retain does ("how much backup
+	// history do I want"), so one setting shouldn't silently starve the
+	// other; same count because introducing a second, differently-sized
+	// limit here would be one more number for a user to reason about for
+	// a marginal benefit over just reusing the one they already set.
 	bySlug := map[string][]BackupMeta{}
+	preRestoreBySlug := map[string][]BackupMeta{}
 	for _, m := range metas {
-		if !m.PreRestore {
+		if m.PreRestore {
+			preRestoreBySlug[m.VolumeSlug] = append(preRestoreBySlug[m.VolumeSlug], m)
+		} else {
 			bySlug[m.VolumeSlug] = append(bySlug[m.VolumeSlug], m)
 		}
 	}
@@ -733,6 +753,15 @@ func (e *Engine) PruneBackups(appID string, retain int) error {
 		}
 		for _, m := range list[retain:] {
 			log.Printf("[prune] removing old backup: %s (%s)", m.FilePath, slug)
+			_ = os.Remove(m.FilePath)
+		}
+	}
+	for slug, list := range preRestoreBySlug {
+		if len(list) <= retain {
+			continue
+		}
+		for _, m := range list[retain:] {
+			log.Printf("[prune] removing old pre-restore snapshot: %s (%s)", m.FilePath, slug)
 			_ = os.Remove(m.FilePath)
 		}
 	}

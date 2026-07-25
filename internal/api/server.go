@@ -115,6 +115,7 @@ func NewServer(cfg *config.Config, image, selfName, restartNote string) *Server 
 	go s.diskMonitorLoop()
 	go s.updateCheckLoop()
 	go s.selfUpdateCheckLoop()
+	go s.pausedScheduleReminderLoop()
 	return s
 }
 
@@ -1608,6 +1609,48 @@ func (s *Server) diskMonitorLoop() {
 	for {
 		s.checkDiskAndAlert()
 		time.Sleep(30 * time.Minute)
+	}
+}
+
+// pausedScheduleReminderThreshold is both how long a schedule has to have
+// been paused before the FIRST reminder fires, and the repeat cadence
+// after that — a schedule paused for exactly a week gets nudged once;
+// left paused for a month, it gets nudged roughly every week until either
+// resumed or the user has clearly made peace with it being off.
+const pausedScheduleReminderThreshold = 7 * 24 * time.Hour
+
+func (s *Server) pausedScheduleReminderLoop() {
+	time.Sleep(2 * time.Minute) // let startup settle before first check
+	for {
+		s.checkPausedSchedulesAndRemind()
+		time.Sleep(6 * time.Hour) // frequent enough to catch the threshold within a few hours of crossing it, not so frequent it's wasted work for something checked in days, not seconds
+	}
+}
+
+func (s *Server) checkPausedSchedulesAndRemind() {
+	now := time.Now()
+	for _, a := range s.cfg.ListApps() {
+		sch := a.Schedule
+		if sch.PausedAt == nil {
+			continue
+		}
+		pausedFor := now.Sub(*sch.PausedAt)
+		if pausedFor < pausedScheduleReminderThreshold {
+			continue
+		}
+		if sch.LastReminderAt != nil && now.Sub(*sch.LastReminderAt) < pausedScheduleReminderThreshold {
+			continue
+		}
+
+		days := int(pausedFor.Hours() / 24)
+		s.dispatchNotify(notify.Event{
+			Kind:    "schedule_paused_reminder",
+			AppName: a.Name,
+			Detail:  fmt.Sprintf("%s's backup schedule has been paused for %d days. Resume it from the Applications page if this wasn't intentional.", a.Name, days),
+		})
+		if err := s.cfg.MarkScheduleReminderSent(a.ID); err != nil {
+			log.Printf("[schedule-reminder] could not record reminder sent for %s: %v", a.ID, err)
+		}
 	}
 }
 
@@ -4793,6 +4836,7 @@ func (s *Server) dispatchNotify(ev notify.Event) {
 		OnRestoreSuccess: nc.OnRestoreSuccess,
 		OnRestoreFail:    nc.OnRestoreFail,
 		OnRemoteReceive:  nc.OnRemoteReceive,
+		OnSchedulePausedReminder: nc.OnSchedulePausedReminder,
 	}, ev)
 }
 
