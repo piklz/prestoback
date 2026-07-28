@@ -461,6 +461,10 @@ select.fi{cursor:pointer}
         <label id="auth-mfa-label">Authenticator code</label>
         <input class="fi" id="mfa-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="000000" maxlength="9" style="text-align:center;letter-spacing:3px;font-family:var(--mono);font-size:18px" onkeydown="if(event.key==='Enter')doMfaVerify()">
       </div>
+      <label style="display:flex;align-items:center;gap:8px;margin:4px 0 12px;font-size:12.5px;color:var(--txt2);cursor:pointer">
+        <input type="checkbox" id="mfa-remember-device" checked>
+        Remember this device for 30 days
+      </label>
       <button class="auth-btn" onclick="doMfaVerify()">Verify →</button>
       <div style="display:flex;justify-content:space-between;margin-top:12px;font-size:12px">
         <a href="javascript:void(0)" onclick="toggleMfaBackupMode()" id="mfa-backup-toggle" style="color:var(--accent)">Use a backup code instead</a>
@@ -783,6 +787,13 @@ select.fi{cursor:pointer}
       <div id="mfa-status-on" style="display:none">
         <div class="info-b" style="border-color:rgba(61,214,140,.3)"><svg width="15" height="15" fill="none" stroke="var(--green)" stroke-width="2" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg><div class="info-t" style="color:var(--green)">2FA is enabled on this account.</div></div>
         <button class="btn btn-d btn-sm" onclick="openMfaDisableModal()">Disable 2FA</button>
+        <div style="margin-top:16px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <div class="fl" style="margin:0">Trusted devices (skip 2FA for 30 days)</div>
+            <button class="btn btn-g btn-sm" onclick="revokeAllTrustedDevices()">Sign out all devices</button>
+          </div>
+          <div id="trusted-devices-list" style="font-size:12px;color:var(--txt3)">Loading…</div>
+        </div>
       </div>
       <div id="mfa-status-loading" style="font-size:12px;color:var(--txt3)">Loading…</div>
     </div></div>
@@ -1645,6 +1656,7 @@ function cancelMfaLogin() {
 
 async function doMfaVerify() {
   const code = document.getElementById('mfa-code').value.trim();
+  const rememberDevice = document.getElementById('mfa-remember-device').checked;
   const err = document.getElementById('auth-err');
   err.textContent='';
   if (!code) { err.textContent = 'Enter your code'; return; }
@@ -1652,7 +1664,7 @@ async function doMfaVerify() {
     const r = await fetch('/api/auth/mfa/verify', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({mfa_token: S.mfaToken, code})
+      body: JSON.stringify({mfa_token: S.mfaToken, code, remember_device: rememberDevice})
     });
     const d = await r.json();
     if (!r.ok) { err.textContent = d.error || 'Invalid code'; return; }
@@ -4548,8 +4560,52 @@ async function loadMfaStatus() {
     const me = await api('/api/auth/me');
     document.getElementById('mfa-status-loading').style.display='none';
     document.getElementById(me.mfa_enabled ? 'mfa-status-on' : 'mfa-status-off').style.display='';
+    if (me.mfa_enabled) loadTrustedDevices();
   } catch {
     document.getElementById('mfa-status-loading').textContent = 'Could not load 2FA status.';
+  }
+}
+
+async function loadTrustedDevices() {
+  const el = document.getElementById('trusted-devices-list');
+  try {
+    const devices = await api('/api/auth/devices');
+    if (!devices || !devices.length) {
+      el.innerHTML = '<span style="color:var(--txt3)">No trusted devices — you\'ll be asked for a code every time you log in.</span>';
+      return;
+    }
+    el.innerHTML = devices.map(d => `
+      <div class="bi">
+        <div class="bm">
+          <div class="bid">${escHtml(d.label || 'Unknown device')}</div>
+          <div class="fh">Trusted ${new Date(d.created_at).toLocaleDateString()} · expires ${new Date(d.expires_at).toLocaleDateString()}${d.last_used_at ? ' · last used ' + new Date(d.last_used_at).toLocaleDateString() : ' · never used since'}</div>
+        </div>
+        <button class="btn btn-d btn-sm" onclick="revokeTrustedDevice('${d.id}','${escHtml(d.label||'this device')}')">Revoke</button>
+      </div>`).join('');
+  } catch (e) {
+    el.innerHTML = '<span style="color:var(--red)">Could not load: ' + escHtml(e.message) + '</span>';
+  }
+}
+
+async function revokeTrustedDevice(id, label) {
+  if (!confirm(`Revoke "${label}"? It will need a code to sign in next time.`)) return;
+  try {
+    await api('/api/auth/devices/' + id, {method:'DELETE'});
+    toast('Device revoked', 'info');
+    loadTrustedDevices();
+  } catch (e) {
+    toast('Could not revoke: ' + e.message, 'error');
+  }
+}
+
+async function revokeAllTrustedDevices() {
+  if (!confirm('Sign out of 2FA on ALL trusted devices? Every device (including this one) will need a code next time.')) return;
+  try {
+    await api('/api/auth/devices/revoke-all', {method:'POST'});
+    toast('All devices signed out', 'info');
+    loadTrustedDevices();
+  } catch (e) {
+    toast('Could not revoke: ' + e.message, 'error');
   }
 }
 

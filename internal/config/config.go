@@ -357,6 +357,7 @@ type disk struct {
 	PairedKeys   []PairedKey      `json:"paired_keys,omitempty"`
 	NodeIdentity *NodeIdentity    `json:"node_identity,omitempty"`
 	RemotePushers []RemotePusher  `json:"remote_pushers,omitempty"`
+	TrustedDevices []TrustedDevice `json:"trusted_devices,omitempty"`
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -415,6 +416,12 @@ type Config struct {
 	// Persisted (unlike remotePending) — these are the actual long-lived
 	// authorization records, not in-progress handshakes.
 	remotePushers map[string]RemotePusher
+
+	// trustedDevices holds "skip MFA on this device for 30 days" records
+	// — see mfa.go's device-trust section. Persisted, like remotePushers:
+	// a real, long-lived authorization a user should be able to see and
+	// revoke, not an ephemeral handshake.
+	trustedDevices map[string]TrustedDevice
 }
 
 func Load(dataDir string) (*Config, error) {
@@ -431,6 +438,7 @@ func Load(dataDir string) (*Config, error) {
 		mfaPending:    make(map[string]*pendingMFALogin),
 		remotePending: make(map[string]*pendingRemotePairing),
 		remotePushers: make(map[string]RemotePusher),
+		trustedDevices: make(map[string]TrustedDevice),
 	}
 	path := filepath.Join(dataDir, "config.json")
 	data, err := os.ReadFile(path)
@@ -506,6 +514,9 @@ func Load(dataDir string) (*Config, error) {
 	for _, rp := range d.RemotePushers {
 		c.remotePushers[rp.ID] = rp
 	}
+	for _, td := range d.TrustedDevices {
+		c.trustedDevices[td.ID] = td
+	}
 	if d.NodeIdentity != nil {
 		c.nodeIdentity = d.NodeIdentity
 	} else {
@@ -558,6 +569,9 @@ func (c *Config) save() error {
 	}
 	for _, rp := range c.remotePushers {
 		d.RemotePushers = append(d.RemotePushers, rp)
+	}
+	for _, td := range c.trustedDevices {
+		d.TrustedDevices = append(d.TrustedDevices, td)
 	}
 	data, err := json.MarshalIndent(d, "", "  ")
 	if err != nil {

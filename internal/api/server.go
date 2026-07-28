@@ -163,6 +163,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/auth/mfa/setup", s.authJWT(s.handleAuthMFASetup))     // self-service — enrolls the calling account only
 	s.mux.HandleFunc("/api/auth/mfa/confirm", s.authJWT(s.handleAuthMFAConfirm)) // self-service
 	s.mux.HandleFunc("/api/auth/mfa/disable", s.authJWT(s.handleAuthMFADisable)) // self-service, but re-checks password itself
+	s.mux.HandleFunc("/api/auth/devices", s.authJWT(s.handleAuthDevices))
+	s.mux.HandleFunc("/api/auth/devices/revoke-all", s.authJWT(s.handleAuthDevicesRevokeAll))
+	s.mux.HandleFunc("/api/auth/devices/", s.authJWT(s.handleAuthDeviceByID))
 	s.mux.HandleFunc("/api/volumes", s.authJWT(s.handleListVolumes))
 	s.mux.HandleFunc("/api/discover", s.authJWT(s.handleDiscover))
 	s.mux.HandleFunc("/api/suggest-excludes", s.authJWT(s.handleSuggestExcludes))
