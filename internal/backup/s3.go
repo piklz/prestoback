@@ -128,6 +128,30 @@ func (c *s3Client) getObject(ctx context.Context, key string) (io.ReadCloser, er
 	return resp.Body, nil
 }
 
+// deleteObject removes a single object — used by PruneRemote (remote.go) to
+// enforce retention on S3-compatible targets, the same way os.Remove /
+// sftp.Client.Remove do for the mount/sftp kinds.
+func (c *s3Client) deleteObject(ctx context.Context, key string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.objectURL(key), nil)
+	if err != nil {
+		return err
+	}
+	c.sign(req, emptyPayloadHash)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	// S3 returns 204 on a successful delete; some S3-compatible servers
+	// return 200. A 404 is also treated as success — the object is already
+	// gone, which is the caller's desired end state either way.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return s3ErrorFromResponse(resp)
+	}
+	return nil
+}
+
 // listObjects lists every object under prefix (a single ListObjectsV2 page
 // — see package comment for why that's sufficient here).
 func (c *s3Client) listObjects(ctx context.Context, prefix string) ([]s3Object, error) {

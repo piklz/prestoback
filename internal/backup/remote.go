@@ -63,6 +63,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -401,6 +402,122 @@ func ListRemoteFiles(t RemoteTarget, appID string) ([]RemoteFile, error) {
 
 	default:
 		return nil, fmt.Errorf("unknown remote kind %q", t.Kind)
+	}
+}
+
+// ── Prune (retention on the remote itself) ───────────────────────────────────
+//
+// PruneRemote enforces `retain` on t the same way Engine.PruneBackups
+// enforces it locally (engine.go): newest `retain` non-prerestore archives
+// kept per volume slug, and pre-restore snapshots capped at `retain`
+// independently of regular ones. Before this existed, PushAppBackup/PushFile
+// only ever ADDED archives to a remote target — nothing ever deleted an old
+// one from mount/sftp/s3 storage, so those three kinds accumulated backups
+// forever regardless of the configured retain count, even though the local
+// copy was being pruned correctly the whole time. That's the actual reason
+// remote storage can show more archives than `retain` implies.
+//
+// "prestoback" targets are deliberately excluded here — that kind already
+// enforces its own retention on the RECEIVING instance (see
+// remotepairing_handlers.go's disk-space + retention limits), which is the
+// receiver's own config, not this pusher's. Pruning it from here too would
+// mean two independent retain counts fighting over the same directory.
+//
+// Grouping uses the exact same volumeSlugFromID/PreRestore parsing
+// ListBackups and PruneBackups use locally, so a slug on the remote means
+// the same thing it means on disk — this is deliberately not a separate
+// parser that could drift from the local one.
+func PruneRemote(t RemoteTarget, appID string, retain int) error {
+	if t.Kind == "prestoback" {
+		return nil
+	}
+	if retain <= 0 {
+		retain = 5
+	}
+
+	files, err := ListRemoteFiles(t, appID)
+	if err != nil {
+		return fmt.Errorf("list remote files for prune: %w", err)
+	}
+	if len(files) == 0 {
+		return nil
+	}
+
+	type named struct {
+		RemoteFile
+		slug       string
+		preRestore bool
+	}
+	bySlug := map[string][]named{}
+	preRestoreBySlug := map[string][]named{}
+	for _, f := range files {
+		id := strings.TrimSuffix(f.Name, ".tar.gz")
+		pr := strings.HasSuffix(id, "_prerestore")
+		slug := volumeSlugFromID(appID, id)
+		n := named{RemoteFile: f, slug: slug, preRestore: pr}
+		if pr {
+			preRestoreBySlug[slug] = append(preRestoreBySlug[slug], n)
+		} else {
+			bySlug[slug] = append(bySlug[slug], n)
+		}
+	}
+
+	var lastErr error
+	prune := func(group map[string][]named) {
+		for _, list := range group {
+			if len(list) <= retain {
+				continue
+			}
+			// Newest-first, same ordering ListBackups produces locally —
+			// ListRemoteFiles carries ModTime for every kind (mount:
+			// os.FileInfo; sftp: fs.FileInfo; s3: LastModified), so this is
+			// consistent across backends.
+			sort.Slice(list, func(i, j int) bool { return list[i].ModTime.After(list[j].ModTime) })
+			for _, f := range list[retain:] {
+				if err := deleteRemoteFile(t, f.Path); err != nil {
+					lastErr = fmt.Errorf("delete %s: %w", f.Name, err)
+					continue
+				}
+			}
+		}
+	}
+	prune(bySlug)
+	prune(preRestoreBySlug)
+	return lastErr
+}
+
+// deleteRemoteFile removes one archive from t by its ListRemoteFiles Path,
+// dispatching to the same per-kind primitive PushFile/ListRemoteFiles
+// already use for that kind (mount: os.Remove; sftp: an SFTP client's
+// Remove; s3: an authenticated DELETE).
+func deleteRemoteFile(t RemoteTarget, path string) error {
+	switch t.Kind {
+	case "mount":
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+
+	case "sftp":
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		client, closeFn, err := sftpDial(ctx, t)
+		if err != nil {
+			return err
+		}
+		defer closeFn()
+		if err := client.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+
+	case "s3":
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return newS3Client(t).deleteObject(ctx, path)
+
+	default:
+		return fmt.Errorf("unknown remote kind %q", t.Kind)
 	}
 }
 

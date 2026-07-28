@@ -39,6 +39,14 @@ type AppUpdateReport struct {
 	AppID   string             `json:"app_id"`
 	AppName string             `json:"app_name"`
 	Images  []backup.ImageMeta `json:"images"`
+	// Pinned mirrors config.AppConfig.Pinned at the time this report was
+	// built. A pinned app (e.g. a Compose service with a hand-managed
+	// upgrade path — Immich's Postgres, for instance) still gets checked
+	// and reported on, but buildUpdateReportMessage must not offer an
+	// "Update" action button for it: tapping Auto-Update on a pinned app
+	// would bypass exactly the manual intervention pinning exists to
+	// force.
+	Pinned bool `json:"pinned"`
 }
 
 // ownedContainers assigns each running container discoverable from apps to
@@ -139,7 +147,7 @@ func (s *Server) checkForUpdates(notifyUser bool) ([]AppUpdateReport, bool) {
 			}
 		}
 		if len(images) > 0 {
-			reports = append(reports, AppUpdateReport{AppID: app.ID, AppName: app.Name, Images: images})
+			reports = append(reports, AppUpdateReport{AppID: app.ID, AppName: app.Name, Images: images, Pinned: app.Pinned})
 		}
 		if appHasUpdate {
 			pending = append(pending, app.Name)
@@ -308,7 +316,11 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 	}
 
 	for _, r := range reports {
-		sb.WriteString(fmt.Sprintf("*%s*\n", notify.EscapeMD(r.AppName)))
+		name := notify.EscapeMD(r.AppName)
+		if r.Pinned {
+			name = "🔒 " + name
+		}
+		sb.WriteString(fmt.Sprintf("*%s*\n", name))
 		for _, img := range r.Images {
 			name := notify.EscapeMD(img.ContainerName)
 			// Link the name to its registry/package page when recognized
@@ -347,6 +359,9 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 				sb.WriteString(fmt.Sprintf("   📦 New build: %s\n", notify.EscapeMD(img.CreatedDate)))
 			}
 		}
+		if r.Pinned {
+			sb.WriteString("   _pinned — update manually, no Auto\\-Update button offered_\n")
+		}
 		sb.WriteString("\n")
 	}
 
@@ -356,11 +371,20 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 	// buttons for granular control, with a single "update all" shortcut
 	// added on top when a batch update is convenient instead.
 	var btns []notify.ButtonAction
+	updatableCount := 0
 	for _, r := range reports {
+		if r.Pinned {
+			// No per-app button for a pinned app — see AppUpdateReport.Pinned's
+			// doc comment. It's still listed above with a 🔒 marker and the
+			// "pinned" note so the update isn't silently hidden, just not
+			// offered as a one-tap action.
+			continue
+		}
+		updatableCount++
 		btns = append(btns, notify.ButtonAction{Label: "🔄 Update " + r.AppName, Data: "update:" + r.AppID})
 	}
-	if len(reports) > 1 {
-		btns = append(btns, notify.ButtonAction{Label: fmt.Sprintf("🔄 Update all %d", len(reports)), Data: "update:all"})
+	if updatableCount > 1 {
+		btns = append(btns, notify.ButtonAction{Label: fmt.Sprintf("🔄 Update all %d", updatableCount), Data: "update:all"})
 	}
 
 	return strings.TrimRight(sb.String(), "\n"), btns

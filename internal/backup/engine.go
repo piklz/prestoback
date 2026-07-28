@@ -657,10 +657,17 @@ func volumeSlugFromID(appID, id string) string {
 	// Strip appID prefix and the trailing timestamp (YYYYMMDD_HHMMSS)
 	// We know appID, so strip it plus the following underscore
 	prefix := appID + "_"
-	if !strings.HasPrefix(id, prefix) {
-		return ""
+	rest := id
+	if strings.HasPrefix(id, prefix) {
+		rest = strings.TrimPrefix(id, prefix) // "config_20250615_120000" or "config_20250615_120000_prerestore"
 	}
-	rest := strings.TrimPrefix(id, prefix) // "config_20250615_120000" or "config_20250615_120000_prerestore"
+	// If id doesn't carry the expected appID_ prefix (e.g. an archive
+	// pulled from a remote target whose filename was produced by a
+	// differently-configured or renamed app), fall back to slugging the
+	// id as-is rather than collapsing it into a shared "" bucket. A
+	// shared bucket lets unrelated volumes' archives count against each
+	// other's retain budget, which looks like — and functionally is — a
+	// retention bug from the outside.
 	// Strip _prerestore suffix
 	rest = strings.TrimSuffix(rest, "_prerestore")
 	// Strip trailing _YYYYMMDD_HHMMSS (17 chars: 8 + _ + 6)

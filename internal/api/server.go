@@ -2488,7 +2488,7 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 		// Gated on the manifest write succeeding: a remote holding archives
 		// with no manifest to describe them is a worse state than just not
 		// pushing this run at all — see pushToRemotes's doc comment.
-		s.pushToRemotes(app.ID, app.Name, metas, manifestPath, emit)
+		s.pushToRemotes(app.ID, app.Name, app.Retain, metas, manifestPath, emit)
 	}
 
 	emit("━━━ Backup complete ━━━")
@@ -2504,7 +2504,7 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 // local failure just means a partial remote push, mirroring exactly what
 // happened locally — never "pretend nothing failed" and never "refuse to
 // push what did succeed."
-func (s *Server) pushToRemotes(appID, appName string, metas []backup.BackupMeta, manifestPath string, emit func(string)) {
+func (s *Server) pushToRemotes(appID, appName string, retain int, metas []backup.BackupMeta, manifestPath string, emit func(string)) {
 	rc := s.cfg.GetRemote()
 	if !rc.Enabled || len(rc.Targets) == 0 {
 		return
@@ -2543,6 +2543,16 @@ func (s *Server) pushToRemotes(appID, appName string, metas []backup.BackupMeta,
 			Detail: t.Name, DurationMs: pushDur,
 		})
 		s.dispatchNotify(notify.Event{Kind: "push_success", AppName: appName, Detail: t.Name})
+
+		// Enforce retain on the remote copy too — see PruneRemote's doc
+		// comment (remote.go) for why this was previously missing entirely
+		// for mount/sftp/s3 targets. Best-effort and non-fatal, same
+		// posture as the local s.engine.PruneBackups calls elsewhere: a
+		// prune hiccup shouldn't be reported as a push failure, since the
+		// push itself already succeeded.
+		if err := backup.PruneRemote(target, appID, retain); err != nil {
+			log.Printf("[remote] prune warning for %s on %s: %v", appID, t.Name, err)
+		}
 	}
 }
 
@@ -4192,16 +4202,43 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 
 	case "update":
 		if parts[1] == "all" {
-			targets := s.cfg.ListApps()
+			all := s.cfg.ListApps()
+			// Pinned apps (e.g. an Immich Postgres — anything whose upgrade
+			// path needs manual intervention) are deliberately excluded from
+			// "update all". This is enforced here, not just by omitting a
+			// per-app button — a callback_data payload is just a string, so
+			// the button being hidden alone wouldn't stop this batch path
+			// from still reaching a pinned app.
+			var targets []config.AppConfig
+			var skipped []string
+			for _, a := range all {
+				if a.Pinned {
+					skipped = append(skipped, a.Name)
+					continue
+				}
+				targets = append(targets, a)
+			}
 			sort.Slice(targets, func(i, j int) bool { return targets[i].Name < targets[j].Name })
-			_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+			msg := fmt.Sprintf(
 				"🔄 Pulling latest images for *%d* app\\(s\\)\\. Results incoming when complete\\.\\.\\.",
 				len(targets),
-			))
+			)
+			if len(skipped) > 0 {
+				sort.Strings(skipped)
+				msg += fmt.Sprintf("\n🔒 Skipped %d pinned app\\(s\\) \\(manual update only\\): %s",
+					len(skipped), notify.EscapeMD(strings.Join(skipped, ", ")))
+			}
+			_ = notify.SendRaw(tgCfg, msg)
 			go s.runContainerUpdates(tgCfg, targets)
 		} else {
 			app, ok := s.cfg.GetApp(parts[1])
 			if !ok {
+				return
+			}
+			if app.Pinned {
+				_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+					"🔒 `%s` is pinned — update it manually rather than via Auto\\-Update\\.",
+					notify.EscapeMD(app.Name)))
 				return
 			}
 			_ = notify.SendRaw(tgCfg, fmt.Sprintf("🔄 Pulling `%s`\\.\\.\\.", notify.EscapeMD(app.Name)))
