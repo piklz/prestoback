@@ -32,6 +32,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -357,6 +358,24 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	recordLoginSuccess(req.Username)
 
 	if user.MFAEnabled {
+		// A trusted device (see mfa.go's "Trusted devices" section) skips
+		// the second factor for up to 30 days, the same "prompt once per
+		// device, not once per login" pattern Google/Bitwarden use — the
+		// password above is still always required either way; this only
+		// ever shortcuts the SECOND factor, never authentication itself.
+		if cookie, err := r.Cookie(trustedDeviceCookieName); err == nil {
+			if s.cfg.ValidateTrustedDevice(user.Username, cookie.Value) {
+				token := s.issueToken(user.Username, user.Role)
+				respond(w, 200, map[string]any{
+					"token":    token,
+					"username": user.Username,
+					"role":     user.Role,
+					"expires":  time.Now().Add(jwtTTL).Unix(),
+				})
+				return
+			}
+		}
+
 		token, expiresAt, err := s.cfg.BeginMFALogin(user.Username, user.Role)
 		if err != nil {
 			errOut(w, 500, "could not start MFA login: "+err.Error())
@@ -379,6 +398,49 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ── Trusted-device cookie ────────────────────────────────────────────────────
+//
+// The raw trusted-device token lives ONLY in this cookie, set HttpOnly so
+// no JavaScript (including any XSS bug in this very frontend) can ever
+// read it — unlike the JWT, which the frontend already keeps in
+// localStorage and attaches manually, this credential is deliberately
+// never given to page script at all, since its whole reason to exist is
+// bypassing a security control (MFA) and so deserves tighter handling
+// than a token that only ever grants what a plain password already would.
+
+const trustedDeviceCookieName = "prestoback_trust"
+
+// isRequestSecure reports whether this request arrived over a connection
+// that was actually encrypted end-to-end from the browser's point of view
+// — either directly (r.TLS set) or via a reverse proxy that terminated
+// TLS and says so (X-Forwarded-Proto). Browsers silently refuse to ever
+// send a cookie marked Secure back over plain HTTP, so setting Secure
+// unconditionally on a typical LAN deployment (PrestoBack's actual
+// default posture — see docker-compose.yml, plain HTTP on :8778) would
+// make the cookie never get sent at all, silently breaking the whole
+// feature rather than failing loudly. Checked per-request rather than
+// once at startup since the same instance can legitimately be reached
+// both directly (HTTP) and through a TLS-terminating proxy depending on
+// how it's set up.
+func isRequestSecure(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+}
+
+func setTrustedDeviceCookie(w http.ResponseWriter, r *http.Request, token string, expiresAt time.Time) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     trustedDeviceCookieName,
+		Value:    token,
+		Path:     "/",
+		Expires:  expiresAt,
+		HttpOnly: true,
+		Secure:   isRequestSecure(r),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
 // POST /api/auth/mfa/verify — second half of login for an MFA-enabled
 // account. Takes the pending token BeginMFALogin issued plus a TOTP or
 // backup code; on success, issues the same real JWT handleAuthLogin would
@@ -389,8 +451,9 @@ func (s *Server) handleAuthMFAVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		MFAToken string `json:"mfa_token"`
-		Code     string `json:"code"`
+		MFAToken       string `json:"mfa_token"`
+		Code           string `json:"code"`
+		RememberDevice bool   `json:"remember_device"`
 	}
 	if err := parseJSON(r, &req); err != nil {
 		errOut(w, 400, "invalid JSON: "+err.Error())
@@ -405,6 +468,17 @@ func (s *Server) handleAuthMFAVerify(w http.ResponseWriter, r *http.Request) {
 		errOut(w, 401, err.Error())
 		return
 	}
+	if req.RememberDevice {
+		label := deviceLabelFromUserAgent(r.UserAgent())
+		if devToken, expiresAt, devErr := s.cfg.IssueTrustedDevice(username, label); devErr == nil {
+			setTrustedDeviceCookie(w, r, devToken, expiresAt)
+		} else {
+			// Non-fatal — the actual login already succeeded above; losing
+			// the "remember me" convenience isn't worth failing the whole
+			// login over. The next login just prompts for MFA again.
+			log.Printf("[auth] could not issue trusted device for %s: %v", username, devErr)
+		}
+	}
 	token := s.issueToken(username, role)
 	respond(w, 200, map[string]any{
 		"token":    token,
@@ -412,6 +486,39 @@ func (s *Server) handleAuthMFAVerify(w http.ResponseWriter, r *http.Request) {
 		"role":     role,
 		"expires":  time.Now().Add(jwtTTL).Unix(),
 	})
+}
+
+// deviceLabelFromUserAgent turns a raw User-Agent string into a short,
+// human-recognizable label for the trusted-devices list ("Chrome on
+// Linux" rather than the full UA string) — deliberately coarse, just
+// enough for a user scanning a list to recognize "yes, that's my
+// laptop," not a real UA-parsing library.
+func deviceLabelFromUserAgent(ua string) string {
+	browser := "Unknown browser"
+	switch {
+	case strings.Contains(ua, "Edg/"):
+		browser = "Edge"
+	case strings.Contains(ua, "Chrome/") && !strings.Contains(ua, "Chromium"):
+		browser = "Chrome"
+	case strings.Contains(ua, "Firefox/"):
+		browser = "Firefox"
+	case strings.Contains(ua, "Safari/") && !strings.Contains(ua, "Chrome"):
+		browser = "Safari"
+	}
+	os := "unknown OS"
+	switch {
+	case strings.Contains(ua, "Windows"):
+		os = "Windows"
+	case strings.Contains(ua, "Mac OS X"):
+		os = "macOS"
+	case strings.Contains(ua, "Android"):
+		os = "Android"
+	case strings.Contains(ua, "iPhone"), strings.Contains(ua, "iPad"):
+		os = "iOS"
+	case strings.Contains(ua, "Linux"):
+		os = "Linux"
+	}
+	return browser + " on " + os
 }
 
 // POST /api/auth/mfa/setup — begins MFA enrollment for the CURRENT
@@ -489,6 +596,87 @@ func (s *Server) handleAuthMFADisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respond(w, 200, map[string]string{"status": "mfa disabled"})
+}
+
+// GET /api/auth/devices — every trusted device for the CURRENT account
+// (never another user's — username always comes from the JWT).
+func (s *Server) handleAuthDevices(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	username := r.Header.Get("X-Auth-User")
+	devices := s.cfg.ListTrustedDevices(username)
+	type deviceView struct {
+		ID         string     `json:"id"`
+		Label      string     `json:"label"`
+		CreatedAt  time.Time  `json:"created_at"`
+		ExpiresAt  time.Time  `json:"expires_at"`
+		LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	}
+	out := make([]deviceView, len(devices))
+	for i, d := range devices {
+		out[i] = deviceView{ID: d.ID, Label: d.Label, CreatedAt: d.CreatedAt, ExpiresAt: d.ExpiresAt, LastUsedAt: d.LastUsedAt}
+	}
+	respond(w, 200, out)
+}
+
+// DELETE /api/auth/devices/{id} — revoke one trusted device belonging to
+// the current account. Deliberately checks ownership (not just "does
+// this ID exist anywhere") so one account can't revoke another's device
+// by guessing/enumerating IDs.
+func (s *Server) handleAuthDeviceByID(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/auth/devices/")
+	if id == "" {
+		errOut(w, 400, "missing device id")
+		return
+	}
+	username := r.Header.Get("X-Auth-User")
+	owned := false
+	for _, d := range s.cfg.ListTrustedDevices(username) {
+		if d.ID == id {
+			owned = true
+			break
+		}
+	}
+	if !owned {
+		errOut(w, 404, "device not found")
+		return
+	}
+	if err := s.cfg.RevokeTrustedDevice(id); err != nil {
+		errOut(w, 404, err.Error())
+		return
+	}
+	respond(w, 200, map[string]string{"status": "revoked"})
+}
+
+// POST /api/auth/devices/revoke-all — sign this account's MFA out of
+// every remembered device at once (e.g. "I think one of these isn't
+// actually mine"), and clear the CURRENT browser's cookie too so it
+// doesn't keep silently working via a stale local cookie against a
+// since-deleted server record (ValidateTrustedDevice would already
+// reject that mismatch on its own, but clearing the cookie is the
+// honest, tidy thing to do rather than leaving a dead cookie behind).
+func (s *Server) handleAuthDevicesRevokeAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	username := r.Header.Get("X-Auth-User")
+	if err := s.cfg.RevokeAllTrustedDevices(username); err != nil {
+		errOut(w, 500, err.Error())
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: trustedDeviceCookieName, Value: "", Path: "/",
+		Expires: time.Unix(0, 0), MaxAge: -1,
+		HttpOnly: true, Secure: isRequestSecure(r), SameSite: http.SameSiteLaxMode,
+	})
+	respond(w, 200, map[string]string{"status": "all devices revoked"})
 }
 
 // ── Protected auth handlers ───────────────────────────────────────────────────

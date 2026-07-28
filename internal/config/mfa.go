@@ -30,6 +30,7 @@ import (
 	"crypto/sha1"
 	"encoding/base32"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net/url"
@@ -299,7 +300,14 @@ func (c *Config) DisableMFA(username string) error {
 	u.MFABackupCodeHashes = nil
 	c.users[username] = u
 	c.mu.Unlock()
-	return c.Save()
+	if err := c.Save(); err != nil {
+		return err
+	}
+	// Trusted-device records only mean anything relative to an MFA
+	// requirement that no longer exists — clean them up rather than
+	// leaving stale entries a re-enabled MFA setup would otherwise
+	// silently start honoring again.
+	return c.RevokeAllTrustedDevices(username)
 }
 
 // VerifyAndConsumeBackupCode checks code against username's remaining
@@ -415,4 +423,161 @@ func (c *Config) CompleteMFALogin(token, code string) (username, role string, er
 		return p.Username, p.Role, nil
 	}
 	return "", "", fmt.Errorf("invalid code")
+}
+
+// ── Trusted devices ("remember this device for 30 days") ───────────────────
+//
+// Without this, an MFA-enabled account gets prompted for a code on EVERY
+// login — every JWT expiry (12h, see auth.go's jwtTTL), forever. That's
+// meaningfully more friction than mainstream MFA implementations (Google,
+// Bitwarden, and most other serious services) actually impose: they
+// prompt for the second factor once per device/browser, then trust that
+// device for a window (commonly ~30 days), re-prompting only on a new
+// device, a cleared cookie, or after the window lapses. This section adds
+// the same shape here — NOT "skip login entirely" (a password is always
+// still required; see handleAuthLogin), just "skip re-proving the second
+// factor on a browser that already proved it recently."
+//
+// Security posture: a trusted-device token is a real bearer credential —
+// anyone holding it can complete a login as this user without a second
+// factor for the rest of its 30-day life. So it gets the same treatment
+// as every other credential in this package: 256 bits of entropy
+// (GenerateAPIKey), stored server-side only as a hash (HashAPIKey),
+// compared via SecureEquals, scoped to one username, and independently
+// revocable. The raw token itself lives ONLY in an HttpOnly cookie (see
+// auth.go) — never reachable from JavaScript, so an XSS bug can't
+// exfiltrate it the way it could a value merely stored in localStorage.
+
+const trustedDeviceTTL = 30 * 24 * time.Hour
+
+// TrustedDevice is one browser/device that's completed MFA recently
+// enough to be trusted for trustedDeviceTTL without re-prompting.
+type TrustedDevice struct {
+	ID         string     `json:"id"`
+	Username   string     `json:"username"`
+	TokenHash  string     `json:"token_hash"`      // HashAPIKey(token) — the raw token is never stored, only ever held by the browser as an HttpOnly cookie
+	Label      string     `json:"label,omitempty"` // e.g. a parsed User-Agent summary, for a human to recognize it in a list later
+	CreatedAt  time.Time  `json:"created_at"`
+	ExpiresAt  time.Time  `json:"expires_at"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+}
+
+func generateTrustedDeviceID() string {
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	return "td_" + hex.EncodeToString(b)
+}
+
+// IssueTrustedDevice mints a new trusted-device token for username,
+// returning the raw token (to be set as an HttpOnly cookie — see
+// auth.go's handleAuthMFAVerify) exactly once; only its hash is persisted.
+func (c *Config) IssueTrustedDevice(username, label string) (token string, expiresAt time.Time, err error) {
+	token = GenerateAPIKey()
+	now := time.Now()
+	expiresAt = now.Add(trustedDeviceTTL)
+
+	td := TrustedDevice{
+		ID: generateTrustedDeviceID(), Username: username,
+		TokenHash: HashAPIKey(token), Label: label,
+		CreatedAt: now, ExpiresAt: expiresAt,
+	}
+	c.mu.Lock()
+	c.trustedDevices[td.ID] = td
+	c.mu.Unlock()
+
+	if err := c.Save(); err != nil {
+		return "", time.Time{}, fmt.Errorf("save trusted device: %w", err)
+	}
+	return token, expiresAt, nil
+}
+
+// ValidateTrustedDevice reports whether token is a currently-valid trusted
+// device for username specifically — a trusted-device token for one
+// account can never be used to skip MFA on a different account, even if
+// somehow presented alongside that other account's username/password.
+// Updates LastUsedAt (best-effort, not persisted synchronously — same
+// lazy posture TouchPairedKey already documents for the identical
+// "informational only" tradeoff).
+func (c *Config) ValidateTrustedDevice(username, token string) bool {
+	if token == "" || username == "" {
+		return false
+	}
+	target := HashAPIKey(token)
+	now := time.Now()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for id, td := range c.trustedDevices {
+		if td.Username != username {
+			continue
+		}
+		if !SecureEquals(td.TokenHash, target) {
+			continue
+		}
+		if now.After(td.ExpiresAt) {
+			return false // expired — deliberately not deleted here; sweepExpiredTrustedDevices handles cleanup, keeping this a read-only check
+		}
+		td.LastUsedAt = &now
+		c.trustedDevices[id] = td
+		return true
+	}
+	return false
+}
+
+// ListTrustedDevices returns every trusted device for username, newest
+// first — for a "your trusted devices" settings list. Never includes
+// TokenHash's raw counterpart (there isn't one to include — that's the
+// point) but does include the hash itself here since this is the
+// internal representation; the HTTP handler strips it, same contract
+// every other List* method in this package follows.
+func (c *Config) ListTrustedDevices(username string) []TrustedDevice {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]TrustedDevice, 0)
+	for _, td := range c.trustedDevices {
+		if td.Username == username {
+			out = append(out, td)
+		}
+	}
+	for i := 0; i < len(out); i++ {
+		for j := i + 1; j < len(out); j++ {
+			if out[j].CreatedAt.After(out[i].CreatedAt) {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	return out
+}
+
+// RevokeTrustedDevice removes one trusted device by ID — the next login
+// attempt from that browser falls back to a full MFA prompt.
+func (c *Config) RevokeTrustedDevice(id string) error {
+	c.mu.Lock()
+	if _, ok := c.trustedDevices[id]; !ok {
+		c.mu.Unlock()
+		return fmt.Errorf("trusted device '%s' not found", id)
+	}
+	delete(c.trustedDevices, id)
+	c.mu.Unlock()
+	return c.Save()
+}
+
+// RevokeAllTrustedDevices removes every trusted device for username —
+// called when MFA is disabled (DisableMFA) so stale trust records don't
+// linger for a feature that's now off, and available directly for a
+// "sign out of all devices" action.
+func (c *Config) RevokeAllTrustedDevices(username string) error {
+	c.mu.Lock()
+	changed := false
+	for id, td := range c.trustedDevices {
+		if td.Username == username {
+			delete(c.trustedDevices, id)
+			changed = true
+		}
+	}
+	c.mu.Unlock()
+	if !changed {
+		return nil
+	}
+	return c.Save()
 }
