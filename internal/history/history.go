@@ -16,6 +16,8 @@ const (
 	EventRestoreFail    EventType = "restore_fail"
 	EventPushSuccess    EventType = "push_success"
 	EventPushFail       EventType = "push_fail"
+	EventPullSuccess    EventType = "pull_success"
+	EventPullFail       EventType = "pull_fail"
 )
 
 type Entry struct {

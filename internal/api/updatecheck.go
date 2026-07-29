@@ -47,6 +47,20 @@ type AppUpdateReport struct {
 	// would bypass exactly the manual intervention pinning exists to
 	// force.
 	Pinned bool `json:"pinned"`
+	// BatchAnchor groups this app with others that share a Compose
+	// depends_on relationship (see containercontrol.go's
+	// ListContainerControlGroups, the same grouping the Container Control
+	// page already uses — deliberately reused rather than inventing a
+	// second "what belongs together" heuristic). An app with no
+	// depends_on relationships is its own anchor — a batch of one.
+	BatchAnchor string `json:"batch_anchor"`
+	// BatchSize is how many OTHER apps in this same report currently have
+	// a pending update and share BatchAnchor — i.e. how large "Update
+	// batch" would be if clicked right now. Intentionally scoped to apps
+	// that actually have a pending update, not every app in the compose
+	// group: a batch action should only touch what the user was just
+	// shown, never silently reach into a sibling with nothing pending.
+	BatchSize int `json:"batch_size"`
 }
 
 // ownedContainers assigns each running container discoverable from apps to
@@ -120,12 +134,34 @@ func (s *Server) checkForUpdates(notifyUser bool) ([]AppUpdateReport, bool) {
 	owned := ownedContainers(apps)
 	cache := map[string]backup.ImageMeta{}
 
+	// containerAnchor maps a running container's name to its
+	// ListContainerControlGroups anchor — reusing that page's existing
+	// depends_on-derived grouping rather than a second parser. A failure
+	// here (e.g. Docker inspect hiccup on one container) just means every
+	// app falls back to being its own anchor below — never fatal to the
+	// update check itself.
+	containerAnchor := map[string]string{}
+	if groups, err := backup.ListContainerControlGroups(); err == nil {
+		for _, g := range groups {
+			for _, c := range g.Containers {
+				containerAnchor[c.Name] = g.Anchor
+			}
+		}
+	}
+
 	var reports []AppUpdateReport
 	var pending []string
 
 	for _, app := range apps {
 		var images []backup.ImageMeta
 		appHasUpdate := false
+		anchor := app.Name // fallback: no known compose relationships — a batch of one
+		for _, c := range owned[app.ID] {
+			if a, ok := containerAnchor[c.Name]; ok {
+				anchor = a
+				break
+			}
+		}
 		for _, c := range owned[app.ID] {
 			// No running-only filter here: this is a registry-vs-local-digest
 			// comparison (backup.CheckImageMeta → docker inspect + a registry
@@ -147,11 +183,23 @@ func (s *Server) checkForUpdates(notifyUser bool) ([]AppUpdateReport, bool) {
 			}
 		}
 		if len(images) > 0 {
-			reports = append(reports, AppUpdateReport{AppID: app.ID, AppName: app.Name, Images: images, Pinned: app.Pinned})
+			reports = append(reports, AppUpdateReport{AppID: app.ID, AppName: app.Name, Images: images, Pinned: app.Pinned, BatchAnchor: anchor})
 		}
 		if appHasUpdate {
 			pending = append(pending, app.Name)
 		}
+	}
+
+	// BatchSize: how many reports share the same anchor — see its doc
+	// comment on AppUpdateReport for why this is scoped to reports
+	// (apps with an actual pending update) rather than every app in the
+	// compose group.
+	batchCounts := map[string]int{}
+	for _, r := range reports {
+		batchCounts[r.BatchAnchor]++
+	}
+	for i := range reports {
+		reports[i].BatchSize = batchCounts[reports[i].BatchAnchor]
 	}
 
 	sort.Strings(pending)

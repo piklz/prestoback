@@ -47,6 +47,10 @@ func (e Event) Title() string {
 		return "Remote push complete"
 	case "push_fail":
 		return "Remote push failed"
+	case "pull_success":
+		return "Pulled archive from remote"
+	case "pull_fail":
+		return "Pull from remote failed"
 	case "remote_receive_success":
 		return "Received backup from paired instance"
 	case "remote_receive_fail":

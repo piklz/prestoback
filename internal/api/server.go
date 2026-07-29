@@ -179,6 +179,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/pairing/status", s.authJWT(s.handlePairingStatus))
 	s.mux.HandleFunc("/api/update/check", s.authJWT(s.handleUpdateCheck))
 	s.mux.HandleFunc("/api/updates/check", s.authJWT(s.handleUpdatesCheck)) // per-app registry check — distinct from /api/update/check (PrestoBack's own self-update)
+	s.mux.HandleFunc("/api/updates/batch", s.adminForWrites(s.handleUpdateBatch)) // update every non-pinned app sharing a batch anchor — see AppUpdateReport.BatchAnchor
 	s.mux.HandleFunc("/api/cron/preview", s.authJWT(s.handleCronPreview))
 
 	// Auth-required — admin-only for any write (GET still allowed for viewer);
@@ -741,6 +742,199 @@ func (s *Server) handleRemoteTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respond(w, 200, map[string]any{"ok": true})
+}
+
+// RemoteArchiveView is one archive as it exists on a remote target, for the
+// "browse remote" picker. AlreadyLocal lets the frontend show "Restore"
+// instead of "Pull" for an archive that's actually already on disk (e.g.
+// this instance pushed it itself) rather than offering a needless re-pull.
+type RemoteArchiveView struct {
+	Name         string    `json:"name"`
+	SizeBytes    int64     `json:"size_bytes"`
+	ModTime      time.Time `json:"mod_time"`
+	AlreadyLocal bool      `json:"already_local"`
+}
+
+// findRemoteTargetByName looks up a configured, saved remote target by
+// name — every remote-archive operation acts on a target the user already
+// saved (not client-supplied connection details, unlike handleRemoteTest's
+// "try before you save" case), so the full stored target — secrets
+// included — is used directly rather than merged from a request body.
+func (s *Server) findRemoteTargetByName(name string) (config.RemoteTarget, bool) {
+	for _, t := range s.cfg.GetRemote().Targets {
+		if t.Name == name {
+			return t, true
+		}
+	}
+	return config.RemoteTarget{}, false
+}
+
+// handleListRemoteArchives lists what's on one remote target for this app,
+// cross-referenced against local backups so an archive already present on
+// disk doesn't get offered as something to pull again. Reachability is
+// checked up front and reported as a structured error (not a bare 500) so
+// the UI can show "target unreachable: <reason>" instead of a generic
+// failure — see index.html's remote-archive picker for how this is
+// consumed, and PruneRemote's doc comment (remote.go) for why "prestoback"
+// targets don't belong in this picker at all (they're pull-capable via
+// their own paired-instance flow, not this one).
+func (s *Server) handleListRemoteArchives(w http.ResponseWriter, r *http.Request, appID string) {
+	app, ok := s.cfg.GetApp(appID)
+	if !ok {
+		errOut(w, 404, "app not found")
+		return
+	}
+	targetName := r.URL.Query().Get("target")
+	if targetName == "" {
+		errOut(w, 400, "target query parameter is required")
+		return
+	}
+	t, ok := s.findRemoteTargetByName(targetName)
+	if !ok {
+		errOut(w, 404, "remote target not found")
+		return
+	}
+	if t.Kind == "prestoback" {
+		errOut(w, 400, "prestoback targets are browsed via the paired-instance view, not this one")
+		return
+	}
+	target := toBackupTarget(t)
+	if err := backup.RemoteReachable(target); err != nil {
+		errOut(w, 503, "remote target unreachable: "+err.Error())
+		return
+	}
+
+	files, err := backup.ListRemoteFiles(target, appID)
+	if err != nil {
+		errOut(w, 500, "could not list remote archives: "+err.Error())
+		return
+	}
+	localIDs := map[string]bool{}
+	if metas, err := s.engine.ListBackups(app.ID); err == nil {
+		for _, m := range metas {
+			localIDs[m.ID] = true
+		}
+	}
+
+	out := make([]RemoteArchiveView, 0, len(files))
+	for _, f := range files {
+		id := strings.TrimSuffix(f.Name, ".tar.gz")
+		out = append(out, RemoteArchiveView{
+			Name: f.Name, SizeBytes: f.SizeBytes, ModTime: f.ModTime,
+			AlreadyLocal: localIDs[id],
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ModTime.After(out[j].ModTime) })
+	respond(w, 200, out)
+}
+
+// handlePullRemoteArchive pulls one archive from a remote target down to
+// local disk, then returns — it deliberately does NOT also run a restore.
+// Pull and restore stay two explicit steps (mirroring how a local restore
+// is already "pick an archive, then restore it" rather than one fused
+// action): a pull can be slow (a multi-GB Immich archive over a home
+// uplink) and the person may want to just stage it for later, inspect it,
+// or pull to a different instance than they restore on. Once this
+// completes the archive is an ordinary local file — the existing
+// restore-preview/restore endpoints need no changes to use it.
+func (s *Server) handlePullRemoteArchive(w http.ResponseWriter, r *http.Request, appID string) {
+	app, ok := s.cfg.GetApp(appID)
+	if !ok {
+		errOut(w, 404, "app not found")
+		return
+	}
+	if s.engine.IsRunning(appID) {
+		errOut(w, 409, "a job is already running for this app")
+		return
+	}
+	var req struct {
+		Target string `json:"target"`
+		Name   string `json:"name"`
+	}
+	if err := parseJSON(r, &req); err != nil {
+		errOut(w, 400, err.Error())
+		return
+	}
+	if req.Target == "" || req.Name == "" {
+		errOut(w, 400, "target and name are required")
+		return
+	}
+	t, ok := s.findRemoteTargetByName(req.Target)
+	if !ok {
+		errOut(w, 404, "remote target not found")
+		return
+	}
+	target := toBackupTarget(t)
+	if err := backup.RemoteReachable(target); err != nil {
+		errOut(w, 503, "remote target unreachable: "+err.Error())
+		return
+	}
+
+	// Re-list rather than trust a client-supplied size — same "server is
+	// the source of truth for anything that gates a decision" posture the
+	// disk-space check below depends on.
+	files, err := backup.ListRemoteFiles(target, appID)
+	if err != nil {
+		errOut(w, 500, "could not list remote archives: "+err.Error())
+		return
+	}
+	var rf *backup.RemoteFile
+	for i := range files {
+		if files[i].Name == req.Name {
+			rf = &files[i]
+			break
+		}
+	}
+	if rf == nil {
+		errOut(w, 404, "archive not found on remote target")
+		return
+	}
+
+	if stat, err := diskUsage(s.cfg.BackupDir()); err == nil && stat.free > 0 {
+		// A flat 10% headroom margin past the archive's own size — the
+		// same "don't cut it exactly to zero" margin spirit as
+		// checkDiskAndAlert's warning threshold, sized for a pull
+		// specifically since this is one large write landing all at once
+		// rather than gradual accumulation.
+		needed := uint64(float64(rf.SizeBytes) * 1.1)
+		if stat.free < needed {
+			errOut(w, 507, fmt.Sprintf(
+				"not enough free space to pull this archive: need ~%s, have %s free",
+				humanBytes(int64(needed)), humanBytes(int64(stat.free))))
+			return
+		}
+	}
+
+	respond(w, 202, map[string]string{"status": "accepted", "target": req.Target, "name": req.Name})
+
+	go func() {
+		start := time.Now()
+		emit := func(msg string) { s.engine.EmitLog(app.ID, msg) }
+		emit(fmt.Sprintf("━━━ Pulling %s from %s ━━━", req.Name, t.Name))
+
+		destDir := filepath.Join(s.cfg.BackupDir(), app.ID)
+		_, pullErr := backup.PullArchive(*rf, target, destDir, emit)
+		dur := time.Since(start).Milliseconds()
+
+		if pullErr != nil {
+			emit("✗ Pull failed: " + pullErr.Error())
+			s.hist.Append(history.Entry{
+				Event: history.EventPullFail, AppID: app.ID, AppName: app.Name,
+				Detail: fmt.Sprintf("%s from %s: %v", req.Name, t.Name, pullErr), DurationMs: dur,
+			})
+			s.dispatchNotify(notify.Event{Kind: "pull_fail", AppName: app.Name,
+				Detail: fmt.Sprintf("%s from %s: %v", req.Name, t.Name, pullErr), IsError: true})
+			return
+		}
+		detail := fmt.Sprintf("Pulled %s from %s (%dms)", req.Name, t.Name, dur)
+		s.hist.Append(history.Entry{
+			Event: history.EventPullSuccess, AppID: app.ID, AppName: app.Name,
+			Detail: detail, DurationMs: dur, SizeBytes: rf.SizeBytes,
+		})
+		s.dispatchNotify(notify.Event{Kind: "pull_success", AppName: app.Name, Detail: detail,
+			Force: isLargeOp(rf.SizeBytes, dur)})
+		emit("━━━ Pull complete ━━━")
+	}()
 }
 
 func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request) {
@@ -2126,6 +2320,20 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 	// click.
 	if len(parts) == 2 && parts[1] == "update" && r.Method == http.MethodPost {
 		s.handleAppUpdate(w, r, appID)
+		return
+	}
+	// GET /api/apps/{id}/remote-archives?target=<name> — list archives that
+	// exist on a remote target, cross-referenced against what's already
+	// local. See handleListRemoteArchives's own doc comment.
+	if len(parts) == 2 && parts[1] == "remote-archives" && r.Method == http.MethodGet {
+		s.handleListRemoteArchives(w, r, appID)
+		return
+	}
+	// POST /api/apps/{id}/remote-archives/pull {target, name} — pull one
+	// remote-only archive down to local disk so it can go through the
+	// normal restore-preview/restore flow unchanged.
+	if len(parts) == 3 && parts[1] == "remote-archives" && parts[2] == "pull" && r.Method == http.MethodPost {
+		s.handlePullRemoteArchive(w, r, appID)
 		return
 	}
 
@@ -4520,6 +4728,80 @@ func (s *Server) handleAppUpdate(w http.ResponseWriter, r *http.Request, appID s
 
 	respond(w, 202, map[string]string{"status": "update started", "app_id": app.ID, "app_name": app.Name})
 	go s.runContainerUpdates(tgCfg, []config.AppConfig{app})
+}
+
+// handleUpdateBatch updates every app that (a) currently has a pending
+// update per the last check and (b) shares the requested BatchAnchor —
+// see AppUpdateReport's doc comments for why both conditions apply. Pinned
+// apps are excluded here at the point of action, the same defense-in-depth
+// posture the Telegram update:all/update:<id> handlers already use — a
+// hidden button in the UI is not itself a security boundary.
+func (s *Server) handleUpdateBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	var req struct {
+		Anchor string `json:"anchor"`
+	}
+	if err := parseJSON(r, &req); err != nil {
+		errOut(w, 400, err.Error())
+		return
+	}
+	if req.Anchor == "" {
+		errOut(w, 400, "anchor is required")
+		return
+	}
+
+	s.stateMu.Lock()
+	busy := s.updateRunning
+	s.stateMu.Unlock()
+	if busy {
+		errOut(w, 409, "an update or stack operation is already in progress — please wait for it to finish first")
+		return
+	}
+	if reachable, errMsg := backup.DockerReachable(); !reachable {
+		errOut(w, 503, "Docker isn't reachable right now (daemon may be restarting): "+errMsg)
+		return
+	}
+
+	// Fresh check, not the cached s.pendingUpdateDetails — same "the
+	// registry may have moved since the last poll" reasoning
+	// handleUpdatesCheck's on-demand check already applies, and this is
+	// about to act, not just display.
+	reports, dockerOK := s.checkForUpdates(false)
+	if !dockerOK {
+		errOut(w, 503, "Docker isn't reachable right now (daemon may be restarting)")
+		return
+	}
+
+	var targets []config.AppConfig
+	var skipped []string
+	for _, rep := range reports {
+		if rep.BatchAnchor != req.Anchor {
+			continue
+		}
+		if rep.Pinned {
+			skipped = append(skipped, rep.AppName)
+			continue
+		}
+		if app, ok := s.cfg.GetApp(rep.AppID); ok {
+			targets = append(targets, app)
+		}
+	}
+	if len(targets) == 0 {
+		if len(skipped) > 0 {
+			errOut(w, 400, "every app in this batch is pinned — update manually")
+		} else {
+			errOut(w, 400, "no apps with a pending update found for this batch — it may have just cleared")
+		}
+		return
+	}
+
+	nc := s.cfg.GetNotify()
+	tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
+	respond(w, 202, map[string]any{"status": "update started", "count": len(targets), "skipped_pinned": skipped})
+	go s.runContainerUpdates(tgCfg, targets)
 }
 
 // runContainerLifecycle does the actual work for a resolved app — shared by

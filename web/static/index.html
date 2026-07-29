@@ -583,7 +583,7 @@ select.fi{cursor:pointer}
         </div>
       </div>
     </div>
-    <div class="card">
+    <div class="card" id="live-activity-card">
       <div class="ch"><div class="ct">Live activity</div><span class="pill pg"><span class="pd"></span>SSE</span></div>
       <div id="live-progress" style="display:none;padding:10px 18px 0 18px">
         <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--txt2);margin-bottom:4px">
@@ -615,7 +615,7 @@ select.fi{cursor:pointer}
     <div class="card">
       <div class="empty" id="apps-empty"><div class="ei"><svg width="22" height="22" fill="none" stroke="var(--txt3)" stroke-width="1.5" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg></div><div class="et">No apps configured</div><div class="es">Use Discover to auto-import, or add manually.</div></div>
       <table class="tbl" id="apps-tbl" style="display:none">
-        <thead><tr><th>Application</th><th style="text-align:right">Backups</th><th>Path</th><th>Retain</th><th>Schedule</th><th style="text-align:right">Actions</th></tr></thead>
+        <thead><tr><th>Application</th><th>Batch</th><th style="text-align:right">Backups</th><th>Path</th><th>Retain</th><th>Schedule</th><th style="text-align:right">Actions</th></tr></thead>
         <tbody id="apps-tbody"></tbody>
       </table>
     </div>
@@ -666,6 +666,7 @@ select.fi{cursor:pointer}
         </div>
         <div style="display:flex;gap:8px;align-items:center">
           <span id="bk-missing-warn" style="display:none;font-size:11px;color:var(--amber)">⚠ some files missing on disk</span>
+          <button class="btn btn-g btn-sm" onclick="openRemoteBrowse()">☁ Browse remote</button>
           <button class="btn btn-g btn-sm" onclick="loadBackups()">↺</button>
         </div>
       </div>
@@ -677,6 +678,25 @@ select.fi{cursor:pointer}
         <div id="bk-list-area"></div>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- Browse remote archives — Feature A: an archive that only exists on a
+     remote target (mount/sftp/s3) doesn't show up in the normal backup
+     list above (that list is disk-derived — see loadBackups). This modal
+     is the picker for "pull it down first, then restore normally." -->
+<div class="overlay hidden" id="m-remote-browse">
+  <div class="modal">
+    <div class="mh"><div class="mt">Browse Remote Archives</div><button class="btn btn-g btn-ic" onclick="CM('m-remote-browse')">✕</button></div>
+    <div class="mb">
+      <div style="margin-bottom:12px">
+        <label style="font-size:12px;color:var(--txt2);display:block;margin-bottom:6px">Remote target</label>
+        <select id="rb-target-select" class="fi" style="width:100%" onchange="rbLoadArchives()"></select>
+      </div>
+      <div id="rb-status" style="font-size:12.5px;color:var(--txt3)"></div>
+      <div id="rb-archive-list"></div>
+    </div>
+    <div class="mf"><button class="btn btn-g" onclick="CM('m-remote-browse')">Close</button></div>
   </div>
 </div>
 
@@ -2320,6 +2340,44 @@ function openUpdateAppModal(id, name) {
   btn.textContent = '🔄 Update now';
   OM('m-update-app');
 }
+// updateBatch updates every non-pinned app sharing `anchor` (see the
+// Batch column in renderApps). `count` is only for the confirm text — the
+// backend re-resolves batch membership fresh at execution time rather
+// than trusting what this click was looking at, so a badge that changed
+// between render and click can't cause a stale/wrong batch to run.
+// pollUntilBatchClears is pollUntilUpdateClears's batch-aware sibling —
+// same backoff shape, but the stop condition is "no report still carries
+// this anchor" rather than one app name dropping off S.pendingUpdates.
+// A batch can include a large image (Immich's ML container, for example)
+// alongside small ones, so this keeps checking until every member clears
+// rather than stopping after the first app to finish.
+function pollUntilBatchClears(anchor) {
+  const delays = [10000, 20000, 30000, 45000, 60000];
+  let i = 0;
+  const tick = () => {
+    checkForUpdatesNow().then(() => {
+      refreshContainerHealth();
+      const stillPending = (S.lastUpdateReports || []).some(r => r.batch_anchor === anchor);
+      if (!stillPending || i >= delays.length) return;
+      setTimeout(tick, delays[i++]);
+    });
+  };
+  setTimeout(tick, delays[i++]);
+}
+
+async function updateBatch(anchor, count) {
+  if (!confirm(`Update all ${count} apps in this dependency group? Any pinned member is skipped automatically.`)) return;
+  focusLiveActivity();
+  try {
+    const r = await api('/api/updates/batch', {method:'POST', body: JSON.stringify({anchor})});
+    const skipped = r.skipped_pinned || [];
+    toast(`Batch update started for ${r.count} app(s)${skipped.length ? ' — skipped pinned: '+skipped.join(', ') : ''} — see Live activity`, 'success');
+    pollUntilBatchClears(anchor);
+  } catch(e) {
+    toast(e.message, 'error');
+  }
+}
+
 async function confirmUpdateApp() {
   if (!_updateAppID) return;
   const btn = document.getElementById('upd-app-confirm-btn');
@@ -2329,6 +2387,7 @@ async function confirmUpdateApp() {
     const r = await api('/api/apps/'+_updateAppID+'/update', {method:'POST'});
     toast(`Update started for ${r.app_name || 'app'} — see Live activity for progress`, 'success');
     CM('m-update-app');
+    focusLiveActivity();
     // The pull+recreate runs in the background (see handleAppUpdate on the
     // server). A single fixed-delay recheck used to run here, but large
     // images (Immich's 1GB+ server/ML images, for example) can take well
@@ -2383,7 +2442,7 @@ function renderApps() {
     : S.apps;
   badge.textContent = appsFilter ? `${filtered.length} / ${S.apps.length} apps` : `${S.apps.length} apps`;
   if (!filtered.length) {
-    tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--txt3);padding:24px">No apps match "${esc(appsFilter)}"</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--txt3);padding:24px">No apps match "${esc(appsFilter)}"</td></tr>`;
     return;
   }
   tbody.innerHTML = filtered.map(a => {
@@ -2523,8 +2582,23 @@ function renderApps() {
     const longPausedHint = longPaused
       ? `<div style="font-size:10.5px;color:var(--amber,#f0a020);margin-top:2px">Paused ${daysPaused}d — forgot to resume?</div>`
       : '';
+    // Batch column — see AppUpdateReport.BatchAnchor/BatchSize on the
+    // backend. Blank for the common case (no pending update, or a batch
+    // of one — nothing to group with right now); a pinned member of an
+    // active batch shows why it's excluded rather than a dead button;
+    // everyone else gets a one-click "Update batch" that updates every
+    // non-pinned member together, since these are apps sharing a Compose
+    // depends_on relationship and updating one in isolation is often the
+    // wrong move (e.g. Immich's server vs. its Postgres).
+    let batchCell = '';
+    if (rpt && rpt.batch_size > 1) {
+      batchCell = rpt.pinned
+        ? `<span class="pill pa" style="font-size:9.5px" title="This app is pinned — it's excluded when the batch updates">🔒 batch of ${rpt.batch_size}</span>`
+        : `<button class="btn btn-g btn-sm" title="Update all ${rpt.batch_size} apps that share this dependency group" onclick="updateBatch('${esc(rpt.batch_anchor)}',${rpt.batch_size})">🔗 Update batch (${rpt.batch_size})</button>`;
+    }
     return `<tr class="${rowCls}">
       <td data-label="Application"><div class="an"><span style="cursor:pointer" title="Click to edit" onclick="openEditApp('${a.id}')">${esc(a.name)}</span>${updBadge}</div>${healthBadge}</td>
+      <td data-label="Batch">${batchCell}</td>
       <td data-label="Backups" style="text-align:right">${cntHtml}</td>
       <td data-label="Path"><div style="display:flex;align-items:center;gap:4px"><span class="path-status-dot ${dotCls}" title="${dotTitle}"></span><span class="ap" style="margin-top:0">${esc(a.path)}</span></div>${pathSizeLine}</td>
       <td data-label="Retain"><span class="pill pb">${a.retain||5}</span></td>
@@ -3636,7 +3710,151 @@ async function selApp(id, name) {
 
 const BK_PER_PAGE = 20;
 
+// ── Browse remote archives (Feature A) ────────────────────────────────────
+// S_rb holds the archives for whichever target is currently selected in the
+// picker, indexed by position — pull buttons dispatch by index rather than
+// re-embedding the archive/target name into an onclick string, sidestepping
+// any quoting issues if a target name ever contains a quote or apostrophe.
+let S_rb = { target: '', archives: [] };
+
+async function openRemoteBrowse() {
+  if (!S.selAppID) { toast('Select an app first', 'error'); return; }
+  OM('m-remote-browse');
+  const sel = document.getElementById('rb-target-select');
+  const statusEl = document.getElementById('rb-status');
+  sel.innerHTML = '';
+  document.getElementById('rb-archive-list').innerHTML = '';
+  statusEl.textContent = 'Loading remote targets…';
+  try {
+    const r = await api('/api/remote');
+    // prestoback-kind targets are browsed via the paired-instance view
+    // (Security → PrestoBack pairing), not this picker — see
+    // handleListRemoteArchives's doc comment on the backend.
+    const targets = (r.targets || []).filter(t => t.kind !== 'prestoback');
+    if (!targets.length) {
+      statusEl.textContent = 'No mount/SFTP/S3 remote targets configured yet — add one under Settings → Security.';
+      return;
+    }
+    sel.innerHTML = targets.map(t => `<option value="${escHtml(t.name)}">${escHtml(t.name)} (${escHtml(t.kind)})</option>`).join('');
+    statusEl.textContent = '';
+    rbLoadArchives();
+  } catch(e) {
+    statusEl.textContent = 'Could not load remote targets: ' + e.message;
+  }
+}
+
+async function rbLoadArchives() {
+  const target = document.getElementById('rb-target-select').value;
+  const listEl = document.getElementById('rb-archive-list');
+  const statusEl = document.getElementById('rb-status');
+  if (!target) return;
+  S_rb.target = target;
+  S_rb.archives = [];
+  statusEl.textContent = `Checking ${target}…`;
+  listEl.innerHTML = '';
+  try {
+    const archives = await api(`/api/apps/${S.selAppID}/remote-archives?target=${encodeURIComponent(target)}`);
+    S_rb.archives = archives;
+    if (!archives.length) {
+      statusEl.textContent = 'No archives found on this target for this app.';
+      return;
+    }
+    statusEl.textContent = '';
+    renderRbArchives();
+  } catch(e) {
+    // handleListRemoteArchives returns a structured "remote target
+    // unreachable: <reason>" 503 — surfaced verbatim rather than a
+    // generic "failed to load", since the reason (auth, DNS, timeout)
+    // usually tells the user what to fix.
+    statusEl.textContent = '⚠ ' + e.message;
+  }
+}
+
+function renderRbArchives() {
+  const listEl = document.getElementById('rb-archive-list');
+  listEl.innerHTML = S_rb.archives.map((a,i) => `
+    <div class="bi">
+      <div class="bm">
+        <div class="bid">${escHtml(a.name)}${a.already_local?' <span class="pill pg" style="font-size:9px">✓ already local</span>':''}</div>
+        <div class="bif">${fmtBytes(a.size_bytes)} · ${new Date(a.mod_time).toLocaleString()}</div>
+        <div class="fh" id="rb-row-result-${i}" style="margin:2px 0 0"></div>
+      </div>
+      ${a.already_local ? '' : `<button class="btn btn-p btn-sm" id="rb-pull-btn-${i}" onclick="rbPullArchive(${i})">⬇ Pull</button>`}
+    </div>`).join('');
+}
+
+// rbPullArchive triggers the pull, then polls /remote-archives with the
+// same backoff shape pollUntilUpdateClears already uses for updates — a
+// multi-GB archive over a home uplink can take well past any fixed delay,
+// so this polls until the entry flips to already_local instead of
+// guessing a timeout. Deliberately does NOT auto-open the restore modal
+// when it finishes — pull and restore stay two separate, deliberate
+// actions (see handlePullRemoteArchive's doc comment on the backend for
+// why), so the result here is just "now show up in the normal backup
+// list," which the existing loadBackups() already renders with its
+// normal Restore button.
+async function rbPullArchive(i) {
+  const a = S_rb.archives[i];
+  if (!a) return;
+  const btn = document.getElementById(`rb-pull-btn-${i}`);
+  const resultEl = document.getElementById(`rb-row-result-${i}`);
+  btn.disabled = true;
+  btn.textContent = '⬇ Starting…';
+  try {
+    await api(`/api/apps/${S.selAppID}/remote-archives/pull`, {
+      method: 'POST',
+      body: JSON.stringify({ target: S_rb.target, name: a.name }),
+    });
+    toast(`Pulling ${a.name} — see Live activity for progress`, 'info');
+    resultEl.textContent = 'Pulling… (watch Live activity)';
+    focusLiveActivity();
+    pollUntilPulled(i, a.name);
+  } catch(e) {
+    toast(e.message, 'error');
+    btn.disabled = false;
+    btn.textContent = '⬇ Pull';
+  }
+}
+
+function pollUntilPulled(i, name) {
+  const delays = [10000, 20000, 30000, 45000, 60000];
+  let attempt = 0;
+  const tick = () => {
+    rbCheckPulled(i, name).then(done => {
+      if (done) return;
+      if (attempt >= delays.length) {
+        const resultEl = document.getElementById(`rb-row-result-${i}`);
+        if (resultEl) resultEl.textContent = 'Still pulling — check Live activity or reopen this list.';
+        return;
+      }
+      setTimeout(tick, delays[attempt++]);
+    });
+  };
+  setTimeout(tick, delays[attempt++]);
+}
+
+// rbCheckPulled re-fetches this one target's archive list and checks
+// whether `name` now shows already_local — reusing the same list endpoint
+// rather than a dedicated status endpoint, since it's already
+// authoritative (derived from what's actually on disk, same as
+// loadBackups) and this only runs a handful of times per pull.
+async function rbCheckPulled(i, name) {
+  try {
+    const archives = await api(`/api/apps/${S.selAppID}/remote-archives?target=${encodeURIComponent(S_rb.target)}`);
+    const match = archives.find(a => a.name === name);
+    if (match && match.already_local) {
+      S_rb.archives = archives;
+      renderRbArchives();
+      toast(`${name} pulled — it now shows up in the backup list`, 'success');
+      if (S.selAppID) loadBackups();
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
 async function loadBackups() {
+
   if (!S.selAppID) return;
   const body = document.getElementById('bk-list-area');
   const sub = document.getElementById('bk-subtitle');
@@ -4203,9 +4421,12 @@ async function loadRemote() {
     setTog('tog-remote', !!r.enabled);
     S_remoteTargets = r.targets || [];
     S_rtEditIndex = null;
+    S_rtReachable = {};
+    S_rtInspectOpen = null;
     setRtDirty(false);
     resetRtForm();
     renderRemoteTargets();
+    sweepRemoteReachability(); // fire-and-forget — see its own doc comment
   } catch {}
 }
 function togRemote() { setTog('tog-remote', !document.getElementById('tog-remote').classList.contains('on')); setRtDirty(true); }
@@ -4220,13 +4441,39 @@ function setRtDirty(v) {
   window.onbeforeunload = v ? () => 'You have unsaved remote backup target changes.' : null;
 }
 
+// remoteTargetSummary is the always-visible subtitle under a target's name.
+// Deliberately excludes the full pinned NodeID for prestoback-kind targets —
+// a 40+ char hash inline on every row is exactly the clutter described in
+// the naming/labeling review; the hash still needs to be reachable for
+// verification, just not printed on every glance at the list. See
+// toggleRtInspect for where it actually lives now.
 function remoteTargetSummary(t) {
   if (t.kind === 'mount') return t.mount_path;
   if (t.kind === 'sftp') return `${t.sftp_user}@${t.sftp_host}:${t.sftp_port||22}${t.sftp_base_dir?(' '+t.sftp_base_dir):''}`;
   if (t.kind === 's3') return `${t.s3_bucket} @ ${t.s3_endpoint}`;
-  if (t.kind === 'prestoback') return `${t.prestoback_url} · paired with ${t.prestoback_pinned_node_id||'—'}`;
+  if (t.kind === 'prestoback') return t.prestoback_url || '';
   return '';
 }
+
+// S_rtInspectOpen tracks which row's inspect drawer (full pinned NodeID +
+// copy) is currently expanded, by target index — collapsed by default so
+// the list stays scannable; only ever one open at a time (opening a new one
+// closes any other) to keep the list from growing unboundedly long.
+let S_rtInspectOpen = null;
+function toggleRtInspect(i) {
+  S_rtInspectOpen = S_rtInspectOpen === i ? null : i;
+  renderRemoteTargets();
+}
+function copyRtNodeID(id) {
+  copyToClipboard(id);
+  toast('Verification key copied to clipboard', 'success');
+}
+
+// S_rtReachable holds the last-known reachability per target index —
+// { ok: bool, error?: string, checking?: bool } — populated by
+// runRemoteTest/sweepRemoteReachability and rendered as a persistent badge
+// on the row (not just a toast that disappears the moment you look away).
+let S_rtReachable = {};
 
 function renderRemoteTargets() {
   const el = document.getElementById('remote-target-list');
@@ -4234,13 +4481,32 @@ function renderRemoteTargets() {
     el.innerHTML = `<div style="color:var(--txt2);font-size:12.5px;padding:6px 0">No remote targets configured yet — add one below.</div>`;
     return;
   }
-  el.innerHTML = S_remoteTargets.map((t,i) => `
+  el.innerHTML = S_remoteTargets.map((t,i) => {
+    const rs = S_rtReachable[i];
+    let statusPill = '';
+    if (rs) {
+      statusPill = rs.checking
+        ? `<span class="pill pb" style="font-size:9px"><span class="pd"></span>checking…</span>`
+        : rs.ok
+          ? `<span class="pill pg" style="font-size:9px">✓ reachable</span>`
+          : `<span class="pill pr" style="font-size:9px" title="${esc(rs.error||'')}">⚠ unreachable</span>`;
+    }
+    const inspectRow = t.kind === 'prestoback' && S_rtInspectOpen === i ? `
+      <div style="margin-top:8px;padding:8px 10px;background:var(--bg4);border-radius:8px;font-family:var(--mono);font-size:10.5px;color:var(--txt2)">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+          <span style="word-break:break-all">${esc(t.prestoback_pinned_node_id||'—')}</span>
+          <button class="btn btn-g btn-sm" style="flex-shrink:0" onclick="copyRtNodeID('${esc(t.prestoback_pinned_node_id||'')}')">Copy</button>
+        </div>
+        <div style="margin-top:4px;color:var(--txt3)">Pinned verification key — confirm this matches the receiver's own NodeID before trusting a re-pair.</div>
+      </div>` : '';
+    return `
     <div class="bi" style="${i===S_rtEditIndex?'outline:1px solid var(--accent);border-radius:8px':''}">
       <div class="bic"><svg width="14" height="14" fill="none" stroke="var(--accent)" stroke-width="1.8" viewBox="0 0 24 24"><path d="M20 16.58A5 5 0 0018 7h-1.26A8 8 0 104 15.25"/></svg></div>
       <div class="bm">
-        <div class="bid">${esc(t.name)} <span class="pill pb" style="font-size:9px">${esc(t.kind)}</span>${i===S_rtEditIndex?' <span class="pill" style="font-size:9px">editing</span>':''}</div>
-        <div class="bif">${esc(remoteTargetSummary(t))}</div>
+        <div class="bid">${esc(t.name)} <span class="pill pb" style="font-size:9px">${esc(t.kind)}</span>${i===S_rtEditIndex?' <span class="pill" style="font-size:9px">editing</span>':''}${statusPill}</div>
+        <div class="bif">${esc(remoteTargetSummary(t))}${t.kind==='prestoback'?` · <a href="#" onclick="toggleRtInspect(${i});return false" style="color:var(--accent);text-decoration:none">${S_rtInspectOpen===i?'hide key':'verify key'}</a>`:''}</div>
         <div class="fh" id="rt-row-result-${i}" style="margin:2px 0 0"></div>
+        ${inspectRow}
       </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn btn-g btn-sm" onclick="testExistingRemoteTarget(${i})">Test</button>
@@ -4249,7 +4515,8 @@ function renderRemoteTargets() {
         <button class="btn btn-g btn-sm" onclick="duplicateRemoteTarget(${i})">Duplicate</button>`}
         <button class="btn btn-d btn-sm btn-ic" onclick="removeRemoteTarget(${i})">🗑</button>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
 function onRtKindChange() {
@@ -4322,7 +4589,59 @@ function remoteTargetIsComplete(t) {
 }
 
 async function testRemoteTargetDraft() { await runRemoteTest(draftRemoteTarget(), 'rt-test-result'); }
-async function testExistingRemoteTarget(i) { await runRemoteTest(S_remoteTargets[i], `rt-row-result-${i}`); }
+async function testExistingRemoteTarget(i) {
+  S_rtReachable[i] = { checking: true };
+  renderRemoteTargets();
+  const target = S_remoteTargets[i];
+  const { ok, error } = await runRemoteTestWithRetry(target);
+  S_rtReachable[i] = ok ? { ok: true } : { ok: false, error };
+  renderRemoteTargets();
+  if (ok) toast(`"${target.name}" is reachable ✓`,'success');
+  else toast(`"${target.name}": ${error}`,'error');
+}
+
+// runRemoteTestWithRetry gives a target 3 attempts (1s / 3s / 9s backoff)
+// before it's declared unreachable — a homelab NAS/router waking from
+// sleep or a brief Wi-Fi drop shouldn't earn a hard "unreachable" badge
+// from one unlucky probe the way a single /api/remote/test call used to.
+// Returns on the first success; only exhausts all 3 on a real outage.
+async function runRemoteTestWithRetry(target, resultEl) {
+  const delays = [0, 1000, 3000, 9000];
+  let lastError = 'unknown error';
+  for (let attempt = 0; attempt < delays.length; attempt++) {
+    if (delays[attempt]) {
+      if (resultEl) resultEl.textContent = `Retrying in ${delays[attempt]/1000}s… (attempt ${attempt+1}/${delays.length})`;
+      await new Promise(r => setTimeout(r, delays[attempt]));
+    }
+    if (resultEl) resultEl.textContent = attempt === 0 ? 'Testing…' : `Testing… (attempt ${attempt+1}/${delays.length})`;
+    try {
+      const r = await api('/api/remote/test',{method:'POST',body:JSON.stringify(target)});
+      if (r.ok) return { ok: true };
+      lastError = r.error;
+    } catch(e) {
+      lastError = e.message;
+    }
+  }
+  return { ok: false, error: lastError };
+}
+
+// sweepRemoteReachability runs on Security-tab load so the unreachable
+// badge is populated proactively — before this, a stale target only ever
+// surfaced as a failure at push time (buried in Live activity) or if
+// someone happened to click "Test". Sequential, not parallel: these are
+// homelab targets (a NAS, a Pi-hosted SFTP server) and firing every probe
+// at once is needless simultaneous load for a background check nobody's
+// actively waiting on.
+async function sweepRemoteReachability() {
+  for (let i = 0; i < S_remoteTargets.length; i++) {
+    if (S_rtEditIndex === i) continue; // don't probe a row mid-edit
+    S_rtReachable[i] = { checking: true };
+    renderRemoteTargets();
+    const { ok, error } = await runRemoteTestWithRetry(S_remoteTargets[i]);
+    S_rtReachable[i] = ok ? { ok: true } : { ok: false, error };
+    renderRemoteTargets();
+  }
+}
 
 async function runRemoteTest(target, resultElId) {
   if (!remoteTargetIsComplete(target)) {
@@ -4330,19 +4649,13 @@ async function runRemoteTest(target, resultElId) {
     return;
   }
   const resultEl = resultElId ? document.getElementById(resultElId) : null;
-  if (resultEl) resultEl.textContent = 'Testing…';
-  try {
-    const r = await api('/api/remote/test',{method:'POST',body:JSON.stringify(target)});
-    if (r.ok) {
-      toast(`"${target.name}" is reachable ✓`,'success');
-      if (resultEl) resultEl.textContent = '✓ reachable';
-    } else {
-      toast(`"${target.name}": ${r.error}`,'error');
-      if (resultEl) resultEl.textContent = '✗ ' + r.error;
-    }
-  } catch(e) {
-    toast(e.message,'error');
-    if (resultEl) resultEl.textContent = '✗ ' + e.message;
+  const { ok, error } = await runRemoteTestWithRetry(target, resultEl);
+  if (ok) {
+    toast(`"${target.name}" is reachable ✓`,'success');
+    if (resultEl) resultEl.textContent = '✓ reachable';
+  } else {
+    toast(`"${target.name}": ${error}`,'error');
+    if (resultEl) resultEl.textContent = '✗ ' + error;
   }
 }
 
@@ -4449,6 +4762,8 @@ function removeRemoteTarget(i) {
   S_remoteTargets.splice(i,1);
   if (S_rtEditIndex === i) resetRtForm();
   else if (S_rtEditIndex !== null && S_rtEditIndex > i) S_rtEditIndex--; // keep pointing at the same logical row after the splice
+  S_rtReachable = {}; // indices shifted — stale badges would point at the wrong row
+  S_rtInspectOpen = null;
   setRtDirty(true);
   renderRemoteTargets();
 }
@@ -4459,10 +4774,13 @@ async function saveRemote() {
     const r = await api('/api/remote',{method:'PUT',body:JSON.stringify({enabled, targets:S_remoteTargets})});
     S_remoteTargets = r.targets || [];
     S_rtEditIndex = null;
+    S_rtReachable = {};
+    S_rtInspectOpen = null;
     setRtDirty(false);
     resetRtForm();
     renderRemoteTargets();
     toast('Remote backup settings saved','success');
+    sweepRemoteReachability();
   } catch(e) { toast(e.message,'error'); }
 }
 
@@ -5253,6 +5571,21 @@ function hideLiveProgressSoon() {
     const box = document.getElementById('live-progress');
     if (box) box.style.display = 'none';
   }, 1500);
+}
+// focusLiveActivity brings the Live activity card into view the moment an
+// update run is kicked off — before this, the toast said "see Live
+// activity for progress" but nothing actually took you there, so on a
+// long dashboard the card was easy to miss below the fold. Desktop uses
+// 'nearest' (scrolls just enough to reveal the card, doesn't yank the
+// viewport away from the app list the update was triggered from); mobile
+// uses 'start' so the card takes the top of the screen, since a phone
+// doesn't have room to keep both the app list and the log comfortably
+// visible at once.
+function focusLiveActivity() {
+  const card = document.getElementById('live-activity-card');
+  if (!card) return;
+  const isMobile = window.matchMedia('(max-width:860px)').matches;
+  card.scrollIntoView({ behavior: 'smooth', block: isMobile ? 'start' : 'nearest' });
 }
 function addLog(appID,msg,cls='') {
   const log=document.getElementById('activity-log');
