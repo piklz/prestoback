@@ -52,13 +52,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 )
 
 const (
 	remotePairingSecretBytes  = 32              // 256 bits — brute-forcing this over the network is infeasible, same size as GenerateAPIKey
-	remotePairingTTL          = 5 * time.Minute  // matches pairing.go's device-pairing TTL
-	remotePairingClaimRate    = 20               // same brute-force guard pairing.go's pairingClaimRate applies
+	remotePairingTTL          = 5 * time.Minute // matches pairing.go's device-pairing TTL
+	remotePairingClaimRate    = 20              // same brute-force guard pairing.go's pairingClaimRate applies
 	remoteChallengeNonceBytes = 32
 )
 
@@ -344,6 +345,20 @@ type RemotePusher struct {
 	LastUsed        *time.Time `json:"last_used,omitempty"`
 }
 
+// shortNodeIDFragment returns just the first 4-hex-char chunk of a chunked
+// NodeID (e.g. "8402" from "8402-2338-6865-..."). Used only for a short,
+// non-identifying display suffix when a pusher connects without a name —
+// the full ID remains available (PusherNodeID) for actual verification.
+func shortNodeIDFragment(nodeID string) string {
+	if i := strings.IndexByte(nodeID, '-'); i > 0 {
+		return nodeID[:i]
+	}
+	if len(nodeID) > 4 {
+		return nodeID[:4]
+	}
+	return nodeID
+}
+
 func generateRemotePusherID() string {
 	b := make([]byte, 4)
 	_, _ = rand.Read(b)
@@ -359,7 +374,15 @@ func generateRemotePusherID() string {
 // here again.
 func (c *Config) AddRemotePusher(name, pusherNodeID, pusherPublicKeyB64, pushCredential string) (RemotePusher, error) {
 	if name == "" {
-		name = pusherNodeID
+		// Matches pairing.go's ClaimPairing, which already solved this
+		// exact problem for the browser-pairing flow ("Unnamed device")
+		// rather than defaulting to a raw credential/ID. Previously this
+		// fell back to pusherNodeID itself — a 40+ char hash — which then
+		// became the permanent Name shown in the paired-pushers list and
+		// anywhere else that prints it. shortNodeIDFragment keeps two
+		// unnamed pushers distinguishable without repeating the full
+		// verification hash as the primary label.
+		name = "Unnamed instance (" + shortNodeIDFragment(pusherNodeID) + ")"
 	}
 	rp := RemotePusher{
 		ID:              generateRemotePusherID(),

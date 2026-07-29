@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -391,6 +392,43 @@ func (s *Server) handleRemotePairingStart(w http.ResponseWriter, r *http.Request
 // handshake (outbound HTTP call to the receiver) and, only if the
 // receiver's identity verifies against what the QR said to expect, saves
 // a new RemoteTarget{Kind: "prestoback"}.
+// defaultPairedInstanceName builds a readable fallback for a prestoback
+// target's name when the person leaves the name field blank while pairing.
+// Previously this fell back to the raw NodeID — a 40+ char hash — which
+// then became the PERMANENT display name everywhere: the Settings row,
+// history entries, and every Telegram/Discord "Remote push complete"
+// notification, since all of those just print target.Name. A hostname is
+// meaningfully more useful at a glance than a hash, and unlike the hash it
+// isn't itself a security-sensitive value — the name is cosmetic; the
+// pinned NodeID (still stored and still shown, truncated, in the UI's
+// inspect drawer) is what verification actually depends on.
+//
+// nodeID's first 4-hex-char chunk is appended as a short disambiguator —
+// not the full ID — so two unnamed pairings to hosts sharing a hostname
+// (e.g. two "raspberrypi.local" on different subnets, common in a
+// homelab) still get distinct rows instead of a silent name collision.
+func defaultPairedInstanceName(rawURL, nodeID string) string {
+	host := "paired instance"
+	if u, err := url.Parse(rawURL); err == nil && u.Hostname() != "" {
+		host = u.Hostname()
+	}
+	return host + " (" + shortNodeID(nodeID) + ")"
+}
+
+// shortNodeID returns just the first 4-hex-char chunk of a chunked NodeID
+// (e.g. "8402" from "8402-2338-6865-...") — enough to disambiguate two
+// same-named entries at a glance without repeating the full verification
+// hash inline everywhere it's used as a display suffix.
+func shortNodeID(nodeID string) string {
+	if i := strings.IndexByte(nodeID, '-'); i > 0 {
+		return nodeID[:i]
+	}
+	if len(nodeID) > 4 {
+		return nodeID[:4]
+	}
+	return nodeID
+}
+
 func (s *Server) handleRemotePairAsPusher(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errOut(w, 405, "method not allowed")
@@ -411,7 +449,7 @@ func (s *Server) handleRemotePairAsPusher(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if req.Name == "" {
-		req.Name = req.NodeID
+		req.Name = defaultPairedInstanceName(req.URL, req.NodeID)
 	}
 	req.URL = strings.TrimRight(req.URL, "/")
 
