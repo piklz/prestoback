@@ -532,6 +532,7 @@ func Load(dataDir string) (*Config, error) {
 		}
 		c.nodeIdentity = identity
 	}
+	migrateLegacyRemoteNames(&c.remote, c.remotePushers)
 	// Persist migrated form immediately so next load is clean
 	_ = c.save()
 	return c, nil

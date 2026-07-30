@@ -301,18 +301,45 @@ func buildUpdateReportDiscordMessage(reports []AppUpdateReport) (title, descript
 
 	var sb strings.Builder
 	for _, r := range reports {
-		sb.WriteString(fmt.Sprintf("**%s**\n", r.AppName))
+		name := r.AppName
+		if r.Pinned {
+			name = "🔒 " + name
+		}
+		sb.WriteString(fmt.Sprintf("**%s**\n", name))
 		for _, img := range r.Images {
+			label := fmt.Sprintf("`%s`", img.ContainerName)
+			if img.WebURL != "" {
+				label = fmt.Sprintf("[%s](%s)", img.ContainerName, img.WebURL)
+			}
 			switch {
 			case img.Err != "" && img.Skipped:
-				sb.WriteString(fmt.Sprintf("ℹ️ `%s` — %s (tracked manually)\n", img.ContainerName, img.Err))
+				line := fmt.Sprintf("ℹ️ %s — %s (tracked manually)", label, img.Err)
+				if img.LocalCreatedDate != "" {
+					line += fmt.Sprintf(" 🗓️ Current: %s", img.LocalCreatedDate)
+				}
+				sb.WriteString(line + "\n")
 			case img.Err != "":
-				sb.WriteString(fmt.Sprintf("⚠️ `%s` — %s\n", img.ContainerName, img.Err))
-			case img.CurrentVersion != "" && img.LatestVersion != "" && img.CurrentVersion != img.LatestVersion:
-				sb.WriteString(fmt.Sprintf("• `%s` %s → %s\n", img.ContainerName, img.CurrentVersion, img.LatestVersion))
+				sb.WriteString(fmt.Sprintf("⚠️ %s — %s\n", label, img.Err))
 			default:
-				sb.WriteString(fmt.Sprintf("• `%s` update available (tag: %s)\n", img.ContainerName, img.CurrentTag))
+				line := fmt.Sprintf("• %s (%s) 🐳", label, img.Image)
+				if img.CurrentVersion != "" && img.LatestVersion != "" && img.CurrentVersion != img.LatestVersion {
+					line += fmt.Sprintf(" 🔖 %s → %s", img.CurrentVersion, img.LatestVersion)
+				}
+				sb.WriteString(line + "\n")
+				var detail []string
+				if img.SizeBytes > 0 {
+					detail = append(detail, "📦 "+humanBytes(img.SizeBytes))
+				}
+				if img.LocalCreatedDate != "" {
+					detail = append(detail, "🗓️ Current: "+img.LocalCreatedDate)
+				}
+				if len(detail) > 0 {
+					sb.WriteString("  " + strings.Join(detail, " | ") + "\n")
+				}
 			}
+		}
+		if r.Pinned {
+			sb.WriteString("   _pinned — update manually, no Auto-Update button offered_\n")
 		}
 		sb.WriteString("\n")
 	}
@@ -370,41 +397,51 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 		}
 		sb.WriteString(fmt.Sprintf("*%s*\n", name))
 		for _, img := range r.Images {
-			name := notify.EscapeMD(img.ContainerName)
+			cname := notify.EscapeMD(img.ContainerName)
 			// Link the name to its registry/package page when recognized
 			// (Docker Hub, GHCR, Quay — see registryWebURL in imagemeta.go).
 			// A markdown link and inline code can't nest in Telegram's
 			// MarkdownV2, so this replaces the old plain backtick styling
 			// rather than layering on top of it.
-			label := fmt.Sprintf("`%s`", name)
+			label := fmt.Sprintf("`%s`", cname)
 			if img.WebURL != "" {
-				label = fmt.Sprintf("[%s](%s)", name, escapeMDURL(img.WebURL))
+				label = fmt.Sprintf("[%s](%s)", cname, escapeMDURL(img.WebURL))
 			}
 			switch {
 			case img.Err != "" && img.Skipped:
-				sb.WriteString(fmt.Sprintf("ℹ️ %s — %s \\(tracked manually\\)\n", label, notify.EscapeMD(img.Err)))
+				// One line, not a separate date line below — a pinned/
+				// unresolvable image has nothing actionable to show, so a
+				// second line just for its current-build date is noise
+				// this format deliberately drops (matches the user's own
+				// "much cleaner" reference format, which condenses these).
+				line := fmt.Sprintf("ℹ️ %s — %s \\(tracked manually\\)", label, notify.EscapeMD(img.Err))
+				if img.LocalCreatedDate != "" {
+					line += fmt.Sprintf(" 🗓️ Current: %s", notify.EscapeMD(img.LocalCreatedDate))
+				}
+				sb.WriteString(line + "\n")
 			case img.Err != "":
 				sb.WriteString(fmt.Sprintf("⚠️ %s — %s\n", label, notify.EscapeMD(img.Err)))
-			case img.CurrentVersion != "" && img.LatestVersion != "" && img.CurrentVersion != img.LatestVersion:
-				sb.WriteString(fmt.Sprintf("• %s %s → %s", label, notify.EscapeMD(img.CurrentVersion), notify.EscapeMD(img.LatestVersion)))
-				appendSizeSuffix(&sb, img.SizeBytes)
-				sb.WriteString("\n")
 			default:
-				sb.WriteString(fmt.Sprintf("• %s update available \\(tag: %s\\)", label, notify.EscapeMD(img.CurrentTag)))
-				appendSizeSuffix(&sb, img.SizeBytes)
-				sb.WriteString("\n")
-			}
-			// "Current" is the build date of the image actually running right
-			// now — this is what Docksentry's "Current: <date>" shows, and
-			// what was missing before. "New build" (when known — only
-			// fetched once an update is confirmed available) is the
-			// replacement image's date, kept separate so the two are never
-			// conflated.
-			if img.LocalCreatedDate != "" {
-				sb.WriteString(fmt.Sprintf("   📅 Current: %s\n", notify.EscapeMD(img.LocalCreatedDate)))
-			}
-			if img.CreatedDate != "" {
-				sb.WriteString(fmt.Sprintf("   📦 New build: %s\n", notify.EscapeMD(img.CreatedDate)))
+				line := fmt.Sprintf("• %s \\(%s\\) 🐳", label, notify.EscapeMD(img.Image))
+				// 🔖 version arrow only when both ends are known and
+				// actually differ — CurrentVersion now resolves even for a
+				// moving tag like :latest/:release (see
+				// resolveCurrentVersionByDigest in imagemeta.go), not just
+				// when the configured tag is itself a version string.
+				if img.CurrentVersion != "" && img.LatestVersion != "" && img.CurrentVersion != img.LatestVersion {
+					line += fmt.Sprintf(" 🔖 %s → %s", notify.EscapeMD(img.CurrentVersion), notify.EscapeMD(img.LatestVersion))
+				}
+				sb.WriteString(line + "\n")
+				var detail []string
+				if img.SizeBytes > 0 {
+					detail = append(detail, "📦 "+notify.EscapeMD(humanBytes(img.SizeBytes)))
+				}
+				if img.LocalCreatedDate != "" {
+					detail = append(detail, "🗓️ Current: "+notify.EscapeMD(img.LocalCreatedDate))
+				}
+				if len(detail) > 0 {
+					sb.WriteString("  " + strings.Join(detail, " \\| ") + "\n")
+				}
 			}
 		}
 		if r.Pinned {
@@ -436,13 +473,6 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 	}
 
 	return strings.TrimRight(sb.String(), "\n"), btns
-}
-
-func appendSizeSuffix(sb *strings.Builder, sizeBytes int64) {
-	if sizeBytes <= 0 {
-		return
-	}
-	sb.WriteString(fmt.Sprintf(" \\(%s\\)", notify.EscapeMD(humanBytes(sizeBytes))))
 }
 
 // escapeMDURL escapes only the two characters MarkdownV2 requires escaping

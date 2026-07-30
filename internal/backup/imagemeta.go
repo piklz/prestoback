@@ -32,6 +32,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -128,8 +129,21 @@ func CheckImageMeta(c ContainerInfo, force bool, cache map[string]ImageMeta) Ima
 		} else {
 			log.Printf("[imagemeta] size/date lookup failed for %s: %v", image, err2)
 		}
-		if lv, err2 := latestSemverTag(registry, repository); err2 == nil {
-			res.LatestVersion = lv
+		// One listTags call, reused for both the latest-version lookup and
+		// (when needed) resolving what version is actually running now —
+		// see resolveCurrentVersionByDigest's doc comment for why the
+		// latter is necessary at all for a moving tag like "latest"/"release".
+		if tags, err2 := listTags(registry, repository); err2 == nil {
+			if lv, ok := latestSemverTagFrom(tags); ok {
+				res.LatestVersion = lv
+			}
+			if res.CurrentVersion == "" && res.LatestVersion != "" {
+				if cv, ok := resolveCurrentVersionByDigest(image, localDigest, tags); ok {
+					res.CurrentVersion = cv
+				}
+			}
+		} else {
+			log.Printf("[imagemeta] tag list lookup failed for %s: %v", image, err2)
 		}
 	}
 
@@ -423,6 +437,17 @@ func latestSemverTag(registry, repository string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if v, ok := latestSemverTagFrom(tags); ok {
+		return v, nil
+	}
+	return "", fmt.Errorf("no semver-looking tags found")
+}
+
+// latestSemverTagFrom is latestSemverTag's pure half — split out so a
+// caller that already fetched the tag list (CheckImageMeta, which also
+// needs it for resolveCurrentVersionByDigest) doesn't pay for a second
+// listTags round trip just to find the highest version.
+func latestSemverTagFrom(tags []string) (string, bool) {
 	var best semver
 	found := false
 	for _, t := range tags {
@@ -435,10 +460,61 @@ func latestSemverTag(registry, repository string) (string, error) {
 			found = true
 		}
 	}
-	if !found {
-		return "", fmt.Errorf("no semver-looking tags found")
+	return best.raw, found
+}
+
+// resolveCurrentVersionByDigest answers "what version is actually running
+// right now", for the common case where the CONFIGURED tag is a moving one
+// ("latest", "release") and so carries no version info on its own even
+// though a real version number exists underneath it. Works backward from
+// the currently-running image's digest: try the newest semver-looking
+// tags one at a time (via a HEAD request each — same primitive
+// headRegistryDigest already uses for the normal update check) until one's
+// digest matches localDigest.
+//
+// Bounded to maxVersionCandidates tags, newest-first, rather than the full
+// tag list — a mature repo can carry 100+ historical version tags, and
+// this is one extra network round trip per candidate on every check cycle
+// for every image that isn't already version-pinned. Stopping at the
+// first match keeps the common case (current version is recent) cheap;
+// not finding a match within the bound just means CurrentVersion stays
+// unset, the same "best-effort, gap is acceptable" posture Skipped
+// already documents for other unresolvable cases.
+const maxVersionCandidates = 8
+
+func resolveCurrentVersionByDigest(image, localDigest string, tags []string) (string, bool) {
+	if localDigest == "" || localDigest == "local-build" {
+		return "", false
 	}
-	return best.raw, nil
+	var candidates []semver
+	for _, t := range tags {
+		if sv, ok := parseSemverTag(t); ok {
+			candidates = append(candidates, sv)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[j].less(candidates[i]) }) // descending
+	if len(candidates) > maxVersionCandidates {
+		candidates = candidates[:maxVersionCandidates]
+	}
+	for _, sv := range candidates {
+		digest, err := headRegistryDigest(withTag(image, sv.raw))
+		if err == nil && digest == localDigest {
+			return sv.raw, true
+		}
+	}
+	return "", false
+}
+
+// withTag replaces image's tag with newTag, preserving everything else
+// (registry host, repository path) exactly as given — the same
+// last-colon-after-last-slash rule parseImageRef itself uses to find the
+// tag boundary, so headRegistryDigest(withTag(image, v)) always resolves
+// against the identical registry/repository the original check used.
+func withTag(image, newTag string) string {
+	if idx := strings.LastIndex(image, ":"); idx > strings.LastIndex(image, "/") {
+		return image[:idx] + ":" + newTag
+	}
+	return image + ":" + newTag
 }
 
 // listTags fetches the repository's full tag list, following pagination via

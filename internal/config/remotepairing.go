@@ -52,14 +52,15 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 )
 
 const (
 	remotePairingSecretBytes  = 32              // 256 bits — brute-forcing this over the network is infeasible, same size as GenerateAPIKey
-	remotePairingTTL          = 5 * time.Minute // matches pairing.go's device-pairing TTL
-	remotePairingClaimRate    = 20              // same brute-force guard pairing.go's pairingClaimRate applies
+	remotePairingTTL          = 5 * time.Minute  // matches pairing.go's device-pairing TTL
+	remotePairingClaimRate    = 20               // same brute-force guard pairing.go's pairingClaimRate applies
 	remoteChallengeNonceBytes = 32
 )
 
@@ -472,4 +473,49 @@ func (c *Config) DeleteRemotePusher(id string) error {
 	delete(c.remotePushers, id)
 	c.mu.Unlock()
 	return c.Save()
+}
+
+// ── Retroactive name migration ────────────────────────────────────────────
+//
+// Both sides of a prestoback pairing used to silently default an unnamed
+// instance's display Name to its raw NodeID (a 40+ char hash) — fixed at
+// the point of creation in remotepairing_handlers.go (pusher side) and
+// AddRemotePusher above (receiver side). That fix only stops NEW bad
+// names from being created; anything paired before the fix shipped still
+// has its Name permanently set to the raw hash on disk, which is exactly
+// what then shows up as the primary label in the UI and in every
+// Telegram/Discord "Remote push complete" notification.
+//
+// migrateLegacyRemoteNames runs once on every config Load (see Load's
+// "heal on load" pattern, same one the volume-schema and node-identity
+// migrations already use) and rewrites any target/pusher whose Name is
+// STILL EXACTLY EQUAL to its own NodeID — a precise, false-positive-free
+// check, since a real user-chosen name colliding character-for-character
+// with a 64-hex-char chunked ID is not a realistic accident.
+func migrateLegacyRemoteNames(remote *RemoteConfig, pushers map[string]RemotePusher) {
+	for i := range remote.Targets {
+		t := &remote.Targets[i]
+		if t.Kind == "prestoback" && t.PrestoBackPinnedNodeID != "" && t.Name == t.PrestoBackPinnedNodeID {
+			t.Name = defaultNameFromURL(t.PrestoBackURL, t.PrestoBackPinnedNodeID)
+		}
+	}
+	for id, rp := range pushers {
+		if rp.PusherNodeID != "" && rp.Name == rp.PusherNodeID {
+			rp.Name = "Unnamed instance (" + shortNodeIDFragment(rp.PusherNodeID) + ")"
+			pushers[id] = rp
+		}
+	}
+}
+
+// defaultNameFromURL builds the same readable fallback
+// remotepairing_handlers.go's defaultPairedInstanceName does for a
+// freshly-completed pairing, duplicated here (rather than importing the
+// api package, which already imports config — that would be a cycle) since
+// it's a small, self-contained handful of lines.
+func defaultNameFromURL(rawURL, nodeID string) string {
+	host := "paired instance"
+	if u, err := url.Parse(rawURL); err == nil && u.Hostname() != "" {
+		host = u.Hostname()
+	}
+	return host + " (" + shortNodeIDFragment(nodeID) + ")"
 }

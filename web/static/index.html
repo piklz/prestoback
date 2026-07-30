@@ -4545,7 +4545,8 @@ function renderRemoteTargets() {
       </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn btn-g btn-sm" onclick="testExistingRemoteTarget(${i})">Test</button>
-        ${t.kind === 'prestoback' ? '' : `
+        ${t.kind === 'prestoback' ? `
+        <button class="btn btn-g btn-sm" onclick="renameRemoteTarget(${i})">Rename</button>` : `
         <button class="btn btn-g btn-sm" onclick="editRemoteTarget(${i})">Edit</button>
         <button class="btn btn-g btn-sm" onclick="duplicateRemoteTarget(${i})">Duplicate</button>`}
         <button class="btn btn-d btn-sm btn-ic" onclick="removeRemoteTarget(${i})">🗑</button>
@@ -4789,6 +4790,28 @@ function saveRtForm() {
   setRtDirty(true);
   resetRtForm();
   renderRemoteTargets();
+}
+
+async function renameRemoteTarget(i) {
+  const t = S_remoteTargets[i];
+  const next = prompt('Rename this paired instance:', t.name);
+  if (next === null) return; // cancelled
+  const trimmed = next.trim();
+  if (!trimmed) { toast('Name cannot be empty', 'error'); return; }
+  const prevName = t.name;
+  t.name = trimmed;
+  renderRemoteTargets();
+  try {
+    const enabled = document.getElementById('tog-remote').classList.contains('on');
+    const r = await api('/api/remote', {method:'PUT', body: JSON.stringify({enabled, targets: S_remoteTargets})});
+    S_remoteTargets = r.targets || S_remoteTargets;
+    renderRemoteTargets();
+    toast('Renamed', 'success');
+  } catch(e) {
+    t.name = prevName; // roll back on failure — don't leave the UI showing a name that didn't actually save
+    renderRemoteTargets();
+    toast(e.message, 'error');
+  }
 }
 
 function removeRemoteTarget(i) {
