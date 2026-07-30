@@ -39,10 +39,21 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
    a future third/fourth panel (e.g. an rclone or B2-specific card) just
    drops in and reflows instead of needing a layout change here. Each
    .sec's own min-width keeps a card readable rather than squashed once
-   there are enough panels to wrap. */
+   there are enough panels to wrap. On genuinely wide screens the two
+   existing panels get an intentional 5:7 ratio instead of an equal 1:1
+   split — Remote Backup Targets is consistently the denser, more-used
+   panel (the target list plus the add-target form) while PrestoBack
+   Instance Pairing is often just a NodeID and two empty lists; an even
+   split left Pairing looking sparse next to a visually heavier Targets
+   card. */
 .remote-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:0;align-items:start}
 .remote-grid>.sec{padding:22px 24px;min-width:0}
+@media (min-width:1300px){.remote-grid{grid-template-columns:5fr 7fr}}
 @media (max-width:900px){.remote-grid{grid-template-columns:1fr}}
+.remote-stats-strip{display:flex;gap:10px;flex-wrap:wrap;margin:0 36px 18px}
+.remote-stat{display:flex;align-items:center;gap:8px;padding:10px 16px;background:var(--bg3);border:1px solid var(--line);border-radius:var(--r);font-size:12.5px;color:var(--txt2)}
+.remote-stat b{color:var(--txt);font-size:15px;font-family:var(--mono)}
+@media (max-width:900px){.remote-stats-strip{margin:0 18px 14px}}
 /* buttons */
 .btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:var(--rs);font-size:13px;font-weight:500;cursor:pointer;border:1px solid transparent;transition:all .15s;font-family:var(--body)}
 .btn-p{background:var(--accent);color:#fff;border-color:var(--accent)}.btn-p:hover{background:var(--accent2)}
@@ -914,6 +925,7 @@ select.fi{cursor:pointer}
 <!-- REMOTE BACKUP (split out of Settings → Security; see [LOOP STATUS] history) -->
 <div id="view-remote" class="view-hidden">
   <div class="ph"><div><div class="pt">Remote Backup</div><div class="ps">Where backups go, and which instances are paired to send them here</div></div></div>
+  <div id="remote-stats-strip" class="remote-stats-strip"></div>
   <div class="remote-grid">
   <div class="sec">
     <div class="card"><div class="ch"><div class="ct">PrestoBack Instance Pairing</div></div><div class="cb">
@@ -938,7 +950,11 @@ select.fi{cursor:pointer}
       <div id="remote-target-list" style="margin:6px 0 4px"></div>
 
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:8px">
-        <div class="fl" style="margin-bottom:8px" id="rt-form-title">Add a target</div>
+        <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;user-select:none" onclick="toggleRtFormCollapse()">
+          <div class="fl" style="margin-bottom:0" id="rt-form-title">Add a target</div>
+          <span id="rt-form-toggle-icon" style="color:var(--txt3);font-size:12px">▸ show form</span>
+        </div>
+        <div id="rt-form-body" style="display:none;margin-top:14px">
         <div class="fg"><label class="fl">Name</label><input class="fi" id="rt-name" placeholder="e.g. Synology NAS"></div>
         <div class="fg"><label class="fl">Kind</label>
           <select class="fi" id="rt-kind" onchange="onRtKindChange()">
@@ -976,6 +992,7 @@ select.fi{cursor:pointer}
           <button class="btn btn-p btn-sm" id="rt-submit-btn" onclick="saveRtForm()">+ Add target</button>
           <button class="btn btn-g btn-sm" id="rt-cancel-btn" style="display:none" onclick="cancelRtEdit()">Cancel</button>
           <span class="fh" id="rt-test-result" style="margin:0"></span>
+        </div>
         </div>
       </div>
 
@@ -2092,6 +2109,7 @@ async function checkForUpdatesNow() {
     renderSelfUpdateBanner();
     renderUpdatesBanner();
     renderApps();
+    renderCtrl();
     const nUpdates = S.pendingUpdates.length;
     const nIssues = S.lastUpdateReports.filter(r => r.images.some(im => im.err && !im.skipped)).length;
     if (nUpdates === 0 && nIssues === 0 && !su.available) {
@@ -2722,6 +2740,46 @@ function toggleCtrlGroup(anchor) {
 // left status-accent border, the default "needs attention first" sort, and
 // filter-chip matching, so all three stay in sync automatically instead of
 // three separate ad-hoc checks drifting apart over time.
+// findImageMetaForContainer looks up one container's registry-check result
+// across every app's report — Container Control's rows are individual
+// containers (a multi-container app like Immich has one row per
+// container), unlike the Applications page which looks up by app name
+// directly. Same S.lastUpdateReports data either way; just a different key.
+function findImageMetaForContainer(name) {
+  for (const r of (S.lastUpdateReports || [])) {
+    const im = (r.images || []).find(im => im.container_name === name);
+    if (im) return im;
+  }
+  return null;
+}
+
+// ctrlUpdateBadge mirrors the Applications page's update badge (same
+// colors, same "click to update" affordance), but shows the actual
+// version number inline (⬆ v1.37.1) rather than a bare "update" label —
+// this is the "release version stats" the badge was missing. Only
+// clickable when the container is backed by a registered app (it.app_id)
+// — an unmanaged container has no app to trigger /api/apps/{id}/update
+// against, so the badge is informational-only in that case rather than a
+// dead button.
+function ctrlUpdateBadge(it) {
+  const im = findImageMetaForContainer(it.name);
+  if (!im) return '';
+  if (im.update_available) {
+    const ver = im.latest_version || null;
+    const verLine = (im.current_version && im.latest_version)
+      ? `${im.current_version} → ${im.latest_version}`
+      : `tag: ${im.current_tag || '?'}`;
+    const sizeLine = im.size_bytes ? ` (${fmtBytes(im.size_bytes)})` : '';
+    const clickable = it.app_id ? ` style="cursor:pointer" onclick="openUpdateAppModal('${it.app_id}','${esc(it.backed_up_as||'')}')"` : '';
+    const title = verLine + sizeLine + (it.app_id ? '\n\nClick to update' : '\n\n(not backed by a registered app — update it manually)');
+    return `<span class="pill" style="background:var(--amber2,#3a2a0f);color:var(--amber,#f0a020);border:1px solid var(--amber,#f0a020);margin-left:6px"${clickable} title="${esc(title)}">⬆ ${ver ? esc(ver) : 'update'}</span>`;
+  }
+  if (im.err && !im.skipped) {
+    return `<span class="pill" style="background:var(--red2,#3a1010);color:var(--red,#e05050);border:1px solid var(--red,#e05050);margin-left:6px" title="${esc(im.err)}">⚠ check issue</span>`;
+  }
+  return '';
+}
+
 function ctrlGroupInfo(g) {
   const items = g.containers || [];
   const hasExited = items.some(i => i.state === 'exited');
@@ -2833,7 +2891,7 @@ function renderCtrl() {
           <span class="ctrl-chev-spacer"></span>
           <div class="ctrl-name-wrap"><span class="ctrl-head-name">${esc(it.name)}</span>${it.service ? `<span class="ctrl-head-count">${esc(it.service)}</span>` : ''}</div>
           <span class="ctrl-image" title="${esc(it.image||'')}">${esc(it.image||'')}</span>
-          <div class="ctrl-badge-wrap">${backedBadge(it)}</div>
+          <div class="ctrl-badge-wrap">${backedBadge(it)}${ctrlUpdateBadge(it)}</div>
           <span class="ctrl-status-pill" style="color:${col};background:${bg}">${label}</span>
           <div class="ctrl-row-actions">${ctrlActionButtons([it.name], it.name, it.state, it.is_self)}</div>
         </div>
@@ -2853,6 +2911,10 @@ function renderCtrl() {
     const isOpen = _ctrlOpen.has(g.anchor);
     const allNames = items.map(i => i.name);
     const unbackedCount = items.filter(i => !i.backed_up_as).length;
+    const updatableCount = items.filter(it => {
+      const im = findImageMetaForContainer(it.name);
+      return im && im.update_available;
+    }).length;
 
     const childrenHtml = items.map(it => {
       const [col, bg, label] = ctrlStatusLabel(it.state, it.health, it.exit_code);
@@ -2863,7 +2925,7 @@ function renderCtrl() {
         <span class="ctrl-chev-spacer"></span>
         <div class="ctrl-name-wrap"><span class="ctrl-child-name">${esc(it.name)}</span>${it.service ? `<span class="ctrl-head-count">${esc(it.service)}</span>` : ''}</div>
         <span class="ctrl-image" title="${esc(it.image||'')}">${esc(it.image||'')}</span>
-        <div class="ctrl-badge-wrap">${backedBadge(it)}</div>
+        <div class="ctrl-badge-wrap">${backedBadge(it)}${ctrlUpdateBadge(it)}</div>
         <span class="ctrl-status-pill" style="color:${col};background:${bg}">${label}</span>
         <div class="ctrl-row-actions">${ctrlActionButtons([it.name], it.name, it.state, it.is_self)}</div>
         ${selfNote}
@@ -2875,7 +2937,7 @@ function renderCtrl() {
         <svg class="ctrl-chev" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
         <div class="ctrl-name-wrap"><span class="ctrl-head-name">${esc(g.anchor)}</span><span class="ctrl-head-count">${items.length} containers${unbackedCount ? ` · ${unbackedCount} unmanaged` : ''}</span></div>
         <span class="ctrl-image"></span>
-        <div class="ctrl-badge-wrap"></div>
+        <div class="ctrl-badge-wrap">${updatableCount ? `<span class="pill" style="background:var(--amber2,#3a2a0f);color:var(--amber,#f0a020);border:1px solid var(--amber,#f0a020)" title="${updatableCount} container${updatableCount>1?'s':''} in this group have an update available — expand to see which">⬆ ${updatableCount} update${updatableCount>1?'s':''}</span>` : ''}</div>
         <span class="ctrl-status-pill" style="color:${sumCol};background:${sumBg}">${sumLabel}</span>
         <div class="ctrl-row-actions" onclick="event.stopPropagation()">
           <button class="btn btn-g btn-sm" title="Restart every container in this group" onclick='containerLifecycle(${JSON.stringify(allNames)},${JSON.stringify(g.anchor)},"restart")'>↻ Restart all</button>
@@ -4482,6 +4544,27 @@ function setRtDirty(v) {
 // the naming/labeling review; the hash still needs to be reachable for
 // verification, just not printed on every glance at the list. See
 // toggleRtInspect for where it actually lives now.
+let S_pusherCount = 0;
+
+// renderRemoteStatsStrip gives the page a quick-glance summary — target
+// count, how many are currently known-reachable, and how many other
+// instances are paired to push here — instead of needing to read every
+// row to answer "is everything OK right now". Called from
+// renderRemoteTargets (so it stays in sync with every reachability
+// update, no separate call needed there) and once pusher data loads.
+function renderRemoteStatsStrip() {
+  const el = document.getElementById('remote-stats-strip');
+  if (!el) return;
+  const total = S_remoteTargets.length;
+  const reachable = Object.values(S_rtReachable).filter(r => r && r.ok).length;
+  const checking = Object.values(S_rtReachable).some(r => r && r.checking);
+  el.innerHTML = `
+    <div class="remote-stat">🎯 <b>${total}</b> target${total===1?'':'s'}</div>
+    <div class="remote-stat">${checking ? '⏳' : '✓'} <b>${reachable}</b>/${total} reachable</div>
+    <div class="remote-stat">🔗 <b>${S_pusherCount}</b> paired instance${S_pusherCount===1?'':'s'} pushing here</div>
+  `;
+}
+
 function remoteTargetSummary(t) {
   if (t.kind === 'mount') return t.mount_path;
   if (t.kind === 'sftp') return `${t.sftp_user}@${t.sftp_host}:${t.sftp_port||22}${t.sftp_base_dir?(' '+t.sftp_base_dir):''}`;
@@ -4514,6 +4597,7 @@ function renderRemoteTargets() {
   const el = document.getElementById('remote-target-list');
   if (!S_remoteTargets.length) {
     el.innerHTML = `<div style="color:var(--txt2);font-size:12.5px;padding:6px 0">No remote targets configured yet — add one below.</div>`;
+    renderRemoteStatsStrip();
     return;
   }
   el.innerHTML = S_remoteTargets.map((t,i) => {
@@ -4553,6 +4637,7 @@ function renderRemoteTargets() {
       </div>
     </div>`;
   }).join('');
+  renderRemoteStatsStrip();
 }
 
 function onRtKindChange() {
@@ -4730,6 +4815,18 @@ function populateRtForm(t, { forDuplicate } = {}) {
   document.getElementById('rt-test-result').textContent = '';
 }
 
+function setRtFormExpanded(expanded) {
+  const body = document.getElementById('rt-form-body');
+  const icon = document.getElementById('rt-form-toggle-icon');
+  if (!body || !icon) return;
+  body.style.display = expanded ? '' : 'none';
+  icon.textContent = expanded ? '▾ hide form' : '▸ show form';
+}
+function toggleRtFormCollapse() {
+  const body = document.getElementById('rt-form-body');
+  setRtFormExpanded(!body || body.style.display === 'none');
+}
+
 function resetRtForm() {
   S_rtEditIndex = null;
   RT_FIELD_IDS.forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
@@ -4742,6 +4839,7 @@ function resetRtForm() {
   document.getElementById('rt-form-title').textContent = 'Add a target';
   document.getElementById('rt-submit-btn').textContent = '+ Add target';
   document.getElementById('rt-cancel-btn').style.display = 'none';
+  setRtFormExpanded(false);
 }
 
 function editRemoteTarget(i) {
@@ -4750,6 +4848,7 @@ function editRemoteTarget(i) {
   document.getElementById('rt-form-title').textContent = `Editing "${S_remoteTargets[i].name}"`;
   document.getElementById('rt-submit-btn').textContent = 'Update target';
   document.getElementById('rt-cancel-btn').style.display = '';
+  setRtFormExpanded(true);
   renderRemoteTargets();
   document.getElementById('rt-form-title').scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
@@ -4761,6 +4860,7 @@ function duplicateRemoteTarget(i) {
   document.getElementById('rt-form-title').textContent = `Duplicate of "${src.name}"`;
   document.getElementById('rt-submit-btn').textContent = '+ Add target';
   document.getElementById('rt-cancel-btn').style.display = '';
+  setRtFormExpanded(true);
   renderRemoteTargets();
   document.getElementById('rt-form-title').scrollIntoView({ behavior: 'smooth', block: 'center' });
   if (src.kind !== 'mount') {
@@ -5122,6 +5222,8 @@ async function loadPrestoBackPushers() {
   if (!el) return;
   try {
     const pushers = await api('/api/remote/pushers');
+    S_pusherCount = pushers ? pushers.length : 0;
+    renderRemoteStatsStrip();
     if (!pushers || !pushers.length) {
       el.innerHTML = '<span style="color:var(--txt3)">No other PrestoBack instances are paired with this one yet.</span>';
       return;
