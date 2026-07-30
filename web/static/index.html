@@ -35,6 +35,14 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .ps{color:var(--txt2);font-size:13px;margin-top:3px}
 .ha{display:flex;gap:8px}
 .sec{padding:22px 36px}
+/* Remote Backup page — auto-fit grid rather than a fixed column count, so
+   a future third/fourth panel (e.g. an rclone or B2-specific card) just
+   drops in and reflows instead of needing a layout change here. Each
+   .sec's own min-width keeps a card readable rather than squashed once
+   there are enough panels to wrap. */
+.remote-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:0;align-items:start}
+.remote-grid>.sec{padding:22px 24px;min-width:0}
+@media (max-width:900px){.remote-grid{grid-template-columns:1fr}}
 /* buttons */
 .btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:var(--rs);font-size:13px;font-weight:500;cursor:pointer;border:1px solid transparent;transition:all .15s;font-family:var(--body)}
 .btn-p{background:var(--accent);color:#fff;border-color:var(--accent)}.btn-p:hover{background:var(--accent2)}
@@ -497,6 +505,9 @@ select.fi{cursor:pointer}
     <div class="nav-item" id="nav-bk" onclick="V('bk')">
       <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path d="M20 7H4a1 1 0 00-1 1v11a1 1 0 001 1h16a1 1 0 001-1V8a1 1 0 00-1-1z"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg>Backups
     </div>
+    <div class="nav-item" id="nav-remote" onclick="V('remote')">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path d="M20 16.58A5 5 0 0018 7h-1.26A8 8 0 104 15.25"/><polyline points="12 12 12 21"/><polyline points="9 18 12 21 15 18"/></svg>Remote Backup
+    </div>
     <div class="nav-item" id="nav-hist" onclick="V('hist')">
       <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>History
     </div>
@@ -819,82 +830,12 @@ select.fi{cursor:pointer}
     </div></div>
   </div>
   <div class="sec">
-    <div class="card"><div class="ch"><div class="ct">PrestoBack Instance Pairing</div></div><div class="cb">
-      <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">Lets another PrestoBack instance (a second Pi, a NAS) push its backups to THIS one — paired with a MITM-resistant identity check, not just a shared secret. To push FROM this instance TO somewhere else instead, use "Another PrestoBack instance" under Remote Backup Targets below.</div></div>
-      <div class="fh" style="margin-bottom:10px">This instance's Node ID: <span id="my-node-id" style="font-family:var(--mono);color:var(--txt2)">loading…</span></div>
-      <button class="btn btn-p btn-sm" onclick="startPrestoBackReceivePairing()">📷 Generate pairing code</button>
-      <div style="margin-top:16px">
-        <div class="fl" style="margin-bottom:6px">Instances allowed to push backups here</div>
-        <div id="prestoback-pushers-list" style="font-size:12px;color:var(--txt3)">Loading…</div>
-      </div>
-      <div style="margin-top:16px">
-        <div class="fl" style="margin-bottom:6px">Backups received from paired instances</div>
-        <div id="prestoback-received-list" style="font-size:12px;color:var(--txt3)">Loading…</div>
-      </div>
-    </div></div>
-  </div>
-  <div class="sec">
     <div class="card"><div class="ch"><div class="ct">Backup Encryption</div></div><div class="cb">
       <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">Encrypts new backup archives at rest (AES-256-CTR + HMAC-SHA256). The passphrase below is used automatically for scheduled backups — but <strong>restoring always asks for it again</strong>, never uses this stored copy silently. Per-app overrides are on each app's Edit screen.</div></div>
       <div class="fg"><div class="ftog" onclick="togEncryption()"><div class="ftog-sw" id="tog-encryption"><div class="ftog-kn"></div></div><div class="ftog-lbl">Encrypt new backups by default</div></div></div>
       <div class="fg"><label class="fl">Passphrase</label><input class="fi" type="password" id="enc-passphrase" placeholder="Leave blank to keep the existing passphrase"><div class="fh" id="enc-passphrase-hint"></div></div>
       <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">There's no recovery if you lose this passphrase — encrypted archives become permanently unreadable. Store it somewhere other than this Pi.</div></div>
       <button class="btn btn-p" onclick="saveEncryption()">Save encryption settings</button>
-    </div></div>
-  </div>
-  <div class="sec">
-    <div class="card"><div class="ch"><div class="ct">Remote Backup Targets</div></div><div class="cb">
-      <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><path d="M20 16.58A5 5 0 0018 7h-1.26A8 8 0 104 15.25"/><polyline points="12 12 12 21"/><polyline points="9 18 12 21 15 18"/></svg><div class="info-t">Copies each finished backup to an off-box destination — the local copy on this Pi is <strong>never</strong> replaced or skipped, this is always an extra copy. Everything runs inside PrestoBack itself — no external tool to install. <strong>Mount</strong> is a folder already inside this container (e.g. an SMB/NFS share mounted on the host and bind-mounted in). <strong>SFTP</strong> connects directly over SSH to any NAS or Linux box that supports it (Synology, TrueNAS, QNAP, a plain server) — just a host, username, and password or key. <strong>S3-compatible</strong> connects directly to AWS S3, MinIO, Backblaze B2, Wasabi, or anything else speaking the S3 API. Google Drive/OneDrive/Dropbox aren't offered since those need an interactive browser login that doesn't fit a headless container.</div></div>
-      <div class="fg"><div class="ftog" onclick="togRemote()"><div class="ftog-sw" id="tog-remote"><div class="ftog-kn"></div></div><div class="ftog-lbl">Push new backups to the targets below</div></div></div>
-
-      <div id="remote-target-list" style="margin:6px 0 4px"></div>
-
-      <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:8px">
-        <div class="fl" style="margin-bottom:8px" id="rt-form-title">Add a target</div>
-        <div class="fg"><label class="fl">Name</label><input class="fi" id="rt-name" placeholder="e.g. Synology NAS"></div>
-        <div class="fg"><label class="fl">Kind</label>
-          <select class="fi" id="rt-kind" onchange="onRtKindChange()">
-            <option value="mount">Mount (folder already in this container)</option>
-            <option value="sftp">SFTP (NAS / Linux server over SSH)</option>
-            <option value="s3">S3-compatible (AWS S3, MinIO, Backblaze B2, Wasabi...)</option>
-            <option value="prestoback">Another PrestoBack instance (paired, MITM-resistant)</option>
-          </select>
-        </div>
-        <div class="fg" id="rt-mount-field"><label class="fl">Mount path</label><input class="fi" id="rt-mount-path" placeholder="/remote/nas"><div class="fh">A path inside THIS container, e.g. mounted with <code>-v /mnt/nas/presto-backups:/remote/nas</code>.</div></div>
-        <div id="rt-sftp-field" style="display:none">
-          <div class="fg"><label class="fl">Host</label><input class="fi" id="rt-sftp-host" placeholder="192.168.1.50 or nas.local"></div>
-          <div class="fg"><label class="fl">Port</label><input class="fi" id="rt-sftp-port" placeholder="22"></div>
-          <div class="fg"><label class="fl">Username</label><input class="fi" id="rt-sftp-user" placeholder="backup-user"></div>
-          <div class="fg"><label class="fl">Password</label><input class="fi" type="password" id="rt-sftp-password" placeholder="leave blank if using a private key"></div>
-          <div class="fg"><label class="fl">Private key path (optional)</label><input class="fi" id="rt-sftp-keypath" placeholder="/data/ssh/nas_key"><div class="fh">A key file mounted INTO this container — used instead of a password if set.</div></div>
-          <div class="fg"><label class="fl">Private key passphrase (optional)</label><input class="fi" type="password" id="rt-sftp-keypass" placeholder="leave blank if the key isn't encrypted"></div>
-          <div class="fg"><label class="fl">Known hosts path (optional)</label><input class="fi" id="rt-sftp-knownhosts" placeholder="/data/ssh/known_hosts"><div class="fh">Pins the server's host key — mount the output of <code>ssh-keyscan your-nas</code> here. Left blank, any host key is accepted (fine on a trusted home LAN).</div></div>
-          <div class="fg"><label class="fl">Remote base directory</label><input class="fi" id="rt-sftp-basedir" placeholder="/volume1/backups/presto"></div>
-        </div>
-        <div id="rt-s3-field" style="display:none">
-          <div class="fg"><label class="fl">Endpoint URL</label><input class="fi" id="rt-s3-endpoint" placeholder="https://s3.us-west-002.backblazeb2.com"></div>
-          <div class="fg"><label class="fl">Bucket</label><input class="fi" id="rt-s3-bucket" placeholder="my-presto-backups"></div>
-          <div class="fg"><label class="fl">Access key</label><input class="fi" id="rt-s3-accesskey"></div>
-          <div class="fg"><label class="fl">Secret key</label><input class="fi" type="password" id="rt-s3-secretkey"></div>
-          <div class="fg"><label class="fl">Region (optional)</label><input class="fi" id="rt-s3-region" placeholder="us-east-1"></div>
-          <div class="fg"><label class="fl">Remote base directory / key prefix (optional)</label><input class="fi" id="rt-s3-basedir" placeholder="presto"></div>
-        </div>
-        <div id="rt-prestoback-field" style="display:none">
-          <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">Pairing is its own flow, not a form — each pairing code is single-use and expires quickly, so there's nothing to save here until you actually complete a pairing. On the OTHER instance (the one that will receive your backups), open its Security page and click "Generate pairing code", then bring that code here.</div></div>
-          <button class="btn btn-p btn-sm" onclick="openPairPrestoBackModal()">🔗 Pair with a PrestoBack instance</button>
-        </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center" id="rt-normal-actions">
-          <button class="btn btn-g btn-sm" onclick="testRemoteTargetDraft()">Test connection</button>
-          <button class="btn btn-p btn-sm" id="rt-submit-btn" onclick="saveRtForm()">+ Add target</button>
-          <button class="btn btn-g btn-sm" id="rt-cancel-btn" style="display:none" onclick="cancelRtEdit()">Cancel</button>
-          <span class="fh" id="rt-test-result" style="margin:0"></span>
-        </div>
-      </div>
-
-      <div style="display:flex;align-items:center;gap:12px;margin-top:18px;flex-wrap:wrap">
-        <button class="btn btn-p" onclick="saveRemote()">Save remote backup settings</button>
-        <span class="fh" id="rt-dirty-note" style="display:none;color:#e0a030">● Unsaved changes below — click Save to persist them</span>
-      </div>
     </div></div>
   </div>
 </div>
@@ -969,6 +910,82 @@ select.fi{cursor:pointer}
   </div>
 </div>
 <!-- /SETTINGS wrapper -->
+<!-- REMOTE BACKUP (split out of Settings → Security; see [LOOP STATUS] history) -->
+<div id="view-remote" class="view-hidden">
+  <div class="ph"><div><div class="pt">Remote Backup</div><div class="ps">Where backups go, and which instances are paired to send them here</div></div></div>
+  <div class="remote-grid">
+  <div class="sec">
+    <div class="card"><div class="ch"><div class="ct">PrestoBack Instance Pairing</div></div><div class="cb">
+      <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">Lets another PrestoBack instance (a second Pi, a NAS) push its backups to THIS one — paired with a MITM-resistant identity check, not just a shared secret. To push FROM this instance TO somewhere else instead, use "Another PrestoBack instance" under Remote Backup Targets below.</div></div>
+      <div class="fh" style="margin-bottom:10px">This instance's Node ID: <span id="my-node-id" style="font-family:var(--mono);color:var(--txt2)">loading…</span></div>
+      <button class="btn btn-p btn-sm" onclick="startPrestoBackReceivePairing()">📷 Generate pairing code</button>
+      <div style="margin-top:16px">
+        <div class="fl" style="margin-bottom:6px">Instances allowed to push backups here</div>
+        <div id="prestoback-pushers-list" style="font-size:12px;color:var(--txt3)">Loading…</div>
+      </div>
+      <div style="margin-top:16px">
+        <div class="fl" style="margin-bottom:6px">Backups received from paired instances</div>
+        <div id="prestoback-received-list" style="font-size:12px;color:var(--txt3)">Loading…</div>
+      </div>
+    </div></div>
+  </div>
+  <div class="sec">
+    <div class="card"><div class="ch"><div class="ct">Remote Backup Targets</div></div><div class="cb">
+      <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><path d="M20 16.58A5 5 0 0018 7h-1.26A8 8 0 104 15.25"/><polyline points="12 12 12 21"/><polyline points="9 18 12 21 15 18"/></svg><div class="info-t">Copies each finished backup to an off-box destination — the local copy on this Pi is <strong>never</strong> replaced or skipped, this is always an extra copy. Everything runs inside PrestoBack itself — no external tool to install. <strong>Mount</strong> is a folder already inside this container (e.g. an SMB/NFS share mounted on the host and bind-mounted in). <strong>SFTP</strong> connects directly over SSH to any NAS or Linux box that supports it (Synology, TrueNAS, QNAP, a plain server) — just a host, username, and password or key. <strong>S3-compatible</strong> connects directly to AWS S3, MinIO, Backblaze B2, Wasabi, or anything else speaking the S3 API. Google Drive/OneDrive/Dropbox aren't offered since those need an interactive browser login that doesn't fit a headless container.</div></div>
+      <div class="fg"><div class="ftog" onclick="togRemote()"><div class="ftog-sw" id="tog-remote"><div class="ftog-kn"></div></div><div class="ftog-lbl">Push new backups to the targets below</div></div></div>
+
+      <div id="remote-target-list" style="margin:6px 0 4px"></div>
+
+      <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:8px">
+        <div class="fl" style="margin-bottom:8px" id="rt-form-title">Add a target</div>
+        <div class="fg"><label class="fl">Name</label><input class="fi" id="rt-name" placeholder="e.g. Synology NAS"></div>
+        <div class="fg"><label class="fl">Kind</label>
+          <select class="fi" id="rt-kind" onchange="onRtKindChange()">
+            <option value="mount">Mount (folder already in this container)</option>
+            <option value="sftp">SFTP (NAS / Linux server over SSH)</option>
+            <option value="s3">S3-compatible (AWS S3, MinIO, Backblaze B2, Wasabi...)</option>
+            <option value="prestoback">Another PrestoBack instance (paired, MITM-resistant)</option>
+          </select>
+        </div>
+        <div class="fg" id="rt-mount-field"><label class="fl">Mount path</label><input class="fi" id="rt-mount-path" placeholder="/remote/nas"><div class="fh">A path inside THIS container, e.g. mounted with <code>-v /mnt/nas/presto-backups:/remote/nas</code>.</div></div>
+        <div id="rt-sftp-field" style="display:none">
+          <div class="fg"><label class="fl">Host</label><input class="fi" id="rt-sftp-host" placeholder="192.168.1.50 or nas.local"></div>
+          <div class="fg"><label class="fl">Port</label><input class="fi" id="rt-sftp-port" placeholder="22"></div>
+          <div class="fg"><label class="fl">Username</label><input class="fi" id="rt-sftp-user" placeholder="backup-user"></div>
+          <div class="fg"><label class="fl">Password</label><input class="fi" type="password" id="rt-sftp-password" placeholder="leave blank if using a private key"></div>
+          <div class="fg"><label class="fl">Private key path (optional)</label><input class="fi" id="rt-sftp-keypath" placeholder="/data/ssh/nas_key"><div class="fh">A key file mounted INTO this container — used instead of a password if set.</div></div>
+          <div class="fg"><label class="fl">Private key passphrase (optional)</label><input class="fi" type="password" id="rt-sftp-keypass" placeholder="leave blank if the key isn't encrypted"></div>
+          <div class="fg"><label class="fl">Known hosts path (optional)</label><input class="fi" id="rt-sftp-knownhosts" placeholder="/data/ssh/known_hosts"><div class="fh">Pins the server's host key — mount the output of <code>ssh-keyscan your-nas</code> here. Left blank, any host key is accepted (fine on a trusted home LAN).</div></div>
+          <div class="fg"><label class="fl">Remote base directory</label><input class="fi" id="rt-sftp-basedir" placeholder="/volume1/backups/presto"></div>
+        </div>
+        <div id="rt-s3-field" style="display:none">
+          <div class="fg"><label class="fl">Endpoint URL</label><input class="fi" id="rt-s3-endpoint" placeholder="https://s3.us-west-002.backblazeb2.com"></div>
+          <div class="fg"><label class="fl">Bucket</label><input class="fi" id="rt-s3-bucket" placeholder="my-presto-backups"></div>
+          <div class="fg"><label class="fl">Access key</label><input class="fi" id="rt-s3-accesskey"></div>
+          <div class="fg"><label class="fl">Secret key</label><input class="fi" type="password" id="rt-s3-secretkey"></div>
+          <div class="fg"><label class="fl">Region (optional)</label><input class="fi" id="rt-s3-region" placeholder="us-east-1"></div>
+          <div class="fg"><label class="fl">Remote base directory / key prefix (optional)</label><input class="fi" id="rt-s3-basedir" placeholder="presto"></div>
+        </div>
+        <div id="rt-prestoback-field" style="display:none">
+          <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">Pairing is its own flow, not a form — each pairing code is single-use and expires quickly, so there's nothing to save here until you actually complete a pairing. On the OTHER instance (the one that will receive your backups), open its Remote Backup page and click "Generate pairing code", then bring that code here.</div></div>
+          <button class="btn btn-p btn-sm" onclick="openPairPrestoBackModal()">🔗 Pair with a PrestoBack instance</button>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center" id="rt-normal-actions">
+          <button class="btn btn-g btn-sm" onclick="testRemoteTargetDraft()">Test connection</button>
+          <button class="btn btn-p btn-sm" id="rt-submit-btn" onclick="saveRtForm()">+ Add target</button>
+          <button class="btn btn-g btn-sm" id="rt-cancel-btn" style="display:none" onclick="cancelRtEdit()">Cancel</button>
+          <span class="fh" id="rt-test-result" style="margin:0"></span>
+        </div>
+      </div>
+
+      <div style="display:flex;align-items:center;gap:12px;margin-top:18px;flex-wrap:wrap">
+        <button class="btn btn-p" onclick="saveRemote()">Save remote backup settings</button>
+        <span class="fh" id="rt-dirty-note" style="display:none;color:#e0a030">● Unsaved changes below — click Save to persist them</span>
+      </div>
+    </div></div>
+  </div>
+  </div>
+</div>
 </div>
 
 </main>
@@ -1354,7 +1371,7 @@ select.fi{cursor:pointer}
       <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">On the OTHER instance (the one that will receive your backups), open Security → "Generate pairing code", then paste what it gives you below.</div></div>
       <div class="fg"><label class="fl">Name for this target</label><input class="fi" id="ppb-name" placeholder="e.g. NAS, Living room Pi"></div>
       <div class="fg"><label class="fl">Paste pairing code</label>
-        <textarea class="fi" id="ppb-paste" rows="3" style="font-family:var(--mono);font-size:11px" placeholder="Paste the code copied from the other instance's Security page…" oninput="parsePrestoBackPairingPaste()"></textarea>
+        <textarea class="fi" id="ppb-paste" rows="3" style="font-family:var(--mono);font-size:11px" placeholder="Paste the code copied from the other instance's Remote Backup page…" oninput="parsePrestoBackPairingPaste()"></textarea>
       </div>
       <div class="fh" id="ppb-parse-status" style="margin-bottom:8px"></div>
       <div class="fg"><label class="fl">URL</label><input class="fi" id="ppb-url" placeholder="http://192.168.1.50:8778"></div>
@@ -1464,7 +1481,7 @@ const S = {
   ctrlSort:'status',  // 'status' (needs-attention first) | 'name' (alphabetical, the old fixed order)
   bkPage:0, bkPerPage:20, bkAll:[],
 };
-const VIEWS = ['dash','apps','ctrl','bk','hist','settings'];
+const VIEWS = ['dash','apps','ctrl','bk','remote','hist','settings'];
 // Settings is a single top-level view containing 3 inner tabs (notif/sec/upd)
 // that reuse the exact same div IDs and JS functions (loadNotify, loadStatus,
 // checkUpdate, etc.) that existed when these were 3 separate top-level views —
@@ -2167,9 +2184,22 @@ function V(name) {
   });
   if (name==='bk') { renderChips(); refreshBkView(); }
   if (name==='ctrl') renderCtrl();
+  if (name==='remote') loadRemoteBackupPage();
   if (name==='hist') loadHistory();
   if (name==='settings') settingsTab(_settingsActiveTab || 'notif');
   closeSidebar();
+}
+
+// loadRemoteBackupPage refreshes everything on the Remote Backup page — the
+// same calls settingsTab('sec') used to fire when Remote lived inside
+// Security (see the architecture note on view-remote's HTML). Centralized
+// here rather than inlined in V() so a future panel (a third target kind,
+// a status widget) has one obvious place to add its own load call.
+function loadRemoteBackupPage() {
+  loadRemote();
+  loadMyNodeID();
+  loadPrestoBackPushers();
+  loadPrestoBackReceived();
 }
 
 // Tracks which inner settings tab is active so V('settings') can restore it
@@ -2183,6 +2213,11 @@ let _settingsActiveTab = 'notif';
 // here is show/hide + re-triggering the same load calls V() used to trigger
 // (loadStatus for 'sec', nothing extra needed for 'notif'/'upd' — those are
 // already kept fresh by loadAll()'s 30s poll same as before).
+//
+// Remote pairing/targets (loadRemote/loadMyNodeID/loadPrestoBackPushers/
+// loadPrestoBackReceived) used to fire from here too — they now live on
+// their own Remote Backup page (view-remote) and are loaded by
+// loadRemoteBackupPage() via V('remote') instead.
 function settingsTab(name) {
   _settingsActiveTab = name;
   SETTINGS_TABS.forEach(t => {
@@ -2194,7 +2229,7 @@ function settingsTab(name) {
       tab.style.borderBottomColor = t===name ? 'var(--accent)' : 'transparent';
     }
   });
-  if (name==='sec') { loadStatus(); loadEncryption(); loadRemote(); loadPairedKeys(); loadMfaStatus(); loadMyNodeID(); loadPrestoBackPushers(); loadPrestoBackReceived(); }
+  if (name==='sec') { loadStatus(); loadEncryption(); loadPairedKeys(); loadMfaStatus(); }
 }
 
 // Auto-hide the fixed hamburger button while scrolling down through page
@@ -3732,7 +3767,7 @@ async function openRemoteBrowse() {
     // handleListRemoteArchives's doc comment on the backend.
     const targets = (r.targets || []).filter(t => t.kind !== 'prestoback');
     if (!targets.length) {
-      statusEl.textContent = 'No mount/SFTP/S3 remote targets configured yet — add one under Settings → Security.';
+      statusEl.textContent = 'No mount/SFTP/S3 remote targets configured yet — add one under Remote Backup.';
       return;
     }
     sel.innerHTML = targets.map(t => `<option value="${escHtml(t.name)}">${escHtml(t.name)} (${escHtml(t.kind)})</option>`).join('');
