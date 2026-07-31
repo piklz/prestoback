@@ -856,11 +856,11 @@ func (c *Config) GetRemote() RemoteConfig {
 	return c.remote
 }
 
-func (c *Config) SetRemote(r RemoteConfig) {
+func (c *Config) SetRemote(r RemoteConfig) error {
 	c.mu.Lock()
 	c.remote = r
 	c.mu.Unlock()
-	_ = c.Save()
+	return c.Save()
 }
 
 // ── Misc ──────────────────────────────────────────────────────────────────────

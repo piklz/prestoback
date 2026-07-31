@@ -25,6 +25,7 @@ package api
 import (
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -475,7 +476,11 @@ func (s *Server) handleRemotePairAsPusher(w http.ResponseWriter, r *http.Request
 		PrestoBackPushCredential:  result.PushCredential,
 	}
 	rc.Targets = append(rc.Targets, newTarget)
-	s.cfg.SetRemote(rc)
+	if err := s.cfg.SetRemote(rc); err != nil {
+		log.Printf("[remote-pairing] failed to persist new target %q: %v", newTarget.Name, err)
+		errOut(w, 500, "pairing succeeded but saving the new target failed — try again: "+err.Error())
+		return
+	}
 
 	resp := map[string]any{"target": redactRemoteTarget(newTarget)}
 	if strings.HasPrefix(req.URL, "http://") {

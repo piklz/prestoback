@@ -684,7 +684,11 @@ func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		s.cfg.SetRemote(rc)
+		if err := s.cfg.SetRemote(rc); err != nil {
+			log.Printf("[remote] failed to persist remote config: %v", err)
+			errOut(w, 500, "saved in memory but failed to write to disk — try again, and if this keeps happening check disk space/permissions on the data directory: "+err.Error())
+			return
+		}
 		respond(w, 200, redactRemoteConfig(rc))
 	default:
 		errOut(w, 405, "method not allowed")
