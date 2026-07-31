@@ -5242,28 +5242,81 @@ async function loadPrestoBackPushers() {
       el.innerHTML = '<span style="color:var(--txt3)">No other PrestoBack instances are paired with this one yet.</span>';
       return;
     }
-    el.innerHTML = pushers.map(p => `
+    el.innerHTML = pushers.map(p => {
+      // Staleness is purely a visual hint (14 days, matching a common
+      // "missed about two scheduled backups" ballpark) — never acted on
+      // automatically. It's the actual answer to "which of these
+      // Unnamed-instance rows is a dead pairing I can clean up" versus
+      // "which is still in active use", since a re-paired instance
+      // (rebuilt, restored from scratch) always shows up as a brand new
+      // entry with its own identity — there's no way to know from the
+      // data alone that two rows are "the same physical box", only that
+      // one of them stopped pushing.
+      const lastMs = p.last_used ? new Date(p.last_used).getTime() : null;
+      const daysSince = lastMs ? Math.floor((Date.now() - lastMs) / 86400000) : null;
+      const stale = daysSince === null || daysSince > 14;
+      const staleBadge = stale
+        ? `<span class="pill pa" style="font-size:9px;margin-left:6px" title="${daysSince===null?'Never pushed since pairing':'No push in '+daysSince+' days'}">⚠ ${daysSince===null?'never pushed':'inactive '+daysSince+'d'}</span>`
+        : '';
+      return `
       <div class="bi">
         <div class="bm">
-          <div class="bid">${escHtml(p.name || p.pusher_node_id)}</div>
+          <div class="bid">${escHtml(p.name || p.pusher_node_id)}${staleBadge}</div>
           <div class="bif" style="font-family:var(--mono);font-size:10.5px">${escHtml(p.pusher_node_id)}</div>
           <div class="fh">Paired ${new Date(p.created_at).toLocaleString()}${p.last_used ? ' · last pushed ' + new Date(p.last_used).toLocaleString() : ' · never pushed yet'}</div>
         </div>
-        <button class="btn btn-d btn-sm" onclick="revokePrestoBackPusher('${p.id}','${escHtml(p.name || p.pusher_node_id)}')">Revoke</button>
-      </div>`).join('');
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn btn-g btn-sm" onclick="renamePrestoBackPusher('${p.id}','${escHtml(p.name || p.pusher_node_id)}')">Rename</button>
+          <button class="btn btn-d btn-sm" onclick="revokePrestoBackPusher('${p.id}','${escHtml(p.name || p.pusher_node_id)}')">Revoke</button>
+          <button class="btn btn-d btn-sm" title="Revoke AND delete every backup this pusher ever sent — use for a dead/replaced pairing, not an active one" onclick="purgePrestoBackPusher('${p.id}','${escHtml(p.name || p.pusher_node_id)}')">🗑 Purge</button>
+        </div>
+      </div>`;
+    }).join('');
   } catch (e) {
     el.innerHTML = '<span style="color:var(--red)">Could not load: ' + escHtml(e.message) + '</span>';
   }
 }
 
+async function renamePrestoBackPusher(id, currentName) {
+  const next = prompt('Rename this paired instance:', currentName);
+  if (next === null) return;
+  const trimmed = next.trim();
+  if (!trimmed) { toast('Name cannot be empty', 'error'); return; }
+  try {
+    await api('/api/remote/pushers/' + id, {method:'PUT', body: JSON.stringify({name: trimmed})});
+    toast('Renamed', 'success');
+    loadPrestoBackPushers();
+    loadPrestoBackReceived(); // group labels are derived from pusher name too
+  } catch (e) {
+    toast('Could not rename: ' + e.message, 'error');
+  }
+}
+
 async function revokePrestoBackPusher(id, name) {
-  if (!confirm(`Revoke "${name}"? It will no longer be able to push backups here.`)) return;
+  if (!confirm(`Revoke "${name}"? It will no longer be able to push backups here. Backups already received from it are kept — use "Purge" instead if you want those gone too.`)) return;
   try {
     await api('/api/remote/pushers/' + id, {method:'DELETE'});
     toast('Revoked', 'info');
     loadPrestoBackPushers();
   } catch (e) {
     toast('Could not revoke: ' + e.message, 'error');
+  }
+}
+
+// purgePrestoBackPusher is the actual answer to "this pairing is dead
+// (device rebuilt/restored, now shows up under a new identity) — get rid
+// of everything the old one left behind." Deliberately a separate,
+// distinctly-labeled action from plain Revoke rather than a checkbox on
+// it, since it's irreversible in a way revoke alone isn't.
+async function purgePrestoBackPusher(id, name) {
+  if (!confirm(`Revoke "${name}" AND permanently delete every backup ever received from it? This cannot be undone.`)) return;
+  try {
+    await api('/api/remote/pushers/' + id + '?purge=true', {method:'DELETE'});
+    toast('Revoked and purged', 'info');
+    loadPrestoBackPushers();
+    loadPrestoBackReceived();
+  } catch (e) {
+    toast('Could not purge: ' + e.message, 'error');
   }
 }
 
@@ -5286,7 +5339,10 @@ async function loadPrestoBackReceived() {
     }
     el.innerHTML = groups.map(g => `
       <div style="margin-bottom:10px">
-        <div style="font-size:11.5px;color:var(--txt2);margin-bottom:4px"><strong>${escHtml(g.pusher_name)}</strong> → ${escHtml(g.app_id)} <span style="color:var(--txt3)">(${g.files.length} kept — older ones are pruned automatically)</span></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+          <div style="font-size:11.5px;color:var(--txt2)"><strong>${escHtml(g.pusher_name)}</strong> → ${escHtml(g.app_id)} <span style="color:var(--txt3)">(${g.files.length} kept — older ones are pruned automatically)</span></div>
+          <button class="btn btn-d btn-sm" style="padding:2px 8px;font-size:10.5px" title="Delete all ${g.files.length} ${escHtml(g.app_id)} backups from ${escHtml(g.pusher_name)}" onclick="deletePrestoBackReceivedGroup('${g.pusher_id}','${g.app_id}','${escHtml(g.pusher_name)}')">🗑 Delete all</button>
+        </div>
         ${g.files.map(f => `
           <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;background:var(--bg3);border-radius:6px;margin-bottom:3px;font-size:11px">
             <span style="font-family:var(--mono);color:var(--txt2)">${escHtml(f.name)}</span>
@@ -5309,6 +5365,17 @@ async function deletePrestoBackReceived(pusherId, appId, name) {
     loadPrestoBackReceived();
   } catch (e) {
     toast('Could not delete: ' + e.message, 'error');
+  }
+}
+
+async function deletePrestoBackReceivedGroup(pusherId, appId, pusherName) {
+  if (!confirm(`Delete ALL ${appId} backups received from "${pusherName}"? This cannot be undone.`)) return;
+  try {
+    await api(`/api/remote/received/${pusherId}/${appId}`, {method:'DELETE'});
+    toast('Group deleted', 'info');
+    loadPrestoBackReceived();
+  } catch (e) {
+    toast('Could not delete group: ' + e.message, 'error');
   }
 }
 

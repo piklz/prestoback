@@ -529,15 +529,49 @@ func (s *Server) handleRemotePusherByID(w http.ResponseWriter, r *http.Request) 
 		errOut(w, 400, "missing pusher id")
 		return
 	}
-	if r.Method != http.MethodDelete {
+	switch r.Method {
+	case http.MethodPut:
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := parseJSON(r, &req); err != nil {
+			errOut(w, 400, err.Error())
+			return
+		}
+		if err := s.cfg.RenameRemotePusher(id, req.Name); err != nil {
+			errOut(w, 400, err.Error())
+			return
+		}
+		respond(w, 200, map[string]string{"status": "renamed"})
+
+	case http.MethodDelete:
+		if err := s.cfg.DeleteRemotePusher(id); err != nil {
+			errOut(w, 404, err.Error())
+			return
+		}
+		purged := false
+		// ?purge=true additionally wipes every backup this pusher ever
+		// sent, across all its apps — the actual answer to "this pairing
+		// is dead (rebuilt/replaced with a new identity), get rid of its
+		// leftovers" rather than just leaving them to sit under an
+		// orphaned "(revoked)" label forever. Revoke-only (the default)
+		// stays non-destructive to received data, matching how revoking a
+		// paired KEY elsewhere in this codebase never deletes anything it
+		// was used for.
+		if r.URL.Query().Get("purge") == "true" {
+			dir := filepath.Join(s.cfg.DataDir, "received", id)
+			if err := os.RemoveAll(dir); err != nil {
+				log.Printf("[remote-pairing] purge of %s failed: %v", dir, err)
+				errOut(w, 500, "revoked, but deleting its received backups failed: "+err.Error())
+				return
+			}
+			purged = true
+		}
+		respond(w, 200, map[string]any{"status": "revoked", "purged": purged})
+
+	default:
 		errOut(w, 405, "method not allowed")
-		return
 	}
-	if err := s.cfg.DeleteRemotePusher(id); err != nil {
-		errOut(w, 404, err.Error())
-		return
-	}
-	respond(w, 200, map[string]string{"status": "revoked"})
 }
 
 // ReceivedBackupGroup is one pusher+app directory's worth of received
@@ -628,10 +662,18 @@ func (s *Server) handleReceivedBackupsList(w http.ResponseWriter, r *http.Reques
 	respond(w, 200, groups)
 }
 
-// handleReceivedBackupDelete lets an admin manually remove one received
-// archive (and its manifest, if any) — the counterpart to the automatic
-// pruneReceivedBackups retention pass, for "I want this specific one gone
-// now" rather than waiting on count-based retention.
+// handleReceivedBackupDelete removes received archives at one of two
+// granularities, distinguished by path segment count:
+//   - /api/remote/received/{pusherID}/{appID}/{filename} — one archive
+//     (and its manifest, if any); the counterpart to the automatic
+//     pruneReceivedBackups retention pass, for "I want this specific one
+//     gone now" rather than waiting on count-based retention.
+//   - /api/remote/received/{pusherID}/{appID} — the entire group: every
+//     archive a given pusher sent for a given app. Useful for clearing
+//     one app's stale history without touching that pusher's other apps
+//     (contrast with the pusher-level ?purge=true on DELETE
+//     /api/remote/pushers/{id}, which wipes ALL of a pusher's apps at
+//     once — this is the finer-grained sibling of that).
 func (s *Server) handleReceivedBackupDelete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		errOut(w, 405, "method not allowed")
@@ -639,8 +681,26 @@ func (s *Server) handleReceivedBackupDelete(w http.ResponseWriter, r *http.Reque
 	}
 	rest := strings.TrimPrefix(r.URL.Path, "/api/remote/received/")
 	parts := strings.SplitN(rest, "/", 3)
+
+	if len(parts) == 2 {
+		pusherID, appID := parts[0], parts[1]
+		for _, component := range []string{pusherID, appID} {
+			if _, err := sanitizeRemotePathComponent(component); err != nil {
+				errOut(w, 400, err.Error())
+				return
+			}
+		}
+		dir := s.receivedDir(pusherID, appID)
+		if err := os.RemoveAll(dir); err != nil {
+			errOut(w, 500, "delete group failed: "+err.Error())
+			return
+		}
+		respond(w, 200, map[string]string{"status": "group deleted"})
+		return
+	}
+
 	if len(parts) != 3 {
-		errOut(w, 400, "expected /api/remote/received/{pusherID}/{appID}/{filename}")
+		errOut(w, 400, "expected /api/remote/received/{pusherID}/{appID} or /api/remote/received/{pusherID}/{appID}/{filename}")
 		return
 	}
 	pusherID, appID, name := parts[0], parts[1], parts[2]

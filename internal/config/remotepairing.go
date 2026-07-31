@@ -475,6 +475,31 @@ func (c *Config) DeleteRemotePusher(id string) error {
 	return c.Save()
 }
 
+// RenameRemotePusher sets a pusher's display name — the receiver-side
+// counterpart to the target-rename affordance the pusher/client side
+// already has. Needed in practice whenever a pusher re-pairs with a new
+// identity (a rebuilt instance, a restored-from-scratch config) and shows
+// up here as a brand new "Unnamed instance (xxxx)" row alongside its own
+// now-stale predecessor — renaming lets an admin label both clearly
+// ("Rpi3-hdmi (current)" / "Rpi3-hdmi (before Aug rebuild)") without
+// losing either one's received-backup history.
+func (c *Config) RenameRemotePusher(id, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("name cannot be empty")
+	}
+	c.mu.Lock()
+	rp, ok := c.remotePushers[id]
+	if !ok {
+		c.mu.Unlock()
+		return fmt.Errorf("remote pusher '%s' not found", id)
+	}
+	rp.Name = name
+	c.remotePushers[id] = rp
+	c.mu.Unlock()
+	return c.Save()
+}
+
 // ── Retroactive name migration ────────────────────────────────────────────
 //
 // Both sides of a prestoback pairing used to silently default an unnamed
