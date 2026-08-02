@@ -3499,6 +3499,26 @@ func (s *Server) handleUpdatesCheck(w http.ResponseWriter, r *http.Request) {
 		errOut(w, 405, "method not allowed")
 		return
 	}
+
+	if r.Method == http.MethodGet {
+		// Cheap path: just return whatever the last check (scheduled or
+		// manual) found — no docker inspect calls, no registry HEAD
+		// requests. Needed so the frontend can populate update badges on
+		// page load without forcing a full, slow check on every visit;
+		// previously GET and POST did identical expensive work, so there
+		// was no way to ever see existing update data without clicking
+		// "Check for updates" first — which meant a fresh session landing
+		// on Container Control (rather than Applications, where the
+		// button lives) never saw any badges at all, even though a
+		// scheduled check might have already found real updates hours
+		// earlier.
+		s.stateMu.Lock()
+		reports := append([]AppUpdateReport{}, s.pendingUpdateDetails...)
+		s.stateMu.Unlock()
+		respond(w, 200, map[string]any{"docker_ok": true, "reports": reports, "cached": true})
+		return
+	}
+
 	reports, dockerOK := s.checkForUpdates(false)
 	if !dockerOK {
 		respond(w, 200, map[string]any{"docker_ok": false, "reports": []AppUpdateReport{}})

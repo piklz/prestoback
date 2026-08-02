@@ -518,9 +518,62 @@ func (s *Server) handleRemotePushers(w http.ResponseWriter, r *http.Request) {
 	pushers := s.cfg.ListRemotePushers()
 	out := make([]RemotePusherView, len(pushers))
 	for i, rp := range pushers {
-		out[i] = RemotePusherView{ID: rp.ID, Name: rp.Name, PusherNodeID: rp.PusherNodeID, CreatedAt: rp.CreatedAt, LastUsed: rp.LastUsed}
+		lastUsed := rp.LastUsed
+		if fileTime := s.newestReceivedFileTime(rp.ID); fileTime != nil && (lastUsed == nil || fileTime.After(*lastUsed)) {
+			lastUsed = fileTime
+		}
+		out[i] = RemotePusherView{ID: rp.ID, Name: rp.Name, PusherNodeID: rp.PusherNodeID, CreatedAt: rp.CreatedAt, LastUsed: lastUsed}
 	}
 	respond(w, 200, out)
+}
+
+// newestReceivedFileTime scans every app subdirectory this pusher has ever
+// sent to and returns the newest file's mtime across all of them — the
+// actual, persisted answer to "when did a backup from this pusher last
+// really land on disk", independent of TouchRemotePusher's in-memory-only
+// bookkeeping (see its own doc comment for why that field alone reverts
+// to null on every restart even when real pushes happened before it).
+func (s *Server) newestReceivedFileTime(pusherID string) *time.Time {
+	return newestFileTimeInDir(filepath.Join(s.cfg.DataDir, "received", pusherID))
+}
+
+// newestFileTimeInDir is newestReceivedFileTime's pure half — split out so
+// it's testable without a full Server/Config. Walks dir/{app}/*.tar.gz two
+// levels deep and returns the newest mtime found. Returns nil if dir
+// doesn't exist, is empty, or contains no archives — best-effort, same
+// posture the rest of this file already takes toward filesystem scans
+// backing purely informational UI.
+func newestFileTimeInDir(dir string) *time.Time {
+	appDirs, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var newest time.Time
+	for _, appDir := range appDirs {
+		if !appDir.IsDir() {
+			continue
+		}
+		files, err := os.ReadDir(filepath.Join(dir, appDir.Name()))
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if f.IsDir() || !strings.HasSuffix(f.Name(), ".tar.gz") {
+				continue
+			}
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+			if info.ModTime().After(newest) {
+				newest = info.ModTime()
+			}
+		}
+	}
+	if newest.IsZero() {
+		return nil
+	}
+	return &newest
 }
 
 func (s *Server) handleRemotePusherByID(w http.ResponseWriter, r *http.Request) {

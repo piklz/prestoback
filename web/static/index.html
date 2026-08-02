@@ -647,7 +647,10 @@ select.fi{cursor:pointer}
 <!-- CONTAINER CONTROL -->
 <div id="view-ctrl" class="view-hidden">
   <div class="ph"><div><div class="pt">Container Control</div><div class="ps">Every container in your stack, grouped by compose dependencies — start, stop, restart, or pause any of them directly</div></div>
-    <div class="ha"><button class="btn btn-g btn-sm" onclick="refreshContainerControl()">↺ Refresh</button></div>
+    <div class="ha">
+      <button class="btn btn-g btn-sm" onclick="checkForUpdatesNow()" title="Check every app's image against its registry now — same check the Applications page's button runs, feeds the ⬆ badges on both pages">🔍 Check for updates</button>
+      <button class="btn btn-g btn-sm" onclick="refreshContainerControl()">↺ Refresh</button>
+    </div>
   </div>
   <div class="sec">
     <div class="ctrl-toolbar" id="ctrl-toolbar" style="display:none;margin-bottom:14px">
@@ -1751,6 +1754,29 @@ async function loadAll() {
   // after apps loaded, probe paths, backup counts, and container health
   probeAllApps();
   pollContainerHealth();
+  loadCachedUpdateReports();
+}
+
+// loadCachedUpdateReports populates update badges (Applications and
+// Container Control both) from whatever the last check already found —
+// the cheap GET path (see handleUpdatesCheck's split on the backend) —
+// rather than leaving badges empty until someone manually clicks "Check
+// for updates". A scheduled background check may have already found real
+// updates hours before this page load; this is what actually surfaces
+// them without forcing a fresh, slow registry check on every visit.
+async function loadCachedUpdateReports() {
+  try {
+    const data = await api('/api/updates/check');
+    if (data.docker_ok) {
+      S.lastUpdateReports = data.reports || [];
+      S.pendingUpdates = S.lastUpdateReports
+        .filter(r => r.images.some(im => im.update_available))
+        .map(r => r.app_name);
+      renderApps();
+      renderCtrl();
+      renderUpdatesBanner();
+    }
+  } catch { /* non-critical — badges just stay empty until a manual check */ }
 }
 
 async function refreshContainerHealth() {
@@ -5670,24 +5696,52 @@ async function applyUpdate() {
 async function waitForServerBackOnline(autoReload) {
   const start = Date.now();
   const maxWaitMs = 90000;
+  // Minimum floor before ANY reload, regardless of how fast the server
+  // answers /healthz — a bare 200 there only proves the Go process is
+  // listening again, not that everything downstream of it (a reverse
+  // proxy's backend pool, DNS, whatever sits between the browser and this
+  // container) has caught up. Reloading 700ms after the first healthz
+  // success was too optimistic in practice. SSE reconnecting (see
+  // connectSSE's onopen) is a stronger signal — it proves the full
+  // authenticated app stack is answering, not just that a socket is
+  // open — so it's allowed to shortcut the floor once it's fired, but the
+  // floor still applies if only healthz (not SSE) has confirmed so far.
+  const minFloorMs = 15000;
+  const requiredConsecutiveHealthy = 2;
+  const healthCheckSpacingMs = 2000;
+
+  S_sseReconnectedSinceUpdate = false;
   await new Promise(r => setTimeout(r, 8000)); // the container needs a few seconds to actually stop before it can come back
+
+  let consecutiveHealthy = 0;
   while (Date.now() - start < maxWaitMs) {
+    let healthy = false;
     try {
       const r = await fetch('/healthz', {cache:'no-store'});
-      if (r.ok) {
-        S_updateInProgress = false;
-        if (autoReload) {
-          showUpdateStatusBanner('Update complete — reloading…', false);
-          setTimeout(() => location.reload(), 700);
-        } else {
-          showUpdateStatusBanner('Update complete ✓', false, [
-            {label: 'Reload now', onClick: () => location.reload()},
-          ]);
-        }
-        return;
-      }
+      healthy = r.ok;
     } catch {} // still restarting — expected, keep polling
-    await new Promise(r => setTimeout(r, 2000));
+    consecutiveHealthy = healthy ? consecutiveHealthy + 1 : 0;
+
+    const elapsed = Date.now() - start;
+    const proven = consecutiveHealthy >= requiredConsecutiveHealthy || S_sseReconnectedSinceUpdate;
+    const pastFloor = elapsed >= minFloorMs;
+
+    if (proven && pastFloor) {
+      S_updateInProgress = false;
+      if (autoReload) {
+        showUpdateStatusBanner('Update complete — reloading…', false);
+        setTimeout(() => location.reload(), 700);
+      } else {
+        showUpdateStatusBanner('Update complete ✓', false, [
+          {label: 'Reload now', onClick: () => location.reload()},
+        ]);
+      }
+      return;
+    }
+    if (proven && !pastFloor) {
+      showUpdateStatusBanner(`PrestoBack is back — waiting a few more seconds to be safe (${Math.ceil((minFloorMs-elapsed)/1000)}s)…`);
+    }
+    await new Promise(r => setTimeout(r, healthCheckSpacingMs));
   }
   // Gave up after maxWaitMs — something may actually be wrong, so this
   // stays visible with manual next-steps rather than silently disappearing.
@@ -5737,6 +5791,10 @@ function connectSSE() {
   }
   const es=new EventSource('/api/events?'+authQueryParam());
   S_eventSource = es;
+  es.onopen=()=>{
+    if (S_eventSource !== es) return;
+    if (S_updateInProgress) S_sseReconnectedSinceUpdate = true;
+  };
   es.onmessage=e=>{
     try {
       const u=JSON.parse(e.data);
@@ -5787,6 +5845,7 @@ function connectSSE() {
   };
 }
 let S_loggedUpdateDisconnect = false;
+let S_sseReconnectedSinceUpdate = false; // set by connectSSE's onopen; consumed by waitForServerBackOnline
 // Persistent (survives the trigger modal closing) percentage bar for the
 // currently running large operation, shown above the activity log — see
 // internal/backup/engine.go's progressEmitter for where these samples come
