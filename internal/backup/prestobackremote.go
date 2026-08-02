@@ -100,7 +100,7 @@ func prestobackChallenge(ctx context.Context, t RemoteTarget) error {
 	}
 	var resp config.RemoteChallengeResponse
 	if err := prestobackPostJSON(ctx, t.PrestoBackURL+"/api/remote-pairing/challenge", config.RemoteChallengeRequest{Nonce: nonce}, &resp); err != nil {
-		return fmt.Errorf("could not reach %s: %w", t.Name, err)
+		return fmt.Errorf("could not reach %s: %w%s", t.Name, err, mdnsHintIfRelevant(t.PrestoBackURL, err))
 	}
 	if err := config.VerifyRemoteChallengeResponse(resp, nonce, t.PrestoBackPinnedNodeID); err != nil {
 		// Deliberately not wrapped further — VerifyRemoteChallengeResponse's
@@ -248,4 +248,32 @@ func prestobackReachable(t RemoteTarget) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	return prestobackChallenge(ctx, t)
+}
+
+// mdnsHintIfRelevant appends an actionable hint when a reachability
+// failure looks like a .local (mDNS/Bonjour) hostname that couldn't
+// resolve — by far the most common real cause of "the IP works but the
+// hostname doesn't" for a paired PrestoBack target. Nothing in this
+// codebase restricts using a hostname/FQDN here — it's a plain string
+// handed to Go's standard net/http client, which resolves it the normal
+// way. The gap is environmental: Docker's embedded DNS (127.0.0.11,
+// which is what "no such host" errors from inside a container resolve
+// against) does not speak mDNS, so a name that resolves fine on the host
+// via Avahi/Bonjour often fails to resolve from inside the container
+// PrestoBack itself runs in. Detected heuristically (string match on the
+// error text) rather than a structural check, since Go's DNS error
+// doesn't expose a machine-checkable "was this mDNS" signal — good enough
+// for a hint, not something anything else depends on.
+func mdnsHintIfRelevant(rawURL string, err error) string {
+	if err == nil {
+		return ""
+	}
+	u, parseErr := url.Parse(rawURL)
+	if parseErr != nil || !strings.HasSuffix(strings.ToLower(u.Hostname()), ".local") {
+		return ""
+	}
+	if !strings.Contains(err.Error(), "no such host") {
+		return ""
+	}
+	return " (\"" + u.Hostname() + "\" is a .local/mDNS name — these usually don't resolve from inside a Docker container even when they work fine on the host. Try the target's plain IP address instead, or add it to the container's DNS via docker-compose's extra_hosts.)"
 }

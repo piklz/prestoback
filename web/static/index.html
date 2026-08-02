@@ -52,6 +52,9 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 @media (max-width:900px){.remote-grid{grid-template-columns:1fr}}
 .remote-stats-strip{display:flex;gap:10px;flex-wrap:wrap;margin:0 36px 18px}
 .remote-stat{display:flex;align-items:center;gap:8px;padding:10px 16px;background:var(--bg3);border:1px solid var(--line);border-radius:var(--r);font-size:12.5px;color:var(--txt2)}
+.rt-form-toggle{display:flex;justify-content:space-between;align-items:center;cursor:pointer;user-select:none;padding:10px 14px;background:var(--bg3);border:1px solid var(--line);border-radius:var(--r);transition:border-color .15s}
+.rt-form-toggle:hover{border-color:var(--accent)}
+.rt-form-toggle #rt-form-toggle-icon{color:var(--accent);font-size:12px;font-weight:600;padding:3px 10px;border:1px solid var(--accent);border-radius:99px}
 .remote-stat b{color:var(--txt);font-size:15px;font-family:var(--mono)}
 @media (max-width:900px){.remote-stats-strip{margin:0 18px 14px}}
 /* buttons */
@@ -952,10 +955,15 @@ select.fi{cursor:pointer}
 
       <div id="remote-target-list" style="margin:6px 0 4px"></div>
 
+      <div style="display:flex;align-items:center;gap:12px;margin:14px 0;flex-wrap:wrap">
+        <button class="btn btn-p" onclick="saveRemote()">Save remote backup settings</button>
+        <span class="fh" id="rt-dirty-note" style="display:none;color:#e0a030">● Unsaved changes — click Save to persist them</span>
+      </div>
+
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:8px">
-        <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;user-select:none" onclick="toggleRtFormCollapse()">
+        <div class="rt-form-toggle" onclick="toggleRtFormCollapse()">
           <div class="fl" style="margin-bottom:0" id="rt-form-title">Add a target</div>
-          <span id="rt-form-toggle-icon" style="color:var(--txt3);font-size:12px">▸ show form</span>
+          <span id="rt-form-toggle-icon">▸ show form</span>
         </div>
         <div id="rt-form-body" style="display:none;margin-top:14px">
         <div class="fg"><label class="fl">Name</label><input class="fi" id="rt-name" placeholder="e.g. Synology NAS"></div>
@@ -997,11 +1005,6 @@ select.fi{cursor:pointer}
           <span class="fh" id="rt-test-result" style="margin:0"></span>
         </div>
         </div>
-      </div>
-
-      <div style="display:flex;align-items:center;gap:12px;margin-top:18px;flex-wrap:wrap">
-        <button class="btn btn-p" onclick="saveRemote()">Save remote backup settings</button>
-        <span class="fh" id="rt-dirty-note" style="display:none;color:#e0a030">● Unsaved changes below — click Save to persist them</span>
       </div>
     </div></div>
   </div>
@@ -2813,12 +2816,16 @@ function ctrlGroupInfo(g) {
   const hasUnhealthy = items.some(i => i.state === 'running' && i.health === 'unhealthy');
   const hasSelf = items.some(i => i.is_self);
   const hasUnmanaged = items.some(i => !i.backed_up_as);
+  const hasUpdatable = items.some(i => {
+    const im = findImageMetaForContainer(i.name);
+    return im && im.update_available;
+  });
   // Sort priority: lower rises to the top. Stopped containers are the most
   // actionable ("did I forget this was down?"), then paused, then
   // running-but-unhealthy, then everything genuinely fine.
   const priority = hasExited ? 0 : hasPaused ? 1 : hasUnhealthy ? 2 : 3;
   const borderClass = hasSelf ? 'st-self' : hasExited ? 'st-bad' : (hasPaused || hasUnhealthy) ? 'st-warn' : 'st-ok';
-  return {g, items, priority, hasExited, hasPaused, hasUnhealthy, hasSelf, hasUnmanaged, borderClass};
+  return {g, items, priority, hasExited, hasPaused, hasUnhealthy, hasSelf, hasUnmanaged, hasUpdatable, borderClass};
 }
 
 function ctrlMatchesFilter(info, filter) {
@@ -2827,6 +2834,7 @@ function ctrlMatchesFilter(info, filter) {
     case 'stopped':   return info.hasExited;
     case 'paused':    return info.hasPaused;
     case 'unmanaged': return info.hasUnmanaged;
+    case 'updatable': return info.hasUpdatable;
     default:          return true; // 'all'
   }
 }
@@ -2852,8 +2860,12 @@ function renderCtrlToolbar(infos) {
     stopped: allItems.filter(i => i.state === 'exited').length,
     paused: allItems.filter(i => i.state === 'paused').length,
     unmanaged: allItems.filter(i => !i.backed_up_as).length,
+    updatable: allItems.filter(i => {
+      const im = findImageMetaForContainer(i.name);
+      return im && im.update_available;
+    }).length,
   };
-  const defs = [['all','All'],['running','Running'],['stopped','Stopped'],['paused','Paused'],['unmanaged','Unmanaged']];
+  const defs = [['all','All'],['running','Running'],['stopped','Stopped'],['paused','Paused'],['unmanaged','Unmanaged'],['updatable','⬆ Updatable']];
   chipsEl.innerHTML = defs.map(([key, lbl]) =>
     `<div class="ctrl-filter-chip${S.ctrlFilter===key?' active':''}" onclick="setCtrlFilter('${key}')">${lbl}<span class="cnt">${counts[key]}</span></div>`
   ).join('');
@@ -4666,7 +4678,7 @@ function renderRemoteTargets() {
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn btn-g btn-sm" onclick="testExistingRemoteTarget(${i})">Test</button>
         ${t.kind === 'prestoback' ? `
-        <button class="btn btn-g btn-sm" onclick="renameRemoteTarget(${i})">Rename</button>` : `
+        <button class="btn btn-g btn-sm" onclick="editPrestoBackTarget(${i})">Edit</button>` : `
         <button class="btn btn-g btn-sm" onclick="editRemoteTarget(${i})">Edit</button>
         <button class="btn btn-g btn-sm" onclick="duplicateRemoteTarget(${i})">Duplicate</button>`}
         <button class="btn btn-d btn-sm btn-ic" onclick="removeRemoteTarget(${i})">🗑</button>
@@ -4928,23 +4940,38 @@ function saveRtForm() {
   renderRemoteTargets();
 }
 
-async function renameRemoteTarget(i) {
+async function editPrestoBackTarget(i) {
   const t = S_remoteTargets[i];
-  const next = prompt('Rename this paired instance:', t.name);
-  if (next === null) return; // cancelled
-  const trimmed = next.trim();
-  if (!trimmed) { toast('Name cannot be empty', 'error'); return; }
-  const prevName = t.name;
-  t.name = trimmed;
+  const nextName = prompt('Name for this paired instance:', t.name);
+  if (nextName === null) return; // cancelled
+  const trimmedName = nextName.trim();
+  if (!trimmedName) { toast('Name cannot be empty', 'error'); return; }
+
+  // URL is the only other editable field — the pinned NodeID and push
+  // credential established during pairing are the actual security
+  // anchor and are deliberately NOT editable here (changing those means
+  // it's a different instance, which needs a real re-pair, not an edit).
+  // Re-verified via the challenge handshake on every push regardless, so
+  // updating just where to reach it doesn't weaken anything: a wrong or
+  // stale URL just fails to connect, it can't silently connect to an
+  // impostor.
+  const nextURL = prompt('URL to reach it at (update this if its IP/hostname changed):', t.prestoback_url || '');
+  if (nextURL === null) return;
+  const trimmedURL = nextURL.trim();
+  if (!trimmedURL) { toast('URL cannot be empty', 'error'); return; }
+
+  const prev = {name: t.name, url: t.prestoback_url};
+  t.name = trimmedName;
+  t.prestoback_url = trimmedURL;
   renderRemoteTargets();
   try {
     const enabled = document.getElementById('tog-remote').classList.contains('on');
     const r = await api('/api/remote', {method:'PUT', body: JSON.stringify({enabled, targets: S_remoteTargets})});
     S_remoteTargets = r.targets || S_remoteTargets;
     renderRemoteTargets();
-    toast('Renamed', 'success');
+    toast('Updated — test the connection to confirm it can still reach it', 'success');
   } catch(e) {
-    t.name = prevName; // roll back on failure — don't leave the UI showing a name that didn't actually save
+    t.name = prev.name; t.prestoback_url = prev.url; // roll back on failure
     renderRemoteTargets();
     toast(e.message, 'error');
   }
