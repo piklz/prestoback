@@ -995,8 +995,15 @@ select.fi{cursor:pointer}
           <div class="fg"><label class="fl">Remote base directory / key prefix (optional)</label><input class="fi" id="rt-s3-basedir" placeholder="presto"></div>
         </div>
         <div id="rt-prestoback-field" style="display:none">
-          <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">Pairing is its own flow, not a form — each pairing code is single-use and expires quickly, so there's nothing to save here until you actually complete a pairing. On the OTHER instance (the one that will receive your backups), open its Remote Backup page and click "Generate pairing code", then bring that code here.</div></div>
-          <button class="btn btn-p btn-sm" onclick="openPairPrestoBackModal()">🔗 Pair with a PrestoBack instance</button>
+          <div id="rt-prestoback-add">
+            <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">Pairing is its own flow, not a form — each pairing code is single-use and expires quickly, so there's nothing to save here until you actually complete a pairing. On the OTHER instance (the one that will receive your backups), open its Remote Backup page and click "Generate pairing code", then bring that code here.</div></div>
+            <button class="btn btn-p btn-sm" onclick="openPairPrestoBackModal()">🔗 Pair with a PrestoBack instance</button>
+          </div>
+          <div id="rt-prestoback-edit">
+            <div class="fg"><label class="fl">URL</label><input class="fi" id="rt-prestoback-url" placeholder="http://192.168.1.101:8778"></div>
+            <div class="fh" style="margin:-4px 0 10px">Update this if its IP/hostname changed. The pinned identity below is what actually keeps this pairing MITM-resistant — it's fixed and can't be edited here; re-pair from scratch if it needs to change.</div>
+            <div class="fg"><label class="fl">Pinned Node ID (read-only)</label><input class="fi" id="rt-prestoback-pinned-id" readonly style="font-family:var(--mono);font-size:11px;color:var(--txt3);cursor:not-allowed"></div>
+          </div>
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center" id="rt-normal-actions">
           <button class="btn btn-g btn-sm" onclick="testRemoteTargetDraft()">Test connection</button>
@@ -4678,7 +4685,7 @@ function renderRemoteTargets() {
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn btn-g btn-sm" onclick="testExistingRemoteTarget(${i})">Test</button>
         ${t.kind === 'prestoback' ? `
-        <button class="btn btn-g btn-sm" onclick="editPrestoBackTarget(${i})">Edit</button>` : `
+        <button class="btn btn-g btn-sm" onclick="editRemoteTarget(${i})">Edit</button>` : `
         <button class="btn btn-g btn-sm" onclick="editRemoteTarget(${i})">Edit</button>
         <button class="btn btn-g btn-sm" onclick="duplicateRemoteTarget(${i})">Duplicate</button>`}
         <button class="btn btn-d btn-sm btn-ic" onclick="removeRemoteTarget(${i})">🗑</button>
@@ -4690,14 +4697,22 @@ function renderRemoteTargets() {
 
 function onRtKindChange() {
   const kind = document.getElementById('rt-kind').value;
+  const editingPrestoback = kind === 'prestoback' && S_rtEditIndex !== null;
   document.getElementById('rt-mount-field').style.display = kind === 'mount' ? '' : 'none';
   document.getElementById('rt-sftp-field').style.display = kind === 'sftp' ? '' : 'none';
   document.getElementById('rt-s3-field').style.display = kind === 's3' ? '' : 'none';
   document.getElementById('rt-prestoback-field').style.display = kind === 'prestoback' ? '' : 'none';
-  document.getElementById('rt-normal-actions').style.display = kind === 'prestoback' ? 'none' : 'flex';
+  document.getElementById('rt-prestoback-add').style.display = editingPrestoback ? 'none' : '';
+  document.getElementById('rt-prestoback-edit').style.display = editingPrestoback ? '' : 'none';
+  document.getElementById('rt-normal-actions').style.display = (kind === 'prestoback' && !editingPrestoback) ? 'none' : 'flex';
+  // Test connection doesn't apply to a prestoback edit — reachability for
+  // that kind is the challenge handshake (Test button on its row), not a
+  // draft-form connection probe like the other kinds have.
+  const testBtn = document.querySelector('#rt-normal-actions button[onclick="testRemoteTargetDraft()"]');
+  if (testBtn) testBtn.style.display = editingPrestoback ? 'none' : '';
 }
 
-const RT_FIELD_IDS = ['rt-name','rt-mount-path','rt-sftp-host','rt-sftp-port','rt-sftp-user','rt-sftp-password','rt-sftp-keypath','rt-sftp-keypass','rt-sftp-knownhosts','rt-sftp-basedir','rt-s3-endpoint','rt-s3-bucket','rt-s3-accesskey','rt-s3-secretkey','rt-s3-region','rt-s3-basedir'];
+const RT_FIELD_IDS = ['rt-name','rt-mount-path','rt-sftp-host','rt-sftp-port','rt-sftp-user','rt-sftp-password','rt-sftp-keypath','rt-sftp-keypass','rt-sftp-knownhosts','rt-sftp-basedir','rt-s3-endpoint','rt-s3-bucket','rt-s3-accesskey','rt-s3-secretkey','rt-s3-region','rt-s3-basedir','rt-prestoback-url','rt-prestoback-pinned-id'];
 
 function draftRemoteTarget() {
   const kind = document.getElementById('rt-kind').value;
@@ -4720,6 +4735,21 @@ function draftRemoteTarget() {
     t.s3_secret_key = gv('rt-s3-secretkey');
     t.s3_region = gv('rt-s3-region');
     t.s3_base_dir = gv('rt-s3-basedir');
+  } else if (kind === 'prestoback') {
+    // Editing an existing pairing only ever changes the URL — the
+    // pinned NodeID/public key and push credential are the actual
+    // security anchor, established once during the handshake, and can't
+    // be reconstructed from this form. They're carried forward untouched
+    // from the target being edited (this branch is only ever reached in
+    // edit mode — see remoteTargetIsComplete/onRtKindChange, adding a new
+    // prestoback target always goes through the pairing modal instead).
+    t.prestoback_url = gv('rt-prestoback-url');
+    const orig = S_rtEditIndex !== null ? S_remoteTargets[S_rtEditIndex] : null;
+    if (orig) {
+      t.prestoback_pinned_node_id = orig.prestoback_pinned_node_id;
+      t.prestoback_pinned_public_key = orig.prestoback_pinned_public_key;
+      t.prestoback_push_credential = orig.prestoback_push_credential;
+    }
   }
   // Editing an existing (already-saved) target: a blank secret field means
   // "leave it as-is", not "clear it" — carry the original's *_is_set flag
@@ -4754,6 +4784,7 @@ function remoteTargetIsComplete(t) {
   if (t.kind === 'mount') return !!t.mount_path;
   if (t.kind === 'sftp') return !!(t.sftp_host && t.sftp_user && (t.sftp_password || t.sftp_password_is_set || t.sftp_private_key_path));
   if (t.kind === 's3') return !!(t.s3_endpoint && t.s3_bucket && t.s3_access_key && (t.s3_secret_key || t.s3_secret_key_is_set));
+  if (t.kind === 'prestoback') return !!(t.prestoback_url && t.prestoback_pinned_node_id);
   return false;
 }
 
@@ -4859,6 +4890,9 @@ function populateRtForm(t, { forDuplicate } = {}) {
     document.getElementById('rt-s3-secretkey').placeholder = (!forDuplicate && t.s3_secret_key_is_set) ? '•••••••• (unchanged — leave blank to keep)' : '';
     document.getElementById('rt-s3-region').value = t.s3_region || '';
     document.getElementById('rt-s3-basedir').value = t.s3_base_dir || '';
+  } else if (t.kind === 'prestoback') {
+    document.getElementById('rt-prestoback-url').value = t.prestoback_url || '';
+    document.getElementById('rt-prestoback-pinned-id').value = t.prestoback_pinned_node_id || '';
   }
   document.getElementById('rt-test-result').textContent = '';
 }
@@ -4938,43 +4972,6 @@ function saveRtForm() {
   setRtDirty(true);
   resetRtForm();
   renderRemoteTargets();
-}
-
-async function editPrestoBackTarget(i) {
-  const t = S_remoteTargets[i];
-  const nextName = prompt('Name for this paired instance:', t.name);
-  if (nextName === null) return; // cancelled
-  const trimmedName = nextName.trim();
-  if (!trimmedName) { toast('Name cannot be empty', 'error'); return; }
-
-  // URL is the only other editable field — the pinned NodeID and push
-  // credential established during pairing are the actual security
-  // anchor and are deliberately NOT editable here (changing those means
-  // it's a different instance, which needs a real re-pair, not an edit).
-  // Re-verified via the challenge handshake on every push regardless, so
-  // updating just where to reach it doesn't weaken anything: a wrong or
-  // stale URL just fails to connect, it can't silently connect to an
-  // impostor.
-  const nextURL = prompt('URL to reach it at (update this if its IP/hostname changed):', t.prestoback_url || '');
-  if (nextURL === null) return;
-  const trimmedURL = nextURL.trim();
-  if (!trimmedURL) { toast('URL cannot be empty', 'error'); return; }
-
-  const prev = {name: t.name, url: t.prestoback_url};
-  t.name = trimmedName;
-  t.prestoback_url = trimmedURL;
-  renderRemoteTargets();
-  try {
-    const enabled = document.getElementById('tog-remote').classList.contains('on');
-    const r = await api('/api/remote', {method:'PUT', body: JSON.stringify({enabled, targets: S_remoteTargets})});
-    S_remoteTargets = r.targets || S_remoteTargets;
-    renderRemoteTargets();
-    toast('Updated — test the connection to confirm it can still reach it', 'success');
-  } catch(e) {
-    t.name = prev.name; t.prestoback_url = prev.url; // roll back on failure
-    renderRemoteTargets();
-    toast(e.message, 'error');
-  }
 }
 
 function removeRemoteTarget(i) {
@@ -5764,9 +5761,6 @@ async function waitForServerBackOnline(autoReload) {
         ]);
       }
       return;
-    }
-    if (proven && !pastFloor) {
-      showUpdateStatusBanner(`PrestoBack is back — waiting a few more seconds to be safe (${Math.ceil((minFloorMs-elapsed)/1000)}s)…`);
     }
     await new Promise(r => setTimeout(r, healthCheckSpacingMs));
   }
