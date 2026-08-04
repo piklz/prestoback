@@ -175,6 +175,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/container-health", s.authJWT(s.handleContainerHealth))
 	s.mux.HandleFunc("/api/container-control", s.authJWT(s.handleContainerControl))
 	s.mux.HandleFunc("/api/containers/lifecycle", s.adminForWrites(s.handleContainerControlLifecycle))
+	s.mux.HandleFunc("/api/containers/update", s.adminForWrites(s.handleContainerQuickUpdate)) // pull+recreate one container by name, no registered app required — see its doc comment
 	s.mux.HandleFunc("/api/history", s.authJWT(s.handleHistory))
 	s.mux.HandleFunc("/api/apikey", s.authJWT(s.handleAPIKey)) // masked fingerprint only, never the live key
 	s.mux.HandleFunc("/api/pairing/status", s.authJWT(s.handlePairingStatus))
@@ -1555,6 +1556,151 @@ func (s *Server) handleContainerControlLifecycle(w http.ResponseWriter, r *http.
 		"duration_ms":  dur.Milliseconds(),
 		"self_skipped": selfSkipped,
 	})
+}
+
+// POST /api/containers/update — pull + recreate ONE container directly by
+// name, with no config.AppConfig behind it at all. This is Container
+// Control's counterpart to the registered-app update paths
+// (runContainerUpdates/handleUpdateBatch/Telegram's update:<id>): those all
+// resolve an AppID via s.cfg.GetApp or s.cfg.ListApps, which by definition
+// can't find a container that was never added as a PrestoBack app (see
+// AppUpdateReport.Unmanaged's doc comment in updatecheck.go). Rather than
+// leave those containers permanently update-only-by-hand, this gives them a
+// real path — but a narrower one than the app-registry paths: no
+// pre-update backup, no app-level batch grouping, and PrestoBack's own
+// container is refused here the same way handleContainerControlLifecycle
+// refuses it for stop/pause, since self-updates already go through their
+// own detached-helper-container flow (SelfUpdate/handleUpdateApply).
+//
+// backup.UpdateContainer — the same function every registered-app update
+// eventually calls — only ever needed a ContainerInfo + the global compose
+// file path, never anything app-specific, which is exactly what makes this
+// safe to offer for a container with no app behind it.
+func (s *Server) handleContainerQuickUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Name) == "" {
+		errOut(w, 400, "invalid request body — expected {name: \"...\"}")
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+
+	selfName := strings.TrimPrefix(strings.TrimSpace(s.selfName), "/")
+	if selfName != "" && strings.EqualFold(strings.TrimPrefix(name, "/"), selfName) {
+		errOut(w, 400, "PrestoBack's own container updates through Settings → Updates, not this endpoint")
+		return
+	}
+
+	s.stateMu.Lock()
+	busy := s.updateRunning
+	s.stateMu.Unlock()
+	if busy {
+		errOut(w, 409, "an update or stack operation is already in progress — please wait for it to finish first")
+		return
+	}
+	if ok, errMsg := backup.DockerReachable(); !ok {
+		errOut(w, 503, "Docker isn't reachable right now (daemon may be restarting): "+errMsg)
+		return
+	}
+
+	containers := backup.DedupeContainers(backup.ContainersByName([]string{name}))
+	if len(containers) == 0 {
+		errOut(w, 404, "container not found (or not currently running): "+name)
+		return
+	}
+	target := containers[0]
+
+	nc := s.cfg.GetNotify()
+	tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
+	respond(w, 202, map[string]string{"status": "update started", "container": target.Name})
+	go s.runQuickContainerUpdate(tgCfg, target)
+}
+
+// runQuickContainerUpdate is handleContainerQuickUpdate's background
+// worker — the single-container, no-AppConfig counterpart to
+// runContainerUpdates/runContainerUpdatesLocked. It shares the same
+// s.updateMu/s.updateRunning lock (see that field's doc comment on the
+// Server struct) so this can never race a registered-app update or a
+// stack operation through recreate at the same time, and streams progress
+// to the live-log panel keyed by the container's own name — there's no
+// app ID to key it by here.
+func (s *Server) runQuickContainerUpdate(tgCfg notify.TelegramConfig, c backup.ContainerInfo) {
+	s.stateMu.Lock()
+	if s.updateRunning {
+		s.stateMu.Unlock()
+		_ = notify.SendRaw(tgCfg, "⏳ An update is already in progress — please wait for it to finish before starting another\\.")
+		return
+	}
+	s.updateRunning = true
+	s.stateMu.Unlock()
+
+	s.updateMu.Lock()
+	defer func() {
+		s.updateMu.Unlock()
+		s.stateMu.Lock()
+		s.updateRunning = false
+		s.stateMu.Unlock()
+	}()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[update] PANIC in runQuickContainerUpdate: %v", r)
+			_ = notify.SendRaw(tgCfg, "❌ Internal error during update — check container logs\\.")
+		}
+	}()
+
+	name := c.Name
+	emit := func(msg string) {
+		log.Printf("[update:%s] %s", name, msg)
+		s.engine.EmitLog(name, msg)
+	}
+	emit(fmt.Sprintf("━━━ Update started: %s (not tracked as a PrestoBack app) ━━━", name))
+
+	start := time.Now()
+	type res struct{ r backup.ContainerUpdate }
+	ch := make(chan res, 1)
+	go func() { ch <- res{r: backup.UpdateContainer(c, s.cfg.ComposeFile, emit)} }()
+
+	// Same watchdog sizing as runContainerUpdatesLocked — see its comment
+	// on why this has to agree with UpdateContainer's own internal timeout.
+	watchdog := backup.ContainerPullTimeout(c) + 5*time.Minute
+	var result backup.ContainerUpdate
+	var timedOut bool
+	select {
+	case r := <-ch:
+		result = r.r
+	case <-time.After(watchdog):
+		timedOut = true
+		emit(fmt.Sprintf("✗ %s timed out (no response after %s)", name, formatDuration(watchdog)))
+	}
+	dur := time.Since(start)
+	emit(fmt.Sprintf("━━━ Update finished: %s (%s) ━━━", name, formatDuration(dur)))
+
+	var msg string
+	switch {
+	case timedOut:
+		msg = fmt.Sprintf("❌ `%s` — timed out \\(no response after %s\\)", notify.EscapeMD(name), notify.EscapeMD(formatDuration(watchdog)))
+	case result.Rolled:
+		msg = fmt.Sprintf("⚠️ `%s` — new container failed health check, rolled back", notify.EscapeMD(name))
+	case result.Err != "":
+		errMsg := result.Err
+		if len(errMsg) > 300 {
+			errMsg = errMsg[:300] + "…"
+		}
+		msg = fmt.Sprintf("❌ `%s` — %s", notify.EscapeMD(name), notify.EscapeMD(errMsg))
+	case result.AlreadyUpToDate:
+		msg = fmt.Sprintf("✔ `%s` — already up to date", notify.EscapeMD(name))
+	case result.Restarted:
+		msg = fmt.Sprintf("✅ `%s` — pulled \\+ recreated _%s_ \\(not tracked as a PrestoBack app\\)",
+			notify.EscapeMD(name), notify.EscapeMD(formatDuration(dur)))
+	default:
+		msg = fmt.Sprintf("❓ `%s` — unknown result", notify.EscapeMD(name))
+	}
+	_ = notify.SendRaw(tgCfg, msg)
 }
 
 func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
