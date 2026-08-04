@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"reflect"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -630,11 +631,62 @@ func mergeRemoteSecrets(incoming, existing []config.RemoteTarget) []config.Remot
 // handleRemote is the off-box push destinations settings endpoint. See
 // RemoteTargetView above for why GET/PUT redact SFTPPassword,
 // SFTPPrivateKeyPass, and S3SecretKey rather than echoing them back.
+// summarizeRemoteTargetChange builds a short, human-readable summary of what
+// changed between two target lists, for the notification sent after a save
+// (see handleRemote's PUT case). Matched by Name — the same identity the UI
+// itself treats as "this target" (row labels, edit-by-name lookups) — so a
+// renamed target shows as one remove+one add rather than confusingly as
+// neither. Content changes on an unrenamed target (a new URL, a rotated
+// key) are caught via a full struct comparison, not just presence.
+func summarizeRemoteTargetChange(oldTargets, newTargets []config.RemoteTarget) string {
+	oldByName := make(map[string]config.RemoteTarget, len(oldTargets))
+	for _, t := range oldTargets {
+		oldByName[t.Name] = t
+	}
+	newByName := make(map[string]config.RemoteTarget, len(newTargets))
+	for _, t := range newTargets {
+		newByName[t.Name] = t
+	}
+
+	var added, removed, edited []string
+	for name, nt := range newByName {
+		if ot, existed := oldByName[name]; !existed {
+			added = append(added, name)
+		} else if !reflect.DeepEqual(ot, nt) {
+			edited = append(edited, name)
+		}
+	}
+	for name := range oldByName {
+		if _, stillThere := newByName[name]; !stillThere {
+			removed = append(removed, name)
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(removed)
+	sort.Strings(edited)
+
+	var parts []string
+	if len(added) > 0 {
+		parts = append(parts, "added "+strings.Join(added, ", "))
+	}
+	if len(removed) > 0 {
+		parts = append(parts, "removed "+strings.Join(removed, ", "))
+	}
+	if len(edited) > 0 {
+		parts = append(parts, "edited "+strings.Join(edited, ", "))
+	}
+	if len(parts) == 0 {
+		return "Remote backup settings saved (no target changes — enabled/disabled toggle only)"
+	}
+	return strings.Join(parts, "; ")
+}
+
 func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		respond(w, 200, redactRemoteConfig(s.cfg.GetRemote()))
 	case http.MethodPut:
+		oldTargets := s.cfg.GetRemote().Targets
 		var rc config.RemoteConfig
 		if err := parseJSON(r, &rc); err != nil {
 			errOut(w, 400, err.Error())
@@ -689,6 +741,7 @@ func (s *Server) handleRemote(w http.ResponseWriter, r *http.Request) {
 			errOut(w, 500, "saved in memory but failed to write to disk — try again, and if this keeps happening check disk space/permissions on the data directory: "+err.Error())
 			return
 		}
+		s.dispatchNotify(notify.Event{Kind: "remote_config_changed", Detail: summarizeRemoteTargetChange(oldTargets, rc.Targets)})
 		respond(w, 200, redactRemoteConfig(rc))
 	default:
 		errOut(w, 405, "method not allowed")

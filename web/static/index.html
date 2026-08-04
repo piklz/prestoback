@@ -53,6 +53,8 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .remote-stats-strip{display:flex;gap:10px;flex-wrap:wrap;margin:0 36px 18px}
 .remote-stat{display:flex;align-items:center;gap:8px;padding:10px 16px;background:var(--bg3);border:1px solid var(--line);border-radius:var(--r);font-size:12.5px;color:var(--txt2)}
 .rt-form-toggle{display:flex;justify-content:space-between;align-items:center;cursor:pointer;user-select:none;padding:10px 14px;background:var(--bg3);border:1px solid var(--line);border-radius:var(--r);transition:border-color .15s}
+@keyframes rt-save-pulse{0%,100%{box-shadow:0 0 0 0 rgba(224,160,48,.5)}50%{box-shadow:0 0 0 6px rgba(224,160,48,0)}}
+.rt-save-dirty{animation:rt-save-pulse 1.6s ease-in-out infinite;border:1px solid #e0a030}
 .rt-form-toggle:hover{border-color:var(--accent)}
 .rt-form-toggle #rt-form-toggle-icon{color:var(--accent);font-size:12px;font-weight:600;padding:3px 10px;border:1px solid var(--accent);border-radius:99px}
 .remote-stat b{color:var(--txt);font-size:15px;font-family:var(--mono)}
@@ -956,7 +958,7 @@ select.fi{cursor:pointer}
       <div id="remote-target-list" style="margin:6px 0 4px"></div>
 
       <div style="display:flex;align-items:center;gap:12px;margin:14px 0;flex-wrap:wrap">
-        <button class="btn btn-p" onclick="saveRemote()">Save remote backup settings</button>
+        <button class="btn btn-p" id="rt-save-btn" onclick="saveRemote()">Save remote backup settings</button>
         <span class="fh" id="rt-dirty-note" style="display:none;color:#e0a030">● Unsaved changes — click Save to persist them</span>
       </div>
 
@@ -2232,6 +2234,16 @@ async function refreshPathStatuses() {
 
 // ════════════════════ Navigation ════════════════════
 function V(name) {
+  // Leaving the Remote Backup page with unsaved target changes — the
+  // existing beforeunload guard (setRtDirty) only fires on a real browser
+  // navigation (refresh, close tab, typed URL); switching tabs within this
+  // SPA never triggers it at all, so without this check a stray click on
+  // "Dashboard" silently discards an in-progress edit with no warning.
+  const leavingRemoteDirty = name !== 'remote' && S_rtDirty
+    && !document.getElementById('view-remote').classList.contains('view-hidden');
+  if (leavingRemoteDirty && !confirm('You have unsaved remote backup changes. Leave without saving?')) {
+    return;
+  }
   VIEWS.forEach(v => {
     document.getElementById('view-'+v).classList.toggle('view-hidden', v!==name);
     document.getElementById('nav-'+v)?.classList.toggle('active', v===name);
@@ -4587,6 +4599,8 @@ function setRtDirty(v) {
   S_rtDirty = v;
   const note = document.getElementById('rt-dirty-note');
   if (note) note.style.display = v ? '' : 'none';
+  const saveBtn = document.getElementById('rt-save-btn');
+  if (saveBtn) saveBtn.classList.toggle('rt-save-dirty', v);
   // Scoped beforeunload guard — only active while there's actually
   // something unsaved, and removed the moment it's saved or reloaded, so
   // it never interferes with navigation the rest of the app relies on.
@@ -4673,11 +4687,15 @@ function renderRemoteTargets() {
         </div>
         <div style="margin-top:4px;color:var(--txt3)">Pinned verification key — confirm this matches the receiver's own NodeID before trusting a re-pair.</div>
       </div>` : '';
+    const kindColor = RT_KIND_COLORS[t.kind] || 'var(--accent)';
+    const editingStyle = i===S_rtEditIndex
+      ? 'outline:1px solid var(--accent);background:rgba(90,140,255,.08);border-radius:8px'
+      : '';
     return `
-    <div class="bi" style="${i===S_rtEditIndex?'outline:1px solid var(--accent);border-radius:8px':''}">
-      <div class="bic"><svg width="14" height="14" fill="none" stroke="var(--accent)" stroke-width="1.8" viewBox="0 0 24 24"><path d="M20 16.58A5 5 0 0018 7h-1.26A8 8 0 104 15.25"/></svg></div>
+    <div class="bi" style="${editingStyle}">
+      <div class="bic" style="border-color:${kindColor}"><svg width="14" height="14" fill="none" stroke="${kindColor}" stroke-width="1.8" viewBox="0 0 24 24"><path d="M20 16.58A5 5 0 0018 7h-1.26A8 8 0 104 15.25"/></svg></div>
       <div class="bm">
-        <div class="bid">${esc(t.name)} <span class="pill pb" style="font-size:9px">${esc(t.kind)}</span>${i===S_rtEditIndex?' <span class="pill" style="font-size:9px">editing</span>':''}${statusPill}</div>
+        <div class="bid">${esc(t.name)} <span class="pill pb" style="font-size:9px">${esc(t.kind)}</span>${i===S_rtEditIndex?' <span class="pill" style="font-size:9px;background:var(--accent);color:#fff">✎ editing this one</span>':''}${statusPill}</div>
         <div class="bif">${esc(remoteTargetSummary(t))}${t.kind==='prestoback'?` · <a href="#" onclick="toggleRtInspect(${i});return false" style="color:var(--accent);text-decoration:none">${S_rtInspectOpen===i?'hide key':'verify key'}</a>`:''}</div>
         <div class="fh" id="rt-row-result-${i}" style="margin:2px 0 0"></div>
         ${inspectRow}
@@ -4931,8 +4949,24 @@ function editRemoteTarget(i) {
   document.getElementById('rt-submit-btn').textContent = 'Update target';
   document.getElementById('rt-cancel-btn').style.display = '';
   setRtFormExpanded(true);
+  setRtFormAccent(S_remoteTargets[i].kind);
   renderRemoteTargets();
   document.getElementById('rt-form-title').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+// setRtFormAccent colors the form body's left border to match the row
+// being edited (same kindColors map renderRemoteTargets uses) — a strong,
+// hard-to-miss visual tie between "this row" and "this form", since the
+// form itself is shared across every kind and previously gave no signal
+// beyond a small text title about which target you were actually about
+// to change.
+const RT_KIND_COLORS = {mount:'#4a9eff', sftp:'#9b6bff', s3:'#e0a030', prestoback:'#4ade80'};
+function setRtFormAccent(kind) {
+  const body = document.getElementById('rt-form-body');
+  if (!body) return;
+  const color = kind ? (RT_KIND_COLORS[kind] || 'var(--accent)') : 'transparent';
+  body.style.borderLeft = kind ? `3px solid ${color}` : 'none';
+  body.style.paddingLeft = kind ? '14px' : '0';
 }
 
 function duplicateRemoteTarget(i) {
@@ -5692,8 +5726,23 @@ async function applyUpdate() {
   const autoReload = document.getElementById('upd-auto-reload').checked;
   S_updateInProgress = true;
   S_loggedUpdateDisconnect = false;
+  focusLiveActivity();
   addLog('_system','⬆ Self-update initiated — container will restart…','info');
-  showUpdateStatusBanner('Updating PrestoBack — this takes about 15–20 seconds…');
+  showUpdateStatusBanner('Updating PrestoBack — this can take a minute or two (image pull + container recreate)…');
+
+  // Capture the version actually running right now, before triggering
+  // anything — this is the real completion signal waitForServerBackOnline
+  // uses below: healthz responding again only proves SOME container is
+  // listening on the port, which can be misleadingly quick to satisfy
+  // during a container recreate (the old one can still be answering, or a
+  // brief handoff gap can look "up" without being the new image yet). A
+  // version string that's actually different is proof the new image is
+  // genuinely running, not just that something is.
+  let preUpdateVersion = null;
+  try {
+    const h = await fetch('/healthz', {cache:'no-store'}).then(r => r.json());
+    preUpdateVersion = h.version || null;
+  } catch {} // fine if this fails — waitForServerBackOnline falls back to the healthy-streak proof instead
 
   try { await api('/api/update/apply',{method:'POST'}); }
   catch(e) {
@@ -5706,7 +5755,7 @@ async function applyUpdate() {
       return;
     }
   }
-  waitForServerBackOnline(autoReload);
+  waitForServerBackOnline(autoReload, preUpdateVersion);
 }
 
 // Polls the (unauthenticated, always-public) health endpoint until the
@@ -5717,37 +5766,47 @@ async function applyUpdate() {
 // to be the only visible sign anything was happening (see
 // connectSSE/addLog's S_updateInProgress check below for the other half
 // of that cleanup).
-async function waitForServerBackOnline(autoReload) {
+async function waitForServerBackOnline(autoReload, preUpdateVersion) {
   const start = Date.now();
-  const maxWaitMs = 90000;
+  const maxWaitMs = 180000; // image pull + container recreate can genuinely take a couple minutes, not seconds
   // Minimum floor before ANY reload, regardless of how fast the server
-  // answers /healthz — a bare 200 there only proves the Go process is
-  // listening again, not that everything downstream of it (a reverse
-  // proxy's backend pool, DNS, whatever sits between the browser and this
-  // container) has caught up. Reloading 700ms after the first healthz
-  // success was too optimistic in practice. SSE reconnecting (see
-  // connectSSE's onopen) is a stronger signal — it proves the full
-  // authenticated app stack is answering, not just that a socket is
-  // open — so it's allowed to shortcut the floor once it's fired, but the
-  // floor still applies if only healthz (not SSE) has confirmed so far.
-  const minFloorMs = 15000;
-  const requiredConsecutiveHealthy = 2;
+  // answers /healthz — a bare 200 there only proves SOME process is
+  // listening on the port, not that it's the NEW container (a container
+  // recreate can have a brief handoff gap, or in some setups the old one
+  // keeps answering right up until it's actually replaced) or that
+  // everything downstream (a reverse proxy's backend pool, DNS) has
+  // caught up. The real proof is a version string that's actually
+  // different from what was running before — see preUpdateVersion below —
+  // so the floor here is a fallback safety margin, not the primary check.
+  const minFloorMs = 20000;
+  // Fallback for when a version comparison isn't possible/meaningful (a
+  // dev build re-tagging the same version, or preUpdateVersion failed to
+  // capture) — require a longer sustained-healthy streak than a version
+  // check would need, since this is the weaker signal of the two.
+  const requiredConsecutiveHealthyFallback = 4;
   const healthCheckSpacingMs = 2000;
 
   S_sseReconnectedSinceUpdate = false;
   await new Promise(r => setTimeout(r, 8000)); // the container needs a few seconds to actually stop before it can come back
 
   let consecutiveHealthy = 0;
+  let versionConfirmed = false;
   while (Date.now() - start < maxWaitMs) {
     let healthy = false;
     try {
       const r = await fetch('/healthz', {cache:'no-store'});
-      healthy = r.ok;
+      if (r.ok) {
+        healthy = true;
+        const data = await r.json().catch(() => null);
+        if (preUpdateVersion && data && data.version && data.version !== preUpdateVersion) {
+          versionConfirmed = true;
+        }
+      }
     } catch {} // still restarting — expected, keep polling
     consecutiveHealthy = healthy ? consecutiveHealthy + 1 : 0;
 
     const elapsed = Date.now() - start;
-    const proven = consecutiveHealthy >= requiredConsecutiveHealthy || S_sseReconnectedSinceUpdate;
+    const proven = versionConfirmed || S_sseReconnectedSinceUpdate || consecutiveHealthy >= requiredConsecutiveHealthyFallback;
     const pastFloor = elapsed >= minFloorMs;
 
     if (proven && pastFloor) {

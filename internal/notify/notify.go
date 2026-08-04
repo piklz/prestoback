@@ -51,6 +51,8 @@ func (e Event) Title() string {
 		return "Pulled archive from remote"
 	case "pull_fail":
 		return "Pull from remote failed"
+	case "remote_config_changed":
+		return "⚙️ Remote backup settings changed"
 	case "remote_receive_success":
 		return "Received backup from paired instance"
 	case "remote_receive_fail":
