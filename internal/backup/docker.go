@@ -238,6 +238,44 @@ func dockerPsSnapshot() ([]psEntry, error) {
 	return entries, nil
 }
 
+// RunningContainers returns every currently-running container on the host,
+// via one `docker ps -a` snapshot filtered down to State=="running".
+//
+// Unlike FindContainers/ownedContainers (which only ever look at containers
+// belonging to a registered config.AppConfig), this has no notion of "apps"
+// at all — it's the same raw view `docker ps` itself gives you. It exists
+// specifically for updatecheck.go's host-wide scan: a container that's
+// running but was never added as a PrestoBack app (e.g. a dashboard with
+// nothing worth backing up) is invisible to FindContainers/ownedContainers
+// by construction, so a caller that wants "every image on this host that
+// might need updating" — matching what a dedicated update-checker like
+// Docksentry reports, since it has no backup-app concept to filter through —
+// has to ask Docker directly instead of going via the app registry.
+//
+// Stopped/exited containers are deliberately excluded here (unlike the
+// registered-app update-check path, which checks stopped containers too —
+// see checkForUpdates' comment on why that's safe/desired there). For an
+// *unregistered* container there's no app entry recording "this is
+// intentionally stopped right now" the way a registered app's config does,
+// so silently surfacing update noise for e.g. a container someone stopped
+// on purpose months ago would be worse than just not reporting it until
+// it's running again.
+func RunningContainers() []ContainerInfo {
+	snapshot, err := dockerPsSnapshot()
+	if err != nil {
+		log.Printf("[docker] ps -a failed while listing running containers: %v", err)
+		return nil
+	}
+	var out []ContainerInfo
+	for _, e := range snapshot {
+		if e.State != "running" {
+			continue
+		}
+		out = append(out, ContainerInfo{ID: e.ID, Name: e.Name, Status: e.State, RawStatus: e.Status})
+	}
+	return out
+}
+
 // FindContainers returns ALL containers (running or stopped) that look like
 // they belong to the given appID. We try several strategies so that
 // standard docker-compose naming (presto-plex-1, presto_plex_1, plex, etc.)

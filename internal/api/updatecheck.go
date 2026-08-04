@@ -61,6 +61,17 @@ type AppUpdateReport struct {
 	// group: a batch action should only touch what the user was just
 	// shown, never silently reach into a sibling with nothing pending.
 	BatchSize int `json:"batch_size"`
+	// Unmanaged is true for a container discovered by the host-wide
+	// RunningContainers() scan (see checkForUpdates) that isn't backed by
+	// any registered config.AppConfig — e.g. a container running on the
+	// host that was never added as a PrestoBack app. It's still checked
+	// and reported on for parity with a dedicated update-checker like
+	// Docksentry, which has no "registered app" concept to filter
+	// through — but buildUpdateReportMessage must not offer an "Update"
+	// action button for it: the Telegram "update:<id>" callback resolves
+	// AppID via s.cfg.GetApp, which only knows about real AppConfig
+	// entries, so a button here would silently do nothing when tapped.
+	Unmanaged bool `json:"unmanaged,omitempty"`
 }
 
 // ownedContainers assigns each running container discoverable from apps to
@@ -190,12 +201,70 @@ func (s *Server) checkForUpdates(notifyUser bool) ([]AppUpdateReport, bool) {
 		}
 	}
 
+	// ── Host-wide scan: containers that aren't backed by any registered
+	// app ──────────────────────────────────────────────────────────────────
+	//
+	// Everything above only ever looks at containers reachable from
+	// s.cfg.ListApps() (via ownedContainers). A container running on the
+	// host that was never added as a PrestoBack app — e.g. a dashboard or
+	// utility container nobody bothered to set up backups for — is
+	// invisible to that path by construction, which meant it silently
+	// never appeared in /check even though a dedicated update-checker
+	// like Docksentry (no "registered app" concept, just `docker ps`)
+	// would report it. RunningContainers() plus a diff against ownedIDs
+	// closes that gap: every currently-running container not already
+	// claimed by an app gets checked and reported the same way, just
+	// flagged Unmanaged so no "Update" button is offered for it (see
+	// AppUpdateReport.Unmanaged's doc comment for why).
+	ownedIDs := map[string]bool{}
+	for _, cs := range owned {
+		for _, c := range cs {
+			ownedIDs[c.ID] = true
+		}
+	}
+	for _, c := range backup.RunningContainers() {
+		if ownedIDs[c.ID] {
+			continue
+		}
+		anchor := c.Name
+		if a, ok := containerAnchor[c.Name]; ok {
+			anchor = a
+		}
+		meta := backup.CheckImageMeta(c, true, cache)
+		if meta.Err == "" && !meta.UpdateAvailable {
+			continue // up to date — omitted from the report, same as any other image
+		}
+		if meta.Err != "" {
+			log.Printf("[updatecheck] (unmanaged) %s: %s", c.Name, meta.Err)
+		}
+		reports = append(reports, AppUpdateReport{
+			AppID:       "container:" + c.Name,
+			AppName:     c.Name,
+			Images:      []backup.ImageMeta{meta},
+			BatchAnchor: anchor,
+			Unmanaged:   true,
+		})
+		if meta.UpdateAvailable {
+			pending = append(pending, c.Name)
+		}
+	}
+
 	// BatchSize: how many reports share the same anchor — see its doc
 	// comment on AppUpdateReport for why this is scoped to reports
 	// (apps with an actual pending update) rather than every app in the
-	// compose group.
+	// compose group. Unmanaged reports are excluded from the count itself
+	// (though they remain in `reports` and are still displayed): they have
+	// no config.AppConfig, so handleUpdateBatch's s.cfg.GetApp(rep.AppID)
+	// silently drops them from `targets` without adding them to `skipped`
+	// either — counting them here would inflate a registered sibling's
+	// "Update batch (N)" button beyond what the batch action actually
+	// updates, with no accounting for the gap the way a pinned member gets
+	// (skipped_pinned).
 	batchCounts := map[string]int{}
 	for _, r := range reports {
+		if r.Unmanaged {
+			continue
+		}
 		batchCounts[r.BatchAnchor]++
 	}
 	for i := range reports {
@@ -304,6 +373,8 @@ func buildUpdateReportDiscordMessage(reports []AppUpdateReport) (title, descript
 		name := r.AppName
 		if r.Pinned {
 			name = "🔒 " + name
+		} else if r.Unmanaged {
+			name = "🧩 " + name
 		}
 		sb.WriteString(fmt.Sprintf("**%s**\n", name))
 		for _, img := range r.Images {
@@ -340,6 +411,8 @@ func buildUpdateReportDiscordMessage(reports []AppUpdateReport) (title, descript
 		}
 		if r.Pinned {
 			sb.WriteString("   _pinned — update manually, no Auto-Update button offered_\n")
+		} else if r.Unmanaged {
+			sb.WriteString("   _not tracked as a PrestoBack app — add it under Applications for one-tap update_\n")
 		}
 		sb.WriteString("\n")
 	}
@@ -394,6 +467,8 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 		name := notify.EscapeMD(r.AppName)
 		if r.Pinned {
 			name = "🔒 " + name
+		} else if r.Unmanaged {
+			name = "🧩 " + name
 		}
 		sb.WriteString(fmt.Sprintf("*%s*\n", name))
 		for _, img := range r.Images {
@@ -446,6 +521,8 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 		}
 		if r.Pinned {
 			sb.WriteString("   _pinned — update manually, no Auto\\-Update button offered_\n")
+		} else if r.Unmanaged {
+			sb.WriteString("   _not tracked as a PrestoBack app — add it under Applications for one\\-tap update_\n")
 		}
 		sb.WriteString("\n")
 	}
@@ -463,6 +540,13 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 			// doc comment. It's still listed above with a 🔒 marker and the
 			// "pinned" note so the update isn't silently hidden, just not
 			// offered as a one-tap action.
+			continue
+		}
+		if r.Unmanaged {
+			// No per-app button here either — see AppUpdateReport.Unmanaged's
+			// doc comment: this AppID has no backing config.AppConfig, so the
+			// "update:<id>" callback's s.cfg.GetApp lookup would just fail
+			// silently. Listed above with a 🧩 marker instead.
 			continue
 		}
 		updatableCount++
