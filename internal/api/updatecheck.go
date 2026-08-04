@@ -549,6 +549,25 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 			// silently. Listed above with a 🧩 marker instead.
 			continue
 		}
+		// A report can exist purely because one of its images is
+		// pinned-by-digest/skipped (e.g. Immich-postgres, or immich's
+		// immich_redis linked container) with nothing else in the app
+		// actually needing an update — that's what put it in `reports` at
+		// all (updatecheck's len(images) > 0 check counts Skipped/errored
+		// images, not just real ones). r.Pinned/r.Unmanaged don't catch
+		// this case: the app itself is a real, non-pinned config.AppConfig,
+		// it just has no actionable image right now. Offering "Update" here
+		// would try to act on an app with nothing to pull against.
+		hasRealUpdate := false
+		for _, im := range r.Images {
+			if im.UpdateAvailable {
+				hasRealUpdate = true
+				break
+			}
+		}
+		if !hasRealUpdate {
+			continue
+		}
 		updatableCount++
 		btns = append(btns, notify.ButtonAction{Label: "🔄 Update " + r.AppName, Data: "update:" + r.AppID})
 	}

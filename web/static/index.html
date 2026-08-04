@@ -124,6 +124,8 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
    column's width predictable regardless of how long the ref is; the full
    value is still one hover away via the title attribute. */
 .ctrl-image{font-size:10.5px;color:var(--txt3);font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.ctrl-image-wrap{display:flex;flex-direction:column;gap:2px;min-width:0;overflow:hidden}
+.ctrl-current-ver{font-size:9.5px;color:var(--txt3);opacity:.7;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 @media (max-width:860px){
   /* Same data, simpler shape: chevron+name share the top row, everything
      else drops to its own full-width row in a fixed, predictable order
@@ -2525,7 +2527,29 @@ function pollUntilUpdateClears(appName) {
   setTimeout(tick, delays[i++]);
 }
 
-let appsFilter = '';
+// quickUpdateContainer pulls + recreates a single container directly by
+// name — Container Control's path for a container with no app_id (see
+// ctrlUpdateBadge). There's no per-app modal here the way confirmUpdateApp
+// has one: no volumes, no schedule, no batch siblings to show, just the
+// one container/one image every time — so a plain confirm() covers it,
+// with an explicit warning that this skips the backup-first safety net a
+// registered app's update gets.
+async function quickUpdateContainer(name) {
+  const ok = confirm(
+    `Update "${name}" now?\n\nThis container isn't tracked as a PrestoBack app — no backup runs first, and there's no per-app rollback beyond Docker's own health-check-triggered one.\n\nAdd it under Applications first if you'd like backups before updates.`
+  );
+  if (!ok) return;
+  try {
+    const r = await api('/api/containers/update', {method:'POST', body: JSON.stringify({name})});
+    toast(`Update started for ${r.container || name} — see Live activity for progress`, 'success');
+    focusLiveActivity();
+    pollUntilUpdateClears(r.container || name);
+  } catch(e) {
+    toast(e.message, 'error');
+  }
+}
+
+
 function filterApps(q) {
   appsFilter = q.toLowerCase();
   renderApps();
@@ -2801,6 +2825,20 @@ function findImageMetaForContainer(name) {
   return null;
 }
 
+// ctrlImageCell renders the image tag plus, once a check has run and we
+// know it, the currently-running version underneath — e.g. "Current:
+// v4.5.5" under "nicolargo/glances:latest-full". Falls back to the raw
+// tag (current_tag) when the image isn't on a semver-parseable tag, and
+// renders no subline at all until a check has actually populated
+// S.lastUpdateReports (findImageMetaForContainer returns null until
+// then) — nothing to show is better than a stale or made-up version.
+function ctrlImageCell(it) {
+  const im = findImageMetaForContainer(it.name);
+  const ver = im ? (im.current_version || im.current_tag) : null;
+  const verLine = ver ? `<span class="ctrl-current-ver">Current: ${esc(ver)}</span>` : '';
+  return `<div class="ctrl-image-wrap"><span class="ctrl-image" title="${esc(it.image||'')}">${esc(it.image||'')}</span>${verLine}</div>`;
+}
+
 // ctrlUpdateBadge mirrors the Applications page's update badge (same
 // colors, same "click to update" affordance), but shows the actual
 // version number inline (⬆ v1.37.1) rather than a bare "update" label —
@@ -2818,8 +2856,17 @@ function ctrlUpdateBadge(it) {
       ? `${im.current_version} → ${im.latest_version}`
       : `tag: ${im.current_tag || '?'}`;
     const sizeLine = im.size_bytes ? ` (${fmtBytes(im.size_bytes)})` : '';
-    const clickable = it.app_id ? ` style="cursor:pointer" onclick="openUpdateAppModal('${it.app_id}','${esc(it.backed_up_as||'')}')"` : '';
-    const title = verLine + sizeLine + (it.app_id ? '\n\nClick to update' : '\n\n(not backed by a registered app — update it manually)');
+    let onclick = '';
+    let clickHint = '\n\n(PrestoBack itself — update via Settings → Updates)';
+    if (it.app_id) {
+      onclick = `openUpdateAppModal('${it.app_id}','${esc(it.backed_up_as||'')}')`;
+      clickHint = '\n\nClick to update';
+    } else if (!it.is_self) {
+      onclick = `quickUpdateContainer('${esc(it.name)}')`;
+      clickHint = '\n\nClick to update directly (not tracked as a PrestoBack app — no backup runs first)';
+    }
+    const clickable = onclick ? ` style="cursor:pointer" onclick="${onclick}"` : '';
+    const title = verLine + sizeLine + clickHint;
     return `<span class="pill" style="background:var(--amber2,#3a2a0f);color:var(--amber,#f0a020);border:1px solid var(--amber,#f0a020);margin-left:6px"${clickable} title="${esc(title)}">⬆ ${ver ? esc(ver) : 'update'}</span>`;
   }
   if (im.err && !im.skipped) {
@@ -2947,7 +2994,7 @@ function renderCtrl() {
         <div class="ctrl-head" style="cursor:default${it.is_self ? ';opacity:.8' : ''}">
           <span class="ctrl-chev-spacer"></span>
           <div class="ctrl-name-wrap"><span class="ctrl-head-name">${esc(it.name)}</span>${it.service ? `<span class="ctrl-head-count">${esc(it.service)}</span>` : ''}</div>
-          <span class="ctrl-image" title="${esc(it.image||'')}">${esc(it.image||'')}</span>
+          ${ctrlImageCell(it)}
           <div class="ctrl-badge-wrap">${backedBadge(it)}${ctrlUpdateBadge(it)}</div>
           <span class="ctrl-status-pill" style="color:${col};background:${bg}">${label}</span>
           <div class="ctrl-row-actions">${ctrlActionButtons([it.name], it.name, it.state, it.is_self)}</div>
@@ -2981,7 +3028,7 @@ function renderCtrl() {
       return `<div class="ctrl-child">
         <span class="ctrl-chev-spacer"></span>
         <div class="ctrl-name-wrap"><span class="ctrl-child-name">${esc(it.name)}</span>${it.service ? `<span class="ctrl-head-count">${esc(it.service)}</span>` : ''}</div>
-        <span class="ctrl-image" title="${esc(it.image||'')}">${esc(it.image||'')}</span>
+        ${ctrlImageCell(it)}
         <div class="ctrl-badge-wrap">${backedBadge(it)}${ctrlUpdateBadge(it)}</div>
         <span class="ctrl-status-pill" style="color:${col};background:${bg}">${label}</span>
         <div class="ctrl-row-actions">${ctrlActionButtons([it.name], it.name, it.state, it.is_self)}</div>
