@@ -633,6 +633,7 @@ select.fi{cursor:pointer}
       <button class="btn btn-p btn-sm" onclick="openAddApp()">+ Add App</button>
     </div>
   </div>
+  <div id="unmanaged-updates-section" style="display:none;margin:0 20px 18px"></div>
   <div class="sec">
     <div class="apps-toolbar">
       <input class="apps-search" id="apps-search" placeholder="Filter apps…" oninput="filterApps(this.value)">
@@ -1810,6 +1811,7 @@ async function loadCachedUpdateReports() {
       renderApps();
       renderCtrl();
       renderUpdatesBanner();
+      renderUnmanagedUpdatesSection();
     }
   } catch { /* non-critical — badges just stay empty until a manual check */ }
 }
@@ -2171,6 +2173,7 @@ async function checkForUpdatesNow() {
     renderUpdatesBanner();
     renderApps();
     renderCtrl();
+    renderUnmanagedUpdatesSection();
     const nUpdates = S.pendingUpdates.length;
     const nIssues = S.lastUpdateReports.filter(r => r.images.some(im => im.err && !im.skipped)).length;
     if (nUpdates === 0 && nIssues === 0 && !su.available) {
@@ -2548,6 +2551,47 @@ function pollUntilUpdateClears(appName) {
   setTimeout(tick, delays[i++]);
 }
 
+// renderUnmanagedUpdatesSection surfaces containers the host-wide scan in
+// checkForUpdates found running with a pending update but with no
+// registered config.AppConfig behind them (see AppUpdateReport.Unmanaged's
+// doc comment on the backend) — previously reported correctly in
+// Telegram/Discord and in the raw /api/updates/check payload, but nothing
+// in the UI ever showed them: renderApps() only ever iterates S.apps
+// (registered apps), so an unmanaged report had no row to attach to and
+// was silently invisible here even though the data existed.
+function renderUnmanagedUpdatesSection() {
+  const el = document.getElementById('unmanaged-updates-section');
+  if (!el) return;
+  const reports = (S.lastUpdateReports || []).filter(r => r.unmanaged);
+  if (!reports.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+
+  el.style.display = '';
+  el.innerHTML = `
+    <div class="card" style="border-left:3px solid #f0a020">
+      <div class="ch"><div class="ct">🧩 Unmanaged containers with updates (${reports.length})</div></div>
+      <div style="padding:4px 18px 14px">
+        <div class="fh" style="margin:6px 0 12px">Running, but not tracked as a PrestoBack app — no scheduled backups for these. Still checked for updates the same as any app; add one under "+ Add App" above for full backup coverage, or just update it directly below.</div>
+        ${reports.map(r => {
+          const img = (r.images || [])[0];
+          if (!img) return '';
+          const verLine = (img.current_version && img.latest_version)
+            ? `${esc(img.current_version)} → ${esc(img.latest_version)}`
+            : `tag: ${esc(img.current_tag || '?')}`;
+          const sizeLine = img.size_bytes ? ` · ${fmtBytes(img.size_bytes)}` : '';
+          return `
+          <div class="bi">
+            <div class="bm">
+              <div class="bid">${esc(r.app_name)}</div>
+              <div class="bif">${esc(img.image || '')}</div>
+              <div class="fh">${verLine}${sizeLine}</div>
+            </div>
+            <button class="btn btn-w btn-sm" onclick="quickUpdateContainer('${esc(r.app_name)}')">⬆ Update</button>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>`;
+}
+
 let appsFilter = '';
 function filterApps(q) {
   appsFilter = q.toLowerCase();
@@ -2841,14 +2885,34 @@ function ctrlUpdateBadge(it) {
       ? `${im.current_version} → ${im.latest_version}`
       : `tag: ${im.current_tag || '?'}`;
     const sizeLine = im.size_bytes ? ` (${fmtBytes(im.size_bytes)})` : '';
-    const clickable = it.app_id ? ` style="cursor:pointer" onclick="openUpdateAppModal('${it.app_id}','${esc(it.backed_up_as||'')}')"` : '';
-    const title = verLine + sizeLine + (it.app_id ? '\n\nClick to update' : '\n\n(not backed by a registered app — update it manually)');
+    const clickable = it.app_id
+      ? ` style="cursor:pointer" onclick="openUpdateAppModal('${it.app_id}','${esc(it.backed_up_as||'')}')"`
+      : ` style="cursor:pointer" onclick="quickUpdateContainer('${esc(it.name)}')"`;
+    const title = verLine + sizeLine + (it.app_id ? '\n\nClick to update' : '\n\nNot backed by a registered app — click to pull + recreate this container directly (no pre-update backup, since there\'s no app to back up)');
     return `<span class="pill" style="background:var(--amber2,#3a2a0f);color:var(--amber,#f0a020);border:1px solid var(--amber,#f0a020);margin-left:6px"${clickable} title="${esc(title)}">⬆ ${ver ? esc(ver) : 'update'}</span>`;
   }
   if (im.err && !im.skipped) {
     return `<span class="pill" style="background:var(--red2,#3a1010);color:var(--red,#e05050);border:1px solid var(--red,#e05050);margin-left:6px" title="${esc(im.err)}">⚠ check issue</span>`;
   }
   return '';
+}
+
+// quickUpdateContainer triggers /api/containers/update — the no-registered-
+// app update path (see handleContainerQuickUpdate's doc comment on the
+// backend). Deliberately a plainer confirm than the registered-app update
+// modal: there's no pre-update backup possible here (nothing to back up
+// without an app), so the warning says so explicitly rather than implying
+// the same safety net the app-update path has.
+async function quickUpdateContainer(name) {
+  if (!confirm(`Update "${name}"? This pulls the latest image and recreates the container directly — there's no app registered for it, so no pre-update backup will be taken first.`)) return;
+  focusLiveActivity();
+  try {
+    await api('/api/containers/update', {method:'POST', body: JSON.stringify({name})});
+    toast(`Update started for ${name} — see Live activity for progress`, 'success');
+    pollUntilUpdateClears(name);
+  } catch(e) {
+    toast(e.message, 'error');
+  }
 }
 
 function ctrlGroupInfo(g) {
