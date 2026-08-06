@@ -55,6 +55,8 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .rt-form-toggle{display:flex;justify-content:space-between;align-items:center;cursor:pointer;user-select:none;padding:10px 14px;background:var(--bg3);border:1px solid var(--line);border-radius:var(--r);transition:border-color .15s}
 @keyframes rt-save-pulse{0%,100%{box-shadow:0 0 0 0 rgba(224,160,48,.5)}50%{box-shadow:0 0 0 6px rgba(224,160,48,0)}}
 .rt-save-dirty{animation:rt-save-pulse 1.6s ease-in-out infinite;border:1px solid #e0a030}
+@keyframes btn-busy-pulse{0%,100%{box-shadow:0 0 0 0 rgba(90,140,255,.55)}50%{box-shadow:0 0 0 6px rgba(90,140,255,0)}}
+.btn-busy{animation:btn-busy-pulse 1s ease-in-out infinite;pointer-events:none;opacity:.85}
 .rt-form-toggle:hover{border-color:var(--accent)}
 .rt-form-toggle #rt-form-toggle-icon{color:var(--accent);font-size:12px;font-weight:600;padding:3px 10px;border:1px solid var(--accent);border-radius:99px}
 .remote-stat b{color:var(--txt);font-size:15px;font-family:var(--mono)}
@@ -112,7 +114,10 @@ nav{flex:1;padding:10px 0;overflow-y:auto}
 .ctrl-child::before{content:'';position:absolute;left:24px;top:0;bottom:0;width:1px;background:var(--line2)}
 .ctrl-child::after{content:'';position:absolute;left:24px;top:50%;width:10px;height:1px;background:var(--line2)}
 .ctrl-child-name{font-size:13px;color:var(--txt2);font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.ctrl-badge-wrap{display:flex;min-width:0}
+.ctrl-badge-wrap{display:flex;min-width:0;gap:6px;flex-wrap:wrap;align-items:center}
+.ctrl-badge-clickable{cursor:pointer;transition:filter .15s,transform .15s}
+.ctrl-badge-clickable:hover{filter:brightness(1.3);transform:translateY(-1px)}
+.ctrl-badge-clickable:active{transform:translateY(0)}
 .ctrl-row-actions{justify-self:end;display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .ctrl-row-actions .btn{padding:9px 16px;font-size:13px}
 .ctrl-row-actions .btn-ic{width:40px;height:40px;padding:0}
@@ -654,8 +659,8 @@ select.fi{cursor:pointer}
 <div id="view-ctrl" class="view-hidden">
   <div class="ph"><div><div class="pt">Container Control</div><div class="ps">Every container in your stack, grouped by compose dependencies — start, stop, restart, or pause any of them directly</div></div>
     <div class="ha">
-      <button class="btn btn-g btn-sm" onclick="checkForUpdatesNow()" title="Check every app's image against its registry now — same check the Applications page's button runs, feeds the ⬆ badges on both pages">🔍 Check for updates</button>
-      <button class="btn btn-g btn-sm" onclick="refreshContainerControl()">↺ Refresh</button>
+      <button class="btn btn-g btn-sm" id="ctrl-updates-check-btn" onclick="checkForUpdatesNow()" title="Check every app's image against its registry now — same check the Applications page's button runs, feeds the ⬆ badges on both pages">🔍 Check for updates</button>
+      <button class="btn btn-g btn-sm" id="ctrl-refresh-btn" onclick="refreshContainerControl()">↺ Refresh</button>
     </div>
   </div>
   <div class="sec">
@@ -1831,11 +1836,15 @@ async function refreshContainerHealth() {
 }
 
 async function refreshContainerControl() {
+  const btn = document.getElementById('ctrl-refresh-btn');
+  btn?.classList.add('btn-busy');
   try {
     const groups = await api('/api/container-control');
     S.ctrlGroups = groups || [];
   } catch {
     S.ctrlGroups = null; // null = fetch failed (Docker unreachable) — distinct from [] = fetched, genuinely zero containers
+  } finally {
+    btn?.classList.remove('btn-busy');
   }
   renderCtrl();
 }
@@ -2135,9 +2144,9 @@ async function cancelMaintenance() {
 // pinned-by-digest vs. a real registry error). Populates S.lastUpdateReports,
 // which renderApps() reads for the detailed per-app badge tooltip.
 async function checkForUpdatesNow() {
-  const btn = document.getElementById('updates-check-btn');
-  const prevLabel = btn ? btn.textContent : '';
-  if (btn) { btn.disabled = true; btn.textContent = '🔍 Checking…'; }
+  const btns = ['updates-check-btn','ctrl-updates-check-btn'].map(id => document.getElementById(id)).filter(Boolean);
+  const prevLabels = btns.map(b => b.textContent);
+  btns.forEach(b => { b.disabled = true; b.textContent = '🔍 Checking…'; b.classList.add('btn-busy'); });
   try {
     const data = await api('/api/updates/check', { method: 'POST' });
     if (!data.docker_ok) {
@@ -2188,7 +2197,7 @@ async function checkForUpdatesNow() {
   } catch (e) {
     toast('Update check failed: ' + (e.message || e), 'error');
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = prevLabel; }
+    btns.forEach((b,i) => { b.disabled = false; b.textContent = prevLabels[i]; b.classList.remove('btn-busy'); });
   }
 }
 
@@ -2885,14 +2894,14 @@ function ctrlUpdateBadge(it) {
       ? `${im.current_version} → ${im.latest_version}`
       : `tag: ${im.current_tag || '?'}`;
     const sizeLine = im.size_bytes ? ` (${fmtBytes(im.size_bytes)})` : '';
-    const clickable = it.app_id
-      ? ` style="cursor:pointer" onclick="openUpdateAppModal('${it.app_id}','${esc(it.backed_up_as||'')}')"`
-      : ` style="cursor:pointer" onclick="quickUpdateContainer('${esc(it.name)}')"`;
+    const onclick = it.app_id
+      ? `openUpdateAppModal('${it.app_id}','${esc(it.backed_up_as||'')}')`
+      : `quickUpdateContainer('${esc(it.name)}')`;
     const title = verLine + sizeLine + (it.app_id ? '\n\nClick to update' : '\n\nNot backed by a registered app — click to pull + recreate this container directly (no pre-update backup, since there\'s no app to back up)');
-    return `<span class="pill" style="background:var(--amber2,#3a2a0f);color:var(--amber,#f0a020);border:1px solid var(--amber,#f0a020);margin-left:6px"${clickable} title="${esc(title)}">⬆ ${ver ? esc(ver) : 'update'}</span>`;
+    return `<span class="pill ctrl-badge-clickable" style="background:var(--amber2,#3a2a0f);color:var(--amber,#f0a020);border:1px solid var(--amber,#f0a020)" onclick="${onclick}" title="${esc(title)}">⬆ ${ver ? esc(ver) : 'update'}</span>`;
   }
   if (im.err && !im.skipped) {
-    return `<span class="pill" style="background:var(--red2,#3a1010);color:var(--red,#e05050);border:1px solid var(--red,#e05050);margin-left:6px" title="${esc(im.err)}">⚠ check issue</span>`;
+    return `<span class="pill" style="background:var(--red2,#3a1010);color:var(--red,#e05050);border:1px solid var(--red,#e05050)" title="${esc(im.err)}">⚠ check issue</span>`;
   }
   return '';
 }
