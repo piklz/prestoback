@@ -4676,6 +4676,40 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 			go s.runContainerUpdates(tgCfg, []config.AppConfig{app})
 		}
 
+	case "qupdate":
+		// Telegram counterpart to POST /api/containers/update
+		// (handleContainerQuickUpdate) — same guards, same resolution,
+		// same background worker, just triggered by a button tap instead
+		// of an HTTP request. Needed as its own case (not folded into
+		// "update" above) because parts[1] here is a bare container name,
+		// not an AppID — there's no config.AppConfig to look up via
+		// s.cfg.GetApp for an unmanaged container.
+		name := parts[1]
+		selfName := strings.TrimPrefix(strings.TrimSpace(s.selfName), "/")
+		if selfName != "" && strings.EqualFold(strings.TrimPrefix(name, "/"), selfName) {
+			_ = notify.SendRaw(tgCfg, "PrestoBack's own container updates through Settings → Updates, not this button\\.")
+			return
+		}
+		s.stateMu.Lock()
+		busy := s.updateRunning
+		s.stateMu.Unlock()
+		if busy {
+			_ = notify.SendRaw(tgCfg, "⏳ An update is already in progress — please wait for it to finish before starting another\\.")
+			return
+		}
+		if ok, errMsg := backup.DockerReachable(); !ok {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("Docker isn't reachable right now: %s", notify.EscapeMD(errMsg)))
+			return
+		}
+		containers := backup.DedupeContainers(backup.ContainersByName([]string{name}))
+		if len(containers) == 0 {
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf("Container not found \\(or not currently running\\): `%s`", notify.EscapeMD(name)))
+			return
+		}
+		target := containers[0]
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf("🔄 Pulling `%s`\\.\\.\\.", notify.EscapeMD(target.Name)))
+		go s.runQuickContainerUpdate(tgCfg, target)
+
 	case "start", "stop", "restart", "pause", "unpause":
 		app, ok := s.cfg.GetApp(parts[1])
 		if !ok {

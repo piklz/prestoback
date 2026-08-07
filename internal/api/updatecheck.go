@@ -412,7 +412,7 @@ func buildUpdateReportDiscordMessage(reports []AppUpdateReport) (title, descript
 		if r.Pinned {
 			sb.WriteString("   _pinned — update manually, no Auto-Update button offered_\n")
 		} else if r.Unmanaged {
-			sb.WriteString("   _not tracked as a PrestoBack app — add it under Applications for one-tap update_\n")
+			sb.WriteString("   _not tracked as a PrestoBack app yet — add it under Applications for one-tap backup_\n")
 		}
 		sb.WriteString("\n")
 	}
@@ -522,7 +522,7 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 		if r.Pinned {
 			sb.WriteString("   _pinned — update manually, no Auto\\-Update button offered_\n")
 		} else if r.Unmanaged {
-			sb.WriteString("   _not tracked as a PrestoBack app — add it under Applications for one\\-tap update_\n")
+			sb.WriteString("   _not tracked as a PrestoBack app yet — add it under Applications for one\\-tap backup_\n")
 		}
 		sb.WriteString("\n")
 	}
@@ -543,10 +543,25 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 			continue
 		}
 		if r.Unmanaged {
-			// No per-app button here either — see AppUpdateReport.Unmanaged's
-			// doc comment: this AppID has no backing config.AppConfig, so the
-			// "update:<id>" callback's s.cfg.GetApp lookup would just fail
-			// silently. Listed above with a 🧩 marker instead.
+			// Own callback prefix ("qupdate:") rather than "update:<id>" —
+			// that path looks the AppID up via s.cfg.GetApp, which has
+			// nothing to find for an unmanaged container (AppID here is
+			// "container:<name>", not a real app). qupdate: instead calls
+			// the same quick-update endpoint the UI's Container Control
+			// badge already uses for exactly this case (see
+			// handleContainerQuickUpdate/runQuickContainerUpdate,
+			// server.go) — no pre-update backup, since there's no app to
+			// back up, just a direct pull + recreate by container name.
+			hasRealUpdate := false
+			for _, im := range r.Images {
+				if im.UpdateAvailable {
+					hasRealUpdate = true
+					break
+				}
+			}
+			if hasRealUpdate {
+				btns = append(btns, notify.ButtonAction{Label: "🔄 Update " + r.AppName, Data: "qupdate:" + r.AppName})
+			}
 			continue
 		}
 		// A report can exist purely because one of its images is
