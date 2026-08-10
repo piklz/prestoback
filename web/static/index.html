@@ -2577,7 +2577,7 @@ function renderUnmanagedUpdatesSection() {
   el.style.display = '';
   el.innerHTML = `
     <div class="card" style="border-left:3px solid #f0a020">
-      <div class="ch"><div class="ct">🧩 Unmanaged containers with updates (${reports.length})</div></div>
+      <div class="ch"><div class="ct">🧩 Unmanaged containers with updates (${reports.length})</div>${reports.length > 1 ? `<button class="btn btn-w btn-sm" onclick="quickUpdateAllContainers()">⬆ Update all ${reports.length}</button>` : ''}</div>
       <div style="padding:4px 18px 14px">
         <div class="fh" style="margin:6px 0 12px">Running, but not tracked as a PrestoBack app — no scheduled backups for these. Still checked for updates the same as any app; add one under "+ Add App" above for full backup coverage, or just update it directly below.</div>
         ${reports.map(r => {
@@ -2912,6 +2912,19 @@ function ctrlUpdateBadge(it) {
 // modal: there's no pre-update backup possible here (nothing to back up
 // without an app), so the warning says so explicitly rather than implying
 // the same safety net the app-update path has.
+async function quickUpdateAllContainers() {
+  const reports = (S.lastUpdateReports || []).filter(r => r.unmanaged && r.images.some(im => im.update_available));
+  if (!confirm(`Update all ${reports.length} unmanaged containers? This pulls the latest image and recreates each one directly, sequentially — there's no app registered for any of them, so no pre-update backup will be taken first.`)) return;
+  focusLiveActivity();
+  try {
+    const r = await api('/api/containers/update-all', {method:'POST'});
+    toast(`Update started for ${r.count} container(s) — see Live activity for progress`, 'success');
+    setTimeout(checkForUpdatesNow, 15000); // one delayed recheck so badges/section refresh once the batch has had time to make progress — same 15s ballpark as the single-container path's own poll cadence
+  } catch(e) {
+    toast(e.message, 'error');
+  }
+}
+
 async function quickUpdateContainer(name) {
   if (!confirm(`Update "${name}"? This pulls the latest image and recreates the container directly — there's no app registered for it, so no pre-update backup will be taken first.`)) return;
   focusLiveActivity();

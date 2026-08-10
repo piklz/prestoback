@@ -534,6 +534,7 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 	// added on top when a batch update is convenient instead.
 	var btns []notify.ButtonAction
 	updatableCount := 0
+	unmanagedUpdatableCount := 0
 	for _, r := range reports {
 		if r.Pinned {
 			// No per-app button for a pinned app — see AppUpdateReport.Pinned's
@@ -549,7 +550,7 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 			// "container:<name>", not a real app). qupdate: instead calls
 			// the same quick-update endpoint the UI's Container Control
 			// badge already uses for exactly this case (see
-			// handleContainerQuickUpdate/runQuickContainerUpdate,
+			// handleContainerQuickUpdate/runQuickContainerUpdatesBatch,
 			// server.go) — no pre-update backup, since there's no app to
 			// back up, just a direct pull + recreate by container name.
 			hasRealUpdate := false
@@ -560,6 +561,7 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 				}
 			}
 			if hasRealUpdate {
+				unmanagedUpdatableCount++
 				btns = append(btns, notify.ButtonAction{Label: "🔄 Update " + r.AppName, Data: "qupdate:" + r.AppName})
 			}
 			continue
@@ -588,6 +590,9 @@ func buildUpdateReportMessage(reports []AppUpdateReport) (string, []notify.Butto
 	}
 	if updatableCount > 1 {
 		btns = append(btns, notify.ButtonAction{Label: fmt.Sprintf("🔄 Update all %d", updatableCount), Data: "update:all"})
+	}
+	if unmanagedUpdatableCount > 1 {
+		btns = append(btns, notify.ButtonAction{Label: fmt.Sprintf("🔄 Update all %d unmanaged", unmanagedUpdatableCount), Data: "qupdate:all"})
 	}
 
 	return strings.TrimRight(sb.String(), "\n"), btns

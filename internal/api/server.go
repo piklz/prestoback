@@ -176,6 +176,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/container-control", s.authJWT(s.handleContainerControl))
 	s.mux.HandleFunc("/api/containers/lifecycle", s.adminForWrites(s.handleContainerControlLifecycle))
 	s.mux.HandleFunc("/api/containers/update", s.adminForWrites(s.handleContainerQuickUpdate)) // pull+recreate one container by name, no registered app required — see its doc comment
+	s.mux.HandleFunc("/api/containers/update-all", s.adminForWrites(s.handleContainerQuickUpdateAll)) // same, for every currently-updatable unmanaged container at once
 	s.mux.HandleFunc("/api/history", s.authJWT(s.handleHistory))
 	s.mux.HandleFunc("/api/apikey", s.authJWT(s.handleAPIKey)) // masked fingerprint only, never the live key
 	s.mux.HandleFunc("/api/pairing/status", s.authJWT(s.handlePairingStatus))
@@ -1618,18 +1619,76 @@ func (s *Server) handleContainerQuickUpdate(w http.ResponseWriter, r *http.Reque
 	nc := s.cfg.GetNotify()
 	tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
 	respond(w, 202, map[string]string{"status": "update started", "container": target.Name})
-	go s.runQuickContainerUpdate(tgCfg, target)
+	go s.runQuickContainerUpdatesBatch(tgCfg, []backup.ContainerInfo{target})
 }
 
-// runQuickContainerUpdate is handleContainerQuickUpdate's background
-// worker — the single-container, no-AppConfig counterpart to
-// runContainerUpdates/runContainerUpdatesLocked. It shares the same
-// s.updateMu/s.updateRunning lock (see that field's doc comment on the
-// Server struct) so this can never race a registered-app update or a
-// stack operation through recreate at the same time, and streams progress
-// to the live-log panel keyed by the container's own name — there's no
-// app ID to key it by here.
-func (s *Server) runQuickContainerUpdate(tgCfg notify.TelegramConfig, c backup.ContainerInfo) {
+// handleContainerQuickUpdateAll is handleContainerQuickUpdate's "all"
+// sibling — the HTTP counterpart to the qupdate:all Telegram callback
+// (see its doc comment in handleTelegramCallback for the full reasoning).
+// Re-checks live rather than trusting whatever the browser's
+// S.lastUpdateReports happened to have cached — the registry may have
+// moved, or a container may have stopped, since that was last fetched.
+func (s *Server) handleContainerQuickUpdateAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	s.stateMu.Lock()
+	busy := s.updateRunning
+	s.stateMu.Unlock()
+	if busy {
+		errOut(w, 409, "an update or stack operation is already in progress — please wait for it to finish first")
+		return
+	}
+	if ok, errMsg := backup.DockerReachable(); !ok {
+		errOut(w, 503, "Docker isn't reachable right now (daemon may be restarting): "+errMsg)
+		return
+	}
+
+	reports, dockerOK := s.checkForUpdates(false)
+	if !dockerOK {
+		errOut(w, 503, "Docker isn't reachable right now (daemon may be restarting)")
+		return
+	}
+	var names []string
+	for _, rep := range reports {
+		if !rep.Unmanaged {
+			continue
+		}
+		for _, im := range rep.Images {
+			if im.UpdateAvailable {
+				names = append(names, rep.AppName)
+				break
+			}
+		}
+	}
+	if len(names) == 0 {
+		errOut(w, 400, "no unmanaged containers with a pending update found — it may have just cleared")
+		return
+	}
+	containers := backup.DedupeContainers(backup.ContainersByName(names))
+	sort.Slice(containers, func(i, j int) bool { return containers[i].Name < containers[j].Name })
+
+	nc := s.cfg.GetNotify()
+	tgCfg := notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID}
+	respond(w, 202, map[string]any{"status": "update started", "count": len(containers)})
+	go s.runQuickContainerUpdatesBatch(tgCfg, containers)
+}
+
+// runQuickContainerUpdatesBatch is "Update all" for containers with no
+// registered app behind them — the qupdate:all counterpart to
+// runContainerUpdates, and also the single-container qupdate:<name>
+// path's implementation (a batch of one). Deliberately mirrors
+// runContainerUpdates' exact locking/sequencing: same s.updateRunning/
+// s.updateMu, same "no concurrent update batches of any kind" guarantee.
+// Running these in parallel would mean several simultaneous docker pulls
+// competing for the same host's bandwidth/CPU with no coordination, and
+// skipping the shared lock would let this batch and a registered-app
+// batch stomp on each other's SSE log stream and Docker daemon load at
+// the same time — so it's sequential, one container fully finishing
+// (success, failure, or its own watchdog timeout) before the next one
+// starts, exactly like the registered-app path already does.
+func (s *Server) runQuickContainerUpdatesBatch(tgCfg notify.TelegramConfig, containers []backup.ContainerInfo) {
 	s.stateMu.Lock()
 	if s.updateRunning {
 		s.stateMu.Unlock()
@@ -1646,61 +1705,62 @@ func (s *Server) runQuickContainerUpdate(tgCfg notify.TelegramConfig, c backup.C
 		s.updateRunning = false
 		s.stateMu.Unlock()
 	}()
+
+	s.runQuickContainerUpdatesLocked(tgCfg, containers)
+}
+
+// runQuickContainerUpdatesLocked is runQuickContainerUpdatesBatch's actual
+// work — must only run while holding s.updateMu (see runContainerUpdatesLocked,
+// whose shape this deliberately mirrors via the shared
+// updateOneContainerWithWatchdog/buildUpdateSummaryMessage pieces).
+func (s *Server) runQuickContainerUpdatesLocked(tgCfg notify.TelegramConfig, containers []backup.ContainerInfo) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[update] PANIC in runQuickContainerUpdate: %v", r)
+			log.Printf("[update] PANIC in runQuickContainerUpdatesLocked: %v", r)
 			_ = notify.SendRaw(tgCfg, "❌ Internal error during update — check container logs\\.")
 		}
 	}()
 
-	name := c.Name
-	emit := func(msg string) {
-		log.Printf("[update:%s] %s", name, msg)
-		s.engine.EmitLog(name, msg)
+	if ok, errMsg := backup.DockerReachable(); !ok {
+		log.Printf("[update] aborting quick-update batch — Docker daemon unreachable: %s", errMsg)
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+			"⚠️ Can't reach Docker right now \\(daemon may be restarting\\) — nothing was checked or updated\\. Try again in a moment\\.\n\n`%s`",
+			notify.EscapeMD(errMsg)))
+		return
 	}
-	emit(fmt.Sprintf("━━━ Update started: %s (not tracked as a PrestoBack app) ━━━", name))
 
-	start := time.Now()
-	type res struct{ r backup.ContainerUpdate }
-	ch := make(chan res, 1)
-	go func() { ch <- res{r: backup.UpdateContainer(c, s.cfg.ComposeFile, emit)} }()
+	overallStart := time.Now()
+	results := make([]appUpdateBatchResult, 0, len(containers))
 
-	// Same watchdog sizing as runContainerUpdatesLocked — see its comment
-	// on why this has to agree with UpdateContainer's own internal timeout.
-	watchdog := backup.ContainerPullTimeout(c) + 5*time.Minute
-	var result backup.ContainerUpdate
-	var timedOut bool
-	select {
-	case r := <-ch:
-		result = r.r
-	case <-time.After(watchdog):
-		timedOut = true
-		emit(fmt.Sprintf("✗ %s timed out (no response after %s)", name, formatDuration(watchdog)))
-	}
-	dur := time.Since(start)
-	emit(fmt.Sprintf("━━━ Update finished: %s (%s) ━━━", name, formatDuration(dur)))
-
-	var msg string
-	switch {
-	case timedOut:
-		msg = fmt.Sprintf("❌ `%s` — timed out \\(no response after %s\\)", notify.EscapeMD(name), notify.EscapeMD(formatDuration(watchdog)))
-	case result.Rolled:
-		msg = fmt.Sprintf("⚠️ `%s` — new container failed health check, rolled back", notify.EscapeMD(name))
-	case result.Err != "":
-		errMsg := result.Err
-		if len(errMsg) > 300 {
-			errMsg = errMsg[:300] + "…"
+	for _, c := range containers {
+		log.Printf("[update] processing unmanaged container %s", c.Name)
+		itemStart := time.Now()
+		name := c.Name
+		emit := func(msg string) {
+			log.Printf("[update:%s] %s", name, msg)
+			s.engine.EmitLog(name, msg)
 		}
-		msg = fmt.Sprintf("❌ `%s` — %s", notify.EscapeMD(name), notify.EscapeMD(errMsg))
-	case result.AlreadyUpToDate:
-		msg = fmt.Sprintf("✔ `%s` — already up to date", notify.EscapeMD(name))
-	case result.Restarted:
-		msg = fmt.Sprintf("✅ `%s` — pulled \\+ recreated _%s_ \\(not tracked as a PrestoBack app\\)",
-			notify.EscapeMD(name), notify.EscapeMD(formatDuration(dur)))
-	default:
-		msg = fmt.Sprintf("❓ `%s` — unknown result", notify.EscapeMD(name))
+		emit(fmt.Sprintf("━━━ Update started: %s (not tracked as a PrestoBack app) ━━━", name))
+
+		cr := s.updateOneContainerWithWatchdog(c, emit)
+		dur := time.Since(itemStart)
+
+		switch {
+		case cr.timedOut:
+			emit(fmt.Sprintf("━━━ Update timed out: %s (%s) ━━━", name, formatDuration(dur)))
+		case cr.res.Rolled:
+			emit(fmt.Sprintf("━━━ Update rolled back: %s (%s) ━━━", name, formatDuration(dur)))
+		case cr.res.Err != "":
+			emit(fmt.Sprintf("━━━ Update failed: %s (%s) ━━━", name, formatDuration(dur)))
+		default:
+			emit(fmt.Sprintf("━━━ Update finished: %s (%s) ━━━", name, formatDuration(dur)))
+		}
+
+		results = append(results, appUpdateBatchResult{appName: name, containers: []containerUpdateResult{cr}, dur: dur})
 	}
-	_ = notify.SendRaw(tgCfg, msg)
+
+	totalDur := time.Since(overallStart)
+	sendUpdateSummary(tgCfg, results, totalDur, "unmanaged container")
 }
 
 func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
@@ -2166,146 +2226,74 @@ func (s *Server) runContainerUpdates(tgCfg notify.TelegramConfig, apps []config.
 // runContainerUpdatesLocked pulls + recreates containers for each app,
 // streaming a timed summary back to Telegram when all work is done.
 // Must only be called while holding s.updateMu — use runContainerUpdates.
-func (s *Server) runContainerUpdatesLocked(tgCfg notify.TelegramConfig, apps []config.AppConfig) {
-	// Belt-and-suspenders: a panic in a goroutine would crash the bot loop.
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("[update] PANIC in runContainerUpdatesLocked: %v", r)
-			_ = notify.SendRaw(tgCfg, "❌ Internal error during update — check container logs\\.")
-		}
-	}()
+// containerUpdateResult and appUpdateBatchResult are shared between
+// runContainerUpdatesLocked (registered apps, possibly several containers
+// each) and runQuickContainerUpdatesLocked (unmanaged containers, always
+// exactly one container per "item") — both do the identical "pull one
+// container with a sized watchdog" and "summarize N results into one
+// Telegram message, with a plain-text fallback if MarkdownV2 rejects it"
+// work, just grouped differently. Keeping that in one place means a
+// future formatting fix only has to happen once, not be kept in sync
+// across two near-identical copies.
+type containerUpdateResult struct {
+	name         string
+	res          backup.ContainerUpdate
+	dur          time.Duration
+	timedOut     bool
+	timeoutAfter time.Duration
+}
 
-	if ok, errMsg := backup.DockerReachable(); !ok {
-		log.Printf("[update] aborting — Docker daemon unreachable: %s", errMsg)
-		_ = notify.SendRaw(tgCfg, fmt.Sprintf(
-			"⚠️ Can't reach Docker right now \\(daemon may be restarting\\) — nothing was checked or updated\\. Try again in a moment\\.\n\n`%s`",
-			notify.EscapeMD(errMsg)))
-		return
+type appUpdateBatchResult struct {
+	appName      string
+	noContainers bool
+	containers   []containerUpdateResult
+	dur          time.Duration
+}
+
+// updateOneContainerWithWatchdog runs backup.UpdateContainer for c with a
+// watchdog sized to its own expected pull time (backup.ContainerPullTimeout)
+// plus a 5-minute buffer for the stop→rename→create→start→health-check
+// steps that run after the pull itself.
+func (s *Server) updateOneContainerWithWatchdog(c backup.ContainerInfo, emit func(string)) containerUpdateResult {
+	type res struct{ r backup.ContainerUpdate }
+	ch := make(chan res, 1)
+	cStart := time.Now()
+	go func(ci backup.ContainerInfo) {
+		ch <- res{r: backup.UpdateContainer(ci, s.cfg.ComposeFile, emit)}
+	}(c)
+
+	var cr containerUpdateResult
+	cr.name = c.Name
+	watchdog := backup.ContainerPullTimeout(c) + 5*time.Minute
+	select {
+	case r := <-ch:
+		cr.res = r.r
+	case <-time.After(watchdog):
+		cr.timedOut = true
+		cr.timeoutAfter = watchdog
+		emit(fmt.Sprintf("✗ %s timed out (no response after %s)", c.Name, formatDuration(watchdog)))
 	}
+	cr.dur = time.Since(cStart)
+	log.Printf("[update] container %s done in %s: err=%q restarted=%v upToDate=%v timedOut=%v",
+		c.Name, cr.dur.Round(time.Second), cr.res.Err, cr.res.Restarted, cr.res.AlreadyUpToDate, cr.timedOut)
+	return cr
+}
 
-	type cResult struct {
-		name         string
-		res          backup.ContainerUpdate
-		dur          time.Duration
-		timedOut     bool
-		timeoutAfter time.Duration
-	}
-	type aResult struct {
-		appName      string
-		noContainers bool
-		containers   []cResult
-		dur          time.Duration
-	}
-	allRestarted := func(ar aResult) bool {
-		if len(ar.containers) == 0 {
-			return false
-		}
-		for _, cr := range ar.containers {
-			if !cr.res.Restarted {
-				return false
-			}
-		}
-		return true
-	}
-	anyRolled := func(ar aResult) bool {
-		for _, cr := range ar.containers {
-			if cr.res.Rolled {
-				return true
-			}
-		}
-		return false
-	}
-	anyErr := func(ar aResult) bool {
-		for _, cr := range ar.containers {
-			if cr.res.Err != "" || cr.timedOut {
-				return true
-			}
-		}
-		return false
-	}
-
-	overallStart := time.Now()
-	results := make([]aResult, 0, len(apps))
-
-	for _, app := range apps {
-		log.Printf("[update] processing app %s (id: %s)", app.Name, app.ID)
-		appStart := time.Now()
-
-		// emit streams each step to SSE so the browser live-log panel shows
-		// progress exactly like a backup job does.
-		appID := app.ID
-		appName := app.Name
-		emit := func(msg string) {
-			log.Printf("[update:%s] %s", appName, msg)
-			s.engine.EmitLog(appID, msg)
-		}
-		emit(fmt.Sprintf("━━━ Update started: %s ━━━", appName))
-
-		containers := backup.DedupeContainers(backup.FindContainers(app.ID))
-		if len(containers) == 0 {
-			log.Printf("[update] no containers found for app %s", app.ID)
-			emit(fmt.Sprintf("⚠  No containers found for %s", appName))
-			results = append(results, aResult{appName: app.Name, noContainers: true, dur: time.Since(appStart)})
-			continue
-		}
-		ar := aResult{appName: app.Name}
-		for _, c := range containers {
-			type res struct{ r backup.ContainerUpdate }
-			ch := make(chan res, 1)
-			cStart := time.Now()
-			go func(ci backup.ContainerInfo) {
-				ch <- res{r: backup.UpdateContainer(ci, s.cfg.ComposeFile, emit)}
-			}(c)
-
-			var cr cResult
-			cr.name = c.Name
-			// Size the wait to agree with what UpdateContainer is actually
-			// doing internally (see ContainerPullTimeout/pullTimeoutFor) —
-			// this used to be a flat 11 minutes regardless of image size,
-			// which fired and abandoned the real pull before its own
-			// (correctly larger) internal timeout ever got a chance to. The
-			// +5m buffer covers the stop→rename→create→start→health-check
-			// steps that run after the pull itself.
-			watchdog := backup.ContainerPullTimeout(c) + 5*time.Minute
-			select {
-			case r := <-ch:
-				cr.res = r.r
-			case <-time.After(watchdog):
-				cr.timedOut = true
-				cr.timeoutAfter = watchdog
-				emit(fmt.Sprintf("✗ %s timed out (no response after %s)", c.Name, formatDuration(watchdog)))
-			}
-			cr.dur = time.Since(cStart)
-			log.Printf("[update] container %s done in %s: err=%q restarted=%v upToDate=%v timedOut=%v",
-				c.Name, cr.dur.Round(time.Second), cr.res.Err, cr.res.Restarted, cr.res.AlreadyUpToDate, cr.timedOut)
-			ar.containers = append(ar.containers, cr)
-		}
-		ar.dur = time.Since(appStart)
-
-		// Emit SSE footer for this app
-		switch {
-		case allRestarted(ar):
-			emit(fmt.Sprintf("━━━ Update complete: %s (%s) ━━━", appName, formatDuration(ar.dur)))
-		case anyRolled(ar):
-			emit(fmt.Sprintf("━━━ Update rolled back: %s (%s) ━━━", appName, formatDuration(ar.dur)))
-		case anyErr(ar):
-			emit(fmt.Sprintf("━━━ Update failed: %s (%s) ━━━", appName, formatDuration(ar.dur)))
-		default:
-			emit(fmt.Sprintf("━━━ Update finished: %s (%s) ━━━", appName, formatDuration(ar.dur)))
-		}
-
-		results = append(results, ar)
-	}
-
-	totalDur := time.Since(overallStart)
-	isSingle := len(apps) == 1
+// buildUpdateSummaryMessage renders the shared "Update Results" Telegram
+// summary — used by both the registered-app path (unitLabel "app") and
+// the unmanaged-container path (unitLabel "unmanaged container"). A
+// single-result batch collapses to a shorter format (no per-item header
+// line, a duration footer instead) matching what a single-app update
+// already looked like before this was ever shared.
+func buildUpdateSummaryMessage(results []appUpdateBatchResult, totalDur time.Duration, unitLabel string) string {
+	isSingle := len(results) == 1
 
 	var sb strings.Builder
 	if isSingle && len(results) > 0 {
 		sb.WriteString(fmt.Sprintf("*Update — %s*\n\n", notify.EscapeMD(results[0].appName)))
 	} else {
-		sb.WriteString(fmt.Sprintf("*Update Results* — %d app\\(s\\) in %s\n\n",
-			len(apps), notify.EscapeMD(formatDuration(totalDur))))
+		sb.WriteString(fmt.Sprintf("*Update Results* — %d %s\\(s\\) in %s\n\n",
+			len(results), unitLabel, notify.EscapeMD(formatDuration(totalDur))))
 	}
 
 	for _, ar := range results {
@@ -2317,8 +2305,6 @@ func (s *Server) runContainerUpdatesLocked(tgCfg notify.TelegramConfig, apps []c
 			sb.WriteString(fmt.Sprintf("*%s* _%s_\n", notify.EscapeMD(ar.appName), notify.EscapeMD(formatDuration(ar.dur))))
 		}
 		for _, cr := range ar.containers {
-			// Truncate error messages — Docker output can include long stack traces
-			// and spinner characters that trip MarkdownV2 length limits.
 			errMsg := cr.res.Err
 			if len(errMsg) > 300 {
 				errMsg = errMsg[:300] + "…"
@@ -2356,34 +2342,103 @@ func (s *Server) runContainerUpdatesLocked(tgCfg notify.TelegramConfig, apps []c
 	if isSingle {
 		sb.WriteString(fmt.Sprintf("\n⏱ _%s_", notify.EscapeMD(formatDuration(totalDur))))
 	}
+	return sb.String()
+}
 
-	msg := sb.String()
-	if err := notify.SendRaw(tgCfg, msg); err != nil {
-		// MarkdownV2 parse failure — Docker error output can contain characters
-		// that trip Telegram even after EscapeMD (e.g. Unicode spinner frames).
-		// Fall back to a plain summary so the user always gets a response.
-		log.Printf("[update] SendRaw failed (%v) — sending plain fallback", err)
-		plain := fmt.Sprintf("Update finished in %s — full results in container logs (docker logs prestoback).", formatDuration(totalDur))
-		for _, ar := range results {
-			for _, cr := range ar.containers {
-				if cr.timedOut {
-					plain += fmt.Sprintf("\n⚠️ %s: timed out", cr.name)
-				} else if cr.res.Rolled {
-					plain += fmt.Sprintf("\n⚠️ %s: health check failed, rolled back", cr.name)
-				} else if cr.res.Err != "" {
-					plain += fmt.Sprintf("\n❌ %s: failed", cr.name)
-				} else if cr.res.Restarted {
-					plain += fmt.Sprintf("\n✅ %s: updated", cr.name)
-				} else if cr.res.AlreadyUpToDate {
-					plain += fmt.Sprintf("\n✔ %s: already up to date", cr.name)
-				}
+// buildUpdateSummaryPlainFallback is the no-Markdown fallback used when
+// SendRaw's MarkdownV2 parse fails (Docker error output can contain
+// characters that trip Telegram even after EscapeMD) — shared for the
+// same reason buildUpdateSummaryMessage is.
+func buildUpdateSummaryPlainFallback(results []appUpdateBatchResult, totalDur time.Duration) string {
+	plain := fmt.Sprintf("Update finished in %s — full results in container logs (docker logs prestoback).", formatDuration(totalDur))
+	for _, ar := range results {
+		for _, cr := range ar.containers {
+			if cr.timedOut {
+				plain += fmt.Sprintf("\n⚠️ %s: timed out", cr.name)
+			} else if cr.res.Rolled {
+				plain += fmt.Sprintf("\n⚠️ %s: health check failed, rolled back", cr.name)
+			} else if cr.res.Err != "" {
+				plain += fmt.Sprintf("\n❌ %s: failed", cr.name)
+			} else if cr.res.Restarted {
+				plain += fmt.Sprintf("\n✅ %s: updated", cr.name)
+			} else if cr.res.AlreadyUpToDate {
+				plain += fmt.Sprintf("\n✔ %s: already up to date", cr.name)
 			}
 		}
-		// SendRaw with no parse_mode for the fallback
+	}
+	return plain
+}
+
+// sendUpdateSummary sends buildUpdateSummaryMessage's output, falling back
+// to buildUpdateSummaryPlainFallback if Telegram rejects the MarkdownV2.
+// Shared tail for both update-batch paths.
+func sendUpdateSummary(tgCfg notify.TelegramConfig, results []appUpdateBatchResult, totalDur time.Duration, unitLabel string) {
+	msg := buildUpdateSummaryMessage(results, totalDur, unitLabel)
+	if err := notify.SendRaw(tgCfg, msg); err != nil {
+		log.Printf("[update] SendRaw failed (%v) — sending plain fallback", err)
+		plain := buildUpdateSummaryPlainFallback(results, totalDur)
 		if err2 := notify.SendRawPlain(tgCfg, plain); err2 != nil {
 			log.Printf("[update] plain fallback also failed: %v", err2)
 		}
 	}
+}
+
+func (s *Server) runContainerUpdatesLocked(tgCfg notify.TelegramConfig, apps []config.AppConfig) {
+	// Belt-and-suspenders: a panic in a goroutine would crash the bot loop.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[update] PANIC in runContainerUpdatesLocked: %v", r)
+			_ = notify.SendRaw(tgCfg, "❌ Internal error during update — check container logs\\.")
+		}
+	}()
+
+	if ok, errMsg := backup.DockerReachable(); !ok {
+		log.Printf("[update] aborting update batch — Docker daemon unreachable: %s", errMsg)
+		_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+			"⚠️ Can't reach Docker right now \\(daemon may be restarting\\) — nothing was checked or updated\\. Try again in a moment\\.\n\n`%s`",
+			notify.EscapeMD(errMsg)))
+		return
+	}
+
+	overallStart := time.Now()
+	results := make([]appUpdateBatchResult, 0, len(apps))
+
+	for _, app := range apps {
+		containers := backup.FindContainers(app.ID)
+		if len(containers) == 0 {
+			results = append(results, appUpdateBatchResult{appName: app.Name, noContainers: true})
+			continue
+		}
+		log.Printf("[update] processing app %s (%d container(s))", app.Name, len(containers))
+		appStart := time.Now()
+		ar := appUpdateBatchResult{appName: app.Name}
+
+		for _, c := range containers {
+			name := c.Name
+			emit := func(msg string) {
+				log.Printf("[update:%s] %s", name, msg)
+				s.engine.EmitLog(app.ID, msg)
+			}
+			emit(fmt.Sprintf("━━━ Update started: %s ━━━", name))
+			cr := s.updateOneContainerWithWatchdog(c, emit)
+			switch {
+			case cr.timedOut:
+				emit(fmt.Sprintf("━━━ Update timed out: %s (%s) ━━━", name, formatDuration(cr.dur)))
+			case cr.res.Rolled:
+				emit(fmt.Sprintf("━━━ Update rolled back: %s (%s) ━━━", name, formatDuration(cr.dur)))
+			case cr.res.Err != "":
+				emit(fmt.Sprintf("━━━ Update failed: %s (%s) ━━━", name, formatDuration(cr.dur)))
+			default:
+				emit(fmt.Sprintf("━━━ Update finished: %s (%s) ━━━", name, formatDuration(cr.dur)))
+			}
+			ar.containers = append(ar.containers, cr)
+		}
+		ar.dur = time.Since(appStart)
+		results = append(results, ar)
+	}
+
+	totalDur := time.Since(overallStart)
+	sendUpdateSummary(tgCfg, results, totalDur, "app")
 }
 
 func (s *Server) handleValidatePath(w http.ResponseWriter, r *http.Request) {
@@ -4677,6 +4732,47 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 		}
 
 	case "qupdate":
+		if parts[1] == "all" {
+			// Fresh check, not stale button data — same reasoning
+			// update:all above already applies: the registry may have
+			// moved (or a container may have stopped) since the button
+			// was rendered, and this is about to act, not just display.
+			s.stateMu.Lock()
+			busy := s.updateRunning
+			s.stateMu.Unlock()
+			if busy {
+				_ = notify.SendRaw(tgCfg, "⏳ An update is already in progress — please wait for it to finish before starting another\\.")
+				return
+			}
+			reports, dockerOK := s.checkForUpdates(false)
+			if !dockerOK {
+				_ = notify.SendRaw(tgCfg, "Docker isn't reachable right now — nothing checked or updated\\.")
+				return
+			}
+			var names []string
+			for _, r := range reports {
+				if !r.Unmanaged {
+					continue
+				}
+				for _, im := range r.Images {
+					if im.UpdateAvailable {
+						names = append(names, r.AppName)
+						break
+					}
+				}
+			}
+			if len(names) == 0 {
+				_ = notify.SendRaw(tgCfg, "No unmanaged containers with a pending update found — it may have just cleared\\.")
+				return
+			}
+			containers := backup.DedupeContainers(backup.ContainersByName(names))
+			sort.Slice(containers, func(i, j int) bool { return containers[i].Name < containers[j].Name })
+			_ = notify.SendRaw(tgCfg, fmt.Sprintf(
+				"🔄 Pulling latest images for *%d* unmanaged container\\(s\\)\\. Results incoming when complete\\.\\.\\.",
+				len(containers)))
+			go s.runQuickContainerUpdatesBatch(tgCfg, containers)
+			return
+		}
 		// Telegram counterpart to POST /api/containers/update
 		// (handleContainerQuickUpdate) — same guards, same resolution,
 		// same background worker, just triggered by a button tap instead
@@ -4708,7 +4804,7 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 		}
 		target := containers[0]
 		_ = notify.SendRaw(tgCfg, fmt.Sprintf("🔄 Pulling `%s`\\.\\.\\.", notify.EscapeMD(target.Name)))
-		go s.runQuickContainerUpdate(tgCfg, target)
+		go s.runQuickContainerUpdatesBatch(tgCfg, []backup.ContainerInfo{target})
 
 	case "start", "stop", "restart", "pause", "unpause":
 		app, ok := s.cfg.GetApp(parts[1])
