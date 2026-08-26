@@ -859,9 +859,25 @@ select.fi{cursor:pointer}
       <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">Encrypts new backup archives at rest (AES-256-CTR + HMAC-SHA256). The passphrase below is used automatically for scheduled backups — but <strong>restoring always asks for it again</strong>, never uses this stored copy silently. Per-app overrides are on each app's Edit screen.</div></div>
       <div class="fg"><div class="ftog" onclick="togEncryption()"><div class="ftog-sw" id="tog-encryption"><div class="ftog-kn"></div></div><div class="ftog-lbl">Encrypt new backups by default</div></div></div>
       <div class="fg"><label class="fl">Passphrase</label><input class="fi" type="password" id="enc-passphrase" placeholder="Leave blank to keep the existing passphrase"><div class="fh" id="enc-passphrase-hint"></div></div>
+      <div class="fg"><button class="btn btn-g btn-sm" type="button" onclick="generateEncryptionPassphrase()">🎲 Generate a strong passphrase instead</button><div class="fh">Creates a random ~120-bit passphrase server-side and shows it to you exactly once, like a wallet's recovery phrase — worth using instead of typing your own if you don't already have a password manager habit for this.</div></div>
       <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">There's no recovery if you lose this passphrase — encrypted archives become permanently unreadable. Store it somewhere other than this Pi.</div></div>
       <button class="btn btn-p" onclick="saveEncryption()">Save encryption settings</button>
     </div></div>
+  </div>
+</div>
+
+<!-- One-time passphrase reveal — shown only immediately after generateEncryptionPassphrase(), never re-openable, never stores the value anywhere but this one JS variable for the duration this is on screen. -->
+<div class="overlay hidden" id="m-passphrase-reveal">
+  <div class="modal">
+    <div class="mh"><div class="mt">🔑 Write this down now</div></div>
+    <div class="mb">
+      <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">This is shown <strong>once</strong>, right now. PrestoBack does not store it anywhere you can come back and view later — only its effect (the ability to decrypt future archives) does. Copy it into a password manager or write it down before closing this box.</div></div>
+      <div style="font-family:var(--mono);font-size:15px;text-align:center;letter-spacing:1px;background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:14px;margin:12px 0;word-break:break-all;user-select:all" id="passphrase-reveal-value"></div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn btn-g btn-sm" onclick="copyRevealedPassphrase()">📋 Copy</button>
+        <button class="btn btn-p" onclick="closePassphraseReveal()">I've saved it — close</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1013,6 +1029,13 @@ select.fi{cursor:pointer}
             <div class="fg"><label class="fl">Pinned Node ID (read-only)</label><input class="fi" id="rt-prestoback-pinned-id" readonly style="font-family:var(--mono);font-size:11px;color:var(--txt3);cursor:not-allowed"></div>
           </div>
         </div>
+        <div class="fg" id="rt-append-only-field">
+          <label class="fl" style="display:flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="checkbox" id="rt-append-only" style="width:auto">
+            Append-only (immutable) retention
+          </label>
+          <div class="fh">PrestoBack will never delete an older backup from this target once written — new backups still push and prune locally as normal, this target just keeps every generation forever. Protects this copy against ransomware or a compromised admin session wiping your backup history, the same idea as Borg's <code>--append-only</code> or Kopia's Object Lock support. You're responsible for cleaning this target up yourself over time (or via the storage backend's own lifecycle rules) since PrestoBack won't.</div>
+        </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center" id="rt-normal-actions">
           <button class="btn btn-g btn-sm" onclick="testRemoteTargetDraft()">Test connection</button>
           <button class="btn btn-p btn-sm" id="rt-submit-btn" onclick="saveRtForm()">+ Add target</button>
@@ -1102,6 +1125,23 @@ select.fi{cursor:pointer}
       <div class="fr">
         <div class="fg"><label class="fl">Keep last N backups</label><input class="fi" id="ea-retain" type="number" min="1" max="99"></div>
         <div class="fg"><label class="fl">App ID (read-only)</label><input class="fi" id="ea-id" disabled style="opacity:.5"></div>
+      </div>
+      <div class="fg">
+        <div class="ftog" onclick="toggleEaGFS()"><div class="ftog-sw" id="tog-ea-gfs"><div class="ftog-kn"></div></div><div class="ftog-lbl">Use a daily/weekly/monthly retention schedule instead</div></div>
+        <div class="fh">Instead of a flat "keep last N," retain (e.g.) 7 daily backups, 4 weekly, and 6 monthly — same idea as Borg/Kopia's retention policies. "Keep last N" above is still used as a fallback if this is left all-zero.</div>
+      </div>
+      <div class="fr" id="ea-gfs-fields" style="display:none">
+        <div class="fg"><label class="fl">Daily</label><input class="fi" id="ea-gfs-daily" type="number" min="0" max="365" value="7"></div>
+        <div class="fg"><label class="fl">Weekly</label><input class="fi" id="ea-gfs-weekly" type="number" min="0" max="104" value="4"></div>
+        <div class="fg"><label class="fl">Monthly</label><input class="fi" id="ea-gfs-monthly" type="number" min="0" max="60" value="6"></div>
+      </div>
+      <div class="fg">
+        <label class="fl">Raw file sync path <span style="font-weight:400;color:var(--txt2)">(optional — for Kopia/restic/etc.)</span></label>
+        <div style="display:flex;gap:6px">
+          <input class="fi" id="ea-rawsync" placeholder="e.g. /kopia-src" style="flex:1">
+          <button class="btn btn-g btn-sm" type="button" onclick="testRawSyncPath()">Test path</button>
+        </div>
+        <div class="fh">In addition to the normal archive, mirrors this app's live files here on every backup — for an external dedup/snapshot tool (Kopia, restic) to point its own policy at. Leave blank to skip. <span id="ea-rawsync-result"></span></div>
       </div>
       <div class="fg">
         <label class="fl">Container handling during backup</label>
@@ -1546,13 +1586,27 @@ function authQueryParam() {
 }
 
 function authSave(data) {
+  // The token is kept in memory only, for this tab's lifetime — it's
+  // handed to authHeader()/authQueryParam() below for the current page
+  // load, but is NOT written to localStorage. The server already set the
+  // same token as an HttpOnly session cookie in this same response (see
+  // auth.go's setSessionCookie), which the browser sends automatically on
+  // every same-origin request — including a future page reload — without
+  // it ever needing to sit in a place page JavaScript (and therefore any
+  // XSS bug) can read it back out of. This closes the exact gap the
+  // trusted-device "remember this device" cookie was already built to
+  // avoid; the session token just hadn't gotten the same treatment yet.
   S.token = data.token || '';
   S.username = data.username || '';
   S.role = data.role || '';
-  if (S.token) {
-    localStorage.setItem('pb_token', S.token);
-    localStorage.setItem('pb_username', S.username);
-  }
+  // pb_username alone (no secret) is still worth keeping — lets the login
+  // screen greet a returning user by name before the /api/auth/me round
+  // trip below resolves.
+  if (S.username) localStorage.setItem('pb_username', S.username);
+  // One-time cleanup: earlier versions stored the raw token itself here.
+  // Clearing it on every fresh login means an upgrading browser's old,
+  // JS-readable copy doesn't linger forever alongside the new cookie.
+  localStorage.removeItem('pb_token');
 }
 
 function authClear() {
@@ -1563,8 +1617,6 @@ function authClear() {
 }
 
 async function checkAuthAndInit() {
-  // Restore session from storage
-  S.token = localStorage.getItem('pb_token') || '';
   S.username = localStorage.getItem('pb_username') || '';
   S.apiKey = localStorage.getItem('pb_apikey') || ''; // legacy
 
@@ -1577,24 +1629,24 @@ async function checkAuthAndInit() {
     }
   } catch { /* server may be down */ }
 
-  // If we have a token, validate it
-  if (S.token) {
-    try {
-      const me = await fetch('/api/auth/me', {headers:{'Authorization':'Bearer '+S.token}});
-      if (me.ok) {
-        const d = await me.json();
-        S.username = d.username;
-        S.role = d.role;
-        hideAuthScreen();
-        if (checkForPairingLink()) return;
-        loadAll();
-        connectSSE();
-        return;
-      }
-    } catch {}
-    // Token invalid/expired
-    authClear();
-  }
+  // Try the session cookie first — sent automatically by the browser on
+  // this same-origin request, so a returning visit authenticates without
+  // ever having kept the raw token in JS-reachable storage. S.token stays
+  // '' here on a fresh page load; that's expected (see authSave above)
+  // and does not mean "logged out" — the cookie is doing the actual work.
+  try {
+    const me = await fetch('/api/auth/me');
+    if (me.ok) {
+      const d = await me.json();
+      S.username = d.username;
+      S.role = d.role;
+      hideAuthScreen();
+      if (checkForPairingLink()) return;
+      loadAll();
+      connectSSE();
+      return;
+    }
+  } catch {}
 
   // Legacy API key
   if (S.apiKey) {
@@ -3186,6 +3238,14 @@ function openEditApp(id) {
     : '';
   document.getElementById('ea-retain').value=a.retain||5;
   document.getElementById('ea-id').value=a.id;
+  const gfs = a.retention_policy;
+  setTog('tog-ea-gfs', !!gfs);
+  document.getElementById('ea-gfs-fields').style.display = gfs ? '' : 'none';
+  document.getElementById('ea-gfs-daily').value = gfs?.daily || 7;
+  document.getElementById('ea-gfs-weekly').value = gfs?.weekly || 4;
+  document.getElementById('ea-gfs-monthly').value = gfs?.monthly || 6;
+  document.getElementById('ea-rawsync').value = a.raw_sync_path || '';
+  document.getElementById('ea-rawsync-result').textContent = '';
   document.getElementById('ea-strategy').value=a.container_strategy||'stop';
   updateStrategyHint('ea');
   document.getElementById('ea-encrypted').value = a.encrypted===true ? 'true' : a.encrypted===false ? 'false' : '';
@@ -3253,15 +3313,35 @@ function togEditSched() {
   if (pausedHint) pausedHint.style.display = 'none'; // acted on it — the reminder's done its job
 }
 function togEditPin() { S.editPinOn=!S.editPinOn; setTog('edit-pin-tog',S.editPinOn); }
+function toggleEaGFS() {
+  const on = !document.getElementById('tog-ea-gfs').classList.contains('on');
+  setTog('tog-ea-gfs', on);
+  document.getElementById('ea-gfs-fields').style.display = on ? '' : 'none';
+}
+async function testRawSyncPath() {
+  const path = gv('ea-rawsync');
+  const resultEl = document.getElementById('ea-rawsync-result');
+  if (!path) { resultEl.textContent = ''; return; }
+  resultEl.textContent = 'Checking…'; resultEl.style.color = '';
+  try {
+    const r = await api('/api/rawsync/check', {method:'POST', body: JSON.stringify({path})});
+    if (r.ok) { resultEl.textContent = '✓ writable'; resultEl.style.color = 'var(--green)'; }
+    else { resultEl.textContent = '✗ ' + r.error; resultEl.style.color = 'var(--red)'; }
+  } catch(e) { resultEl.textContent = '✗ ' + e.message; resultEl.style.color = 'var(--red)'; }
+}
 async function submitEditApp() {
   const excludesRaw = (document.getElementById('ea-excludes').value||'')
     .split('\n').map(s=>s.trim()).filter(Boolean);
   const linkedContainers = [...document.querySelectorAll('.ea-linked-chk:checked')].map(el => el.value);
   const encVal = gv('ea-encrypted'); // '' = inherit global (send null), 'true'/'false' = explicit override
+  const gfsOn = document.getElementById('tog-ea-gfs').classList.contains('on');
+  const gfsDaily = parseInt(gv('ea-gfs-daily'))||0, gfsWeekly = parseInt(gv('ea-gfs-weekly'))||0, gfsMonthly = parseInt(gv('ea-gfs-monthly'))||0;
   const a = {
     ...S.editApp,
     name:gv('ea-name'), path:gv('ea-path'),
     retain:parseInt(gv('ea-retain'))||5,
+    retention_policy: (gfsOn && (gfsDaily||gfsWeekly||gfsMonthly)) ? {daily:gfsDaily, weekly:gfsWeekly, monthly:gfsMonthly} : null,
+    raw_sync_path: gv('ea-rawsync'),
     pinned:S.editPinOn,
     container_strategy:gv('ea-strategy'),
     encrypted: encVal==='' ? null : encVal==='true',
@@ -4664,6 +4744,36 @@ async function saveEncryption() {
   } catch(e) { toast(e.message,'error'); }
 }
 
+// S_revealedPassphrase lives ONLY in this JS variable, only for as long
+// as the reveal modal is open — never localStorage, never sent anywhere
+// but the one PUT that generated it. See GenerateRecoveryPassphrase's
+// doc comment (config.go) and handleEncryption's PUT case (server.go)
+// for why the server treats this as the one deliberate exception to
+// "never echo a secret back."
+let S_revealedPassphrase = '';
+async function generateEncryptionPassphrase() {
+  if (!confirm('This replaces any passphrase currently set (or about to be typed above) with a fresh, randomly generated one, shown to you exactly once. Continue?')) return;
+  try {
+    const enabled = document.getElementById('tog-encryption').classList.contains('on');
+    const r = await api('/api/encryption', {method:'PUT', body: JSON.stringify({enabled, generate: true})});
+    S_encPassSet = !!r.passphrase_is_set;
+    document.getElementById('enc-passphrase').value = '';
+    S_revealedPassphrase = r.generated_passphrase || '';
+    document.getElementById('passphrase-reveal-value').textContent = S_revealedPassphrase;
+    OM('m-passphrase-reveal');
+  } catch(e) { toast(e.message,'error'); }
+}
+async function copyRevealedPassphrase() {
+  try { await navigator.clipboard.writeText(S_revealedPassphrase); toast('Copied — now put it somewhere durable','success'); }
+  catch { toast('Copy failed — select the text manually','error'); }
+}
+function closePassphraseReveal() {
+  S_revealedPassphrase = '';
+  document.getElementById('passphrase-reveal-value').textContent = '';
+  CM('m-passphrase-reveal');
+  loadEncryption();
+}
+
 // ════════════════════ Remote backup targets ════════════════════
 // S_remoteTargets mirrors RemoteTargetView (server.go) — name/kind plus the
 // kind-specific fields, EXCEPT secrets: sftp_password, sftp_private_key_pass,
@@ -4804,7 +4914,7 @@ function renderRemoteTargets() {
     <div class="bi" style="${editingStyle}">
       <div class="bic" style="border-color:${kindColor}"><svg width="14" height="14" fill="none" stroke="${kindColor}" stroke-width="1.8" viewBox="0 0 24 24"><path d="M20 16.58A5 5 0 0018 7h-1.26A8 8 0 104 15.25"/></svg></div>
       <div class="bm">
-        <div class="bid">${esc(t.name)} <span class="pill pb" style="font-size:9px">${esc(t.kind)}</span>${i===S_rtEditIndex?' <span class="pill" style="font-size:9px;background:var(--accent);color:#fff">✎ editing this one</span>':''}${statusPill}</div>
+        <div class="bid">${esc(t.name)} <span class="pill pb" style="font-size:9px">${esc(t.kind)}</span>${t.append_only?' <span class="pill pg" style="font-size:9px" title="PrestoBack will never delete an older backup from this target">🔒 append-only</span>':''}${i===S_rtEditIndex?' <span class="pill" style="font-size:9px;background:var(--accent);color:#fff">✎ editing this one</span>':''}${statusPill}</div>
         <div class="bif">${esc(remoteTargetSummary(t))}${t.kind==='prestoback'?` · <a href="#" onclick="toggleRtInspect(${i});return false" style="color:var(--accent);text-decoration:none">${S_rtInspectOpen===i?'hide key':'verify key'}</a>`:''}</div>
         <div class="fh" id="rt-row-result-${i}" style="margin:2px 0 0"></div>
         ${inspectRow}
@@ -4829,6 +4939,7 @@ function onRtKindChange() {
   document.getElementById('rt-sftp-field').style.display = kind === 'sftp' ? '' : 'none';
   document.getElementById('rt-s3-field').style.display = kind === 's3' ? '' : 'none';
   document.getElementById('rt-prestoback-field').style.display = kind === 'prestoback' ? '' : 'none';
+  document.getElementById('rt-append-only-field').style.display = kind === 'prestoback' ? 'none' : '';
   document.getElementById('rt-prestoback-add').style.display = editingPrestoback ? 'none' : '';
   document.getElementById('rt-prestoback-edit').style.display = editingPrestoback ? '' : 'none';
   document.getElementById('rt-normal-actions').style.display = (kind === 'prestoback' && !editingPrestoback) ? 'none' : 'flex';
@@ -4844,6 +4955,9 @@ const RT_FIELD_IDS = ['rt-name','rt-mount-path','rt-sftp-host','rt-sftp-port','r
 function draftRemoteTarget() {
   const kind = document.getElementById('rt-kind').value;
   const t = { name: gv('rt-name'), kind };
+  if (kind !== 'prestoback') {
+    t.append_only = !!document.getElementById('rt-append-only').checked;
+  }
   if (kind === 'mount') {
     t.mount_path = gv('rt-mount-path');
   } else if (kind === 'sftp') {
@@ -4996,6 +5110,7 @@ function populateRtForm(t, { forDuplicate } = {}) {
   document.getElementById('rt-name').value = forDuplicate ? (t.name + ' (copy)') : t.name;
   document.getElementById('rt-kind').value = t.kind;
   onRtKindChange();
+  document.getElementById('rt-append-only').checked = !forDuplicate && !!t.append_only;
   if (t.kind === 'mount') {
     document.getElementById('rt-mount-path').value = t.mount_path || '';
   } else if (t.kind === 'sftp') {
@@ -5040,6 +5155,7 @@ function resetRtForm() {
   S_rtEditIndex = null;
   clearRtSubmitReminder();
   RT_FIELD_IDS.forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  document.getElementById('rt-append-only').checked = false;
   document.getElementById('rt-sftp-password').placeholder = 'leave blank if using a private key';
   document.getElementById('rt-sftp-keypass').placeholder = "leave blank if the key isn't encrypted";
   document.getElementById('rt-s3-secretkey').placeholder = '';
@@ -5457,12 +5573,13 @@ async function loadPrestoBackPushers() {
       return `
       <div class="bi">
         <div class="bm">
-          <div class="bid">${escHtml(p.name || p.pusher_node_id)}${staleBadge}</div>
+          <div class="bid">${escHtml(p.name || p.pusher_node_id)}${staleBadge}${p.append_only?' <span class="pill pg" style="font-size:9px" title="This receiver will never delete backups pushed by this instance">🔒 append-only</span>':''}</div>
           <div class="bif" style="font-family:var(--mono);font-size:10.5px">${escHtml(p.pusher_node_id)}</div>
           <div class="fh">Paired ${new Date(p.created_at).toLocaleString()}${p.last_used ? ' · last pushed ' + new Date(p.last_used).toLocaleString() : ' · never pushed yet'}</div>
         </div>
         <div style="display:flex;gap:6px;flex-wrap:wrap">
           <button class="btn btn-g btn-sm" onclick="renamePrestoBackPusher('${p.id}','${escHtml(p.name || p.pusher_node_id)}')">Rename</button>
+          <button class="btn btn-g btn-sm" title="${p.append_only?'Allow this receiver to prune old backups from this pusher again':'Stop this receiver from ever deleting backups pushed by this instance'}" onclick="toggleAppendOnlyPusher('${p.id}',${p.append_only?'false':'true'})">${p.append_only?'🔓 Allow pruning':'🔒 Make append-only'}</button>
           <button class="btn btn-d btn-sm" onclick="revokePrestoBackPusher('${p.id}','${escHtml(p.name || p.pusher_node_id)}')">Revoke</button>
           <button class="btn btn-d btn-sm" title="Revoke AND delete every backup this pusher ever sent — use for a dead/replaced pairing, not an active one" onclick="purgePrestoBackPusher('${p.id}','${escHtml(p.name || p.pusher_node_id)}')">🗑 Purge</button>
         </div>
@@ -5470,6 +5587,24 @@ async function loadPrestoBackPushers() {
     }).join('');
   } catch (e) {
     el.innerHTML = '<span style="color:var(--red)">Could not load: ' + escHtml(e.message) + '</span>';
+  }
+}
+
+// toggleAppendOnlyPusher flips RECEIVER-side enforcement (see
+// RemotePusher.AppendOnly's doc comment in remotepairing.go) — this is
+// the setting that actually matters for ransomware protection on the
+// prestoback-to-prestoback transport, since it's enforced here, on the
+// instance being pushed TO, regardless of what the pushing instance's own
+// RemoteTarget.append_only flag says (that one only governs whether the
+// PUSHER prunes its own copy locally — see rt-append-only in the remote
+// target form above).
+async function toggleAppendOnlyPusher(id, next) {
+  try {
+    await api('/api/remote/pushers/' + id, {method:'PUT', body: JSON.stringify({append_only: next})});
+    toast(next ? 'Now append-only — backups from this instance will never be auto-deleted here' : 'Pruning re-enabled for this pusher', 'success');
+    loadPrestoBackPushers();
+  } catch (e) {
+    toast('Could not update: ' + e.message, 'error');
   }
 }
 

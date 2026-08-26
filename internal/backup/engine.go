@@ -196,6 +196,20 @@ func (e *Engine) CheckAllDiskSpace(appID string, volumes []VolumeTarget, emit fu
 // before containers are stopped, streaming combined stdout/stderr to emit as
 // it runs. A 5-minute timeout prevents a hung hook from blocking the backup
 // indefinitely.
+//
+// Security note: cmdStr runs via `sh -c`, i.e. with full shell semantics
+// (pipes, redirects, subshells — not just a single binary invocation),
+// as root, inside the PrestoBack container. That's the correct behavior
+// for the feature (a real pg_dump/mysqldump one-liner needs redirection),
+// but it means AppConfig.PreBackupCmd is exactly as sensitive as the
+// admin API key that can set it — anyone who can PUT to /api/apps can
+// already run arbitrary commands here. That's an accepted consequence of
+// admin-equivalent API access, same trust boundary as everything else
+// gated by adminForWrites, not a gap specific to this feature. There is
+// currently no dedicated UI field for editing PreBackupCmd (it's only
+// settable via a direct API call), so if/when one is added it should
+// carry a plain warning to that effect rather than presenting it as an
+// inert text field.
 func (e *Engine) RunPreBackupCmd(appID, cmdStr string, emit func(string)) error {
 	cmdStr = strings.TrimSpace(cmdStr)
 	if cmdStr == "" {
@@ -260,11 +274,11 @@ func (e *Engine) RunPreBackupCmd(appID, cmdStr string, emit func(string)) error 
 // config.EncryptionConfig + the app's per-app override — see
 // AppConfig.EffectiveEncrypted in internal/config/config.go); pass "" to
 // write plaintext archives as before.
-func (e *Engine) BackupVolumes(appID, appName string, volumes []VolumeTarget, passphrase string) ([]BackupMeta, error) {
-	return e.backupVolumes(appID, appName, volumes, false, passphrase)
+func (e *Engine) BackupVolumes(appID, appName string, volumes []VolumeTarget, passphrase, rawSyncPath string) ([]BackupMeta, error) {
+	return e.backupVolumes(appID, appName, volumes, false, passphrase, rawSyncPath)
 }
 
-func (e *Engine) backupVolumes(appID, appName string, volumes []VolumeTarget, preRestore bool, passphrase string) ([]BackupMeta, error) {
+func (e *Engine) backupVolumes(appID, appName string, volumes []VolumeTarget, preRestore bool, passphrase, rawSyncPath string) ([]BackupMeta, error) {
 	e.mu.Lock()
 	if e.running[appID] {
 		e.mu.Unlock()
@@ -397,6 +411,29 @@ func (e *Engine) backupVolumes(appID, appName string, volumes []VolumeTarget, pr
 		meta.SizeBytes = finalSize
 		meta.Status = StatusSuccess
 		prog.flush() // make sure the final sample reads 100% for this volume, not whatever the last throttled tick left it at
+
+		// Raw mirror sync for external dedup/snapshot tools (Kopia et al.)
+		// — see AppConfig.RawSyncPath's doc comment (config.go) and
+		// SyncRawTree's own doc comment (below in this file) for what
+		// this is and why it's a plain side effect here, not a
+		// replacement for the tar.gz archive above. Deliberately skipped
+		// for a pre-restore safety snapshot (preRestore==true isn't
+		// reachable through this path today — see backupVolumeLocked's
+		// own separate pre-restore call — but the guard is kept here too
+		// in case that ever changes) and never allowed to fail the
+		// backup itself: a mirror-sync problem is logged and surfaced in
+		// the run log, but the archive that already succeeded above is
+		// the actual backup and stands on its own regardless.
+		if rawSyncPath != "" && !preRestore {
+			mirrorDest := filepath.Join(rawSyncPath, vol.Slug)
+			e.emit(&meta, fmt.Sprintf("Syncing raw files for external tools: %s → %s", vol.Slug, mirrorDest))
+			if copied, removed, syncErr := SyncRawTree(vol.Path, mirrorDest); syncErr != nil {
+				e.emit(&meta, fmt.Sprintf("Raw sync warning (%s): %v — archive above is unaffected", vol.Slug, syncErr))
+			} else {
+				e.emit(&meta, fmt.Sprintf("Raw sync complete (%s): %d changed, %d removed", vol.Slug, copied, removed))
+			}
+		}
+
 		encNote := ""
 		if meta.Encrypted {
 			encNote = ", encrypted 🔒"
@@ -417,7 +454,7 @@ func (e *Engine) backupVolumes(appID, appName string, volumes []VolumeTarget, pr
 // to wire through.
 func (e *Engine) BackupApp(appID, appName, srcPath string, excludes []string) (*BackupMeta, error) {
 	slug := slugFromPath(srcPath)
-	metas, err := e.backupVolumes(appID, appName, []VolumeTarget{{Slug: slug, Path: srcPath, Excludes: excludes}}, false, "")
+	metas, err := e.backupVolumes(appID, appName, []VolumeTarget{{Slug: slug, Path: srcPath, Excludes: excludes}}, false, "", "")
 	if len(metas) > 0 {
 		return &metas[0], err
 	}
@@ -715,7 +752,71 @@ func (e *Engine) DeleteAppBackups(appID string) error {
 // one of those slugs still has a retained archive — so InspectOrphan (which
 // depends on manifests to recover app details for orphaned backup dirs)
 // keeps working correctly through partial prunes.
+// RetentionPolicy is engine.go's own copy of the grandfather-father-son
+// shape config.RetentionPolicy persists — see that type's doc comment
+// (config.go) for the full rationale. Duplicated rather than imported to
+// avoid engine.go (package backup) taking a dependency on internal/config
+// purely for one small value type; server.go, which already imports
+// both packages to glue them together (see its backup.VolumeTarget{}
+// construction from config.VolumeConfig), does the same one-field-at-a-
+// time translation here.
+type RetentionPolicy struct {
+	Daily   int
+	Weekly  int
+	Monthly int
+}
+
+// selectGFSKeep implements RetentionPolicy's selection rule (see that
+// type's doc comment in config.go) over a set of timestamps that are
+// already sorted newest-first. Returns the set of indices (into ts) to
+// KEEP — everything else is prune-eligible. Generic over the caller's
+// own key type (BackupMeta locally, RemoteFile for a remote target) so
+// PruneBackups and PruneRemote can share one implementation instead of
+// two copies of the same bucketing logic drifting apart over time.
+func selectGFSKeep(ts []time.Time, policy RetentionPolicy) map[int]bool {
+	keep := map[int]bool{}
+	bucketKeep := func(bucketOf func(time.Time) string, limit int) {
+		if limit <= 0 {
+			return
+		}
+		seen := map[string]bool{}
+		for i, t := range ts {
+			b := bucketOf(t)
+			if seen[b] {
+				continue // not the newest in this bucket — ts is newest-first, so the first hit per bucket always is
+			}
+			seen[b] = true
+			keep[i] = true
+			if len(seen) >= limit {
+				return
+			}
+		}
+	}
+	bucketKeep(func(t time.Time) string { return t.Format("2006-01-02") }, policy.Daily)
+	bucketKeep(func(t time.Time) string {
+		y, w := t.ISOWeek()
+		return fmt.Sprintf("%d-W%02d", y, w)
+	}, policy.Weekly)
+	bucketKeep(func(t time.Time) string { return t.Format("2006-01") }, policy.Monthly)
+	return keep
+}
+
 func (e *Engine) PruneBackups(appID string, retain int) error {
+	return e.pruneBackupsWithPolicy(appID, retain, nil)
+}
+
+// PruneBackupsGFS is PruneBackups' grandfather-father-son sibling — same
+// function, different selection rule. retain is still accepted and used
+// as the fallback for any BackupMeta slug where policy would keep zero
+// backups (e.g. all three tiers left at 0, or a config edited to a
+// policy that just doesn't happen to reach every volume) so a
+// misconfigured policy degrades to "keep the flat count" rather than to
+// "keep nothing."
+func (e *Engine) PruneBackupsGFS(appID string, retain int, policy RetentionPolicy) error {
+	return e.pruneBackupsWithPolicy(appID, retain, &policy)
+}
+
+func (e *Engine) pruneBackupsWithPolicy(appID string, retain int, policy *RetentionPolicy) error {
 	if retain <= 0 {
 		retain = 5
 	}
@@ -743,6 +844,11 @@ func (e *Engine) PruneBackups(appID string, retain int) error {
 	// other; same count because introducing a second, differently-sized
 	// limit here would be one more number for a user to reason about for
 	// a marginal benefit over just reusing the one they already set.
+	//
+	// GFS policy, when set, applies ONLY to regular backups — pre-restore
+	// snapshots stay on the flat retain count regardless, since "keep one
+	// per week going back 3 months" makes no sense for what's meant to be
+	// a short-lived undo buffer around a specific restore action.
 	bySlug := map[string][]BackupMeta{}
 	preRestoreBySlug := map[string][]BackupMeta{}
 	for _, m := range metas {
@@ -755,10 +861,30 @@ func (e *Engine) PruneBackups(appID string, retain int) error {
 
 	for slug, list := range bySlug {
 		// list is already newest-first from ListBackups sort
-		if len(list) <= retain {
-			continue
+		var toRemove []BackupMeta
+		if policy != nil {
+			ts := make([]time.Time, len(list))
+			for i, m := range list {
+				ts[i] = m.StartedAt
+			}
+			keep := selectGFSKeep(ts, *policy)
+			if len(keep) == 0 {
+				// Degrade to flat retain rather than delete everything —
+				// see PruneBackupsGFS's doc comment.
+				if len(list) > retain {
+					toRemove = list[retain:]
+				}
+			} else {
+				for i, m := range list {
+					if !keep[i] {
+						toRemove = append(toRemove, m)
+					}
+				}
+			}
+		} else if len(list) > retain {
+			toRemove = list[retain:]
 		}
-		for _, m := range list[retain:] {
+		for _, m := range toRemove {
 			log.Printf("[prune] removing old backup: %s (%s)", m.FilePath, slug)
 			_ = os.Remove(m.FilePath)
 		}
@@ -1721,6 +1847,207 @@ func tarGz(srcDir, destFile string, excludes []string, onBytes func(int64)) (int
 		return 0, fmt.Errorf("archive is empty — check that %s contains files and is readable", srcDir)
 	}
 	return fi.Size(), nil
+}
+
+// CheckRawSyncPath verifies path exists, is a directory, and is writable
+// — same write-probe pattern RemoteReachable (remote.go) uses for a
+// mount target, applied here so the UI can offer a "Test path" check
+// before an admin sets AppConfig.RawSyncPath and only finds out it's
+// wrong at the next scheduled backup, hours or days later.
+func CheckRawSyncPath(path string) error {
+	if path == "" {
+		return fmt.Errorf("path is empty")
+	}
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return fmt.Errorf("cannot create %q: %w", path, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("path %q not accessible: %w", path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("path %q is not a directory", path)
+	}
+	probe := filepath.Join(path, ".prestoback_write_test")
+	if err := os.WriteFile(probe, []byte("ok"), 0644); err != nil {
+		return fmt.Errorf("path %q is not writable: %w", path, err)
+	}
+	_ = os.Remove(probe)
+	return nil
+}
+
+// ── Raw mirror sync (for external dedup/snapshot tools, e.g. Kopia) ────────
+//
+// SyncRawTree mirrors srcDir into destDir so an external tool with its own
+// content-addressable snapshot repository (Kopia, restic, borg — anything
+// that wants to point at a real, current file tree rather than an opaque
+// archive) always finds destDir looking exactly like srcDir does right
+// now — same files, same relative paths, same mtimes — with as little
+// spurious churn between runs as possible. See AppConfig.RawSyncPath's
+// doc comment (config.go) for why this exists and how it's meant to be
+// used alongside, not instead of, the normal tar.gz archive.
+//
+// The three rules that make this actually useful to a tool like Kopia
+// (which decides whether to re-read a file's content primarily by
+// comparing size+mtime against its last snapshot, the same heuristic
+// rsync/tar/restore-preview all use elsewhere in this codebase — see
+// classifyEntry's mtimeToleranceSeconds comment in restorepreview.go for
+// the same idea applied to restores):
+//
+//  1. A file whose size AND mtime match what's already at the
+//     destination is left completely untouched — not even re-opened.
+//     This is the case that matters most in practice (a mostly-static
+//     media library, config directory, etc.) and is why repeated runs
+//     stay cheap.
+//  2. A file that's new or changed is copied fresh (not hardlinked) so
+//     the destination always holds independent, safe-to-scan bytes — no
+//     risk of Kopia (or a human) reading through a hardlink and seeing a
+//     file that mutates out from under it mid-scan if the source app
+//     happens to still be writing.
+//  3. Anything present at the destination but no longer present in
+//     srcDir is removed. Without this, RawSyncPath would grow forever —
+//     the mirror's job is "what does the source look like right now,"
+//     not an archive of everything it ever contained. (History/retention
+//     is exactly what the external tool's own snapshot repository is
+//     for — that's the division of labor this feature is built around.)
+//
+// Like tarGz, symlinks are mirrored as literal link targets (never
+// followed), matching what every other file-walk in this codebase
+// already does.
+func SyncRawTree(srcDir, destDir string) (filesCopied, filesRemoved int, err error) {
+	srcDir = filepath.Clean(srcDir)
+	destDir = filepath.Clean(destDir)
+	if _, statErr := os.Stat(srcDir); statErr != nil {
+		return 0, 0, fmt.Errorf("source path %q: %w", srcDir, statErr)
+	}
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return 0, 0, fmt.Errorf("create mirror dir %q: %w", destDir, err)
+	}
+
+	seen := make(map[string]bool)
+
+	walkErr := filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			log.Printf("[rawsync] walk warning: %v — skipping %s", err, path)
+			return nil
+		}
+		rel, relErr := filepath.Rel(srcDir, path)
+		if relErr != nil || rel == "." {
+			return nil
+		}
+		destPath := filepath.Join(destDir, rel)
+		seen[rel] = true
+
+		isSymlink := info.Mode()&os.ModeSymlink != 0
+		switch {
+		case info.IsDir():
+			return os.MkdirAll(destPath, info.Mode().Perm())
+		case isSymlink:
+			target, rlErr := os.Readlink(path)
+			if rlErr != nil {
+				log.Printf("[rawsync] readlink warning: %v — skipping %s", rlErr, path)
+				return nil
+			}
+			if existing, lErr := os.Readlink(destPath); lErr == nil && existing == target {
+				return nil // unchanged
+			}
+			_ = os.Remove(destPath)
+			if err := os.Symlink(target, destPath); err != nil {
+				log.Printf("[rawsync] symlink warning: %v — skipping %s", err, path)
+			}
+			return nil
+		case info.Mode().IsRegular():
+			if destInfo, statErr := os.Lstat(destPath); statErr == nil {
+				sameSize := destInfo.Size() == info.Size()
+				sameMtime := destInfo.ModTime().Unix() == info.ModTime().Unix()
+				if sameSize && sameMtime {
+					return nil // rule 1 — untouched
+				}
+			}
+			if err := copyFileWithMtime(path, destPath, info); err != nil {
+				log.Printf("[rawsync] copy warning: %v — skipping %s", err, path)
+				return nil
+			}
+			filesCopied++
+			return nil
+		default:
+			return nil // sockets, devices, etc. — same "not a meaningful backup target" posture as tarGz
+		}
+	})
+	if walkErr != nil {
+		return filesCopied, filesRemoved, fmt.Errorf("walk %s: %w", srcDir, walkErr)
+	}
+
+	// Rule 3: prune anything in destDir that wasn't just seen in srcDir.
+	// Walked separately, after the copy pass, and depth-first-safe by
+	// walking destDir top-down but only removing directories once empty
+	// (filepath.Walk itself doesn't support post-order, so a plain
+	// os.RemoveAll on an unseen directory is used instead — safe here
+	// because "unseen" already means nothing under it was in srcDir
+	// either, so there's nothing worth preserving underneath it).
+	pruneErr := filepath.Walk(destDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || path == destDir {
+			return nil
+		}
+		rel, relErr := filepath.Rel(destDir, path)
+		if relErr != nil {
+			return nil
+		}
+		if seen[rel] {
+			return nil
+		}
+		filesRemoved++
+		if info.IsDir() {
+			_ = os.RemoveAll(path)
+			return filepath.SkipDir
+		}
+		_ = os.Remove(path)
+		return nil
+	})
+	if pruneErr != nil {
+		return filesCopied, filesRemoved, fmt.Errorf("prune %s: %w", destDir, pruneErr)
+	}
+
+	log.Printf("[rawsync] %s → %s: %d copied, %d removed", srcDir, destDir, filesCopied, filesRemoved)
+	return filesCopied, filesRemoved, nil
+}
+
+// copyFileWithMtime copies src to dst (overwriting dst if present) and
+// then sets dst's mtime to match src's — the mtime match is what lets
+// the NEXT SyncRawTree pass recognize this file as unchanged via rule 1
+// above, and it's exactly what an external tool like Kopia also uses to
+// decide whether to re-read a file's content, so keeping it faithful
+// matters for both sides of this feature, not just PrestoBack's own
+// re-run cost.
+func copyFileWithMtime(src, dst string, srcInfo os.FileInfo) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	tmp := dst + ".rawsync-tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, srcInfo.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Chtimes(tmp, srcInfo.ModTime(), srcInfo.ModTime()); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	// Same rename-over-final-name posture used everywhere else in this
+	// codebase (sftpPut, extractTarGz) — destDir never has a
+	// partially-written file visible at its real name.
+	return os.Rename(tmp, dst)
 }
 
 // verifyArchive performs a quick integrity pass over a freshly written

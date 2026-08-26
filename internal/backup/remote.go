@@ -105,10 +105,19 @@ type RemoteTarget struct {
 	// every push and reachability check refuses rather than silently
 	// trusting whatever answers now, the same "host key changed" posture
 	// sftpconn.go's KnownHostsPath already takes for SSH.
-	PrestoBackURL             string `json:"prestoback_url,omitempty"`              // e.g. "http://192.168.1.50:8778"
+	PrestoBackURL             string `json:"prestoback_url,omitempty"`               // e.g. "http://192.168.1.50:8778"
 	PrestoBackPinnedNodeID    string `json:"prestoback_pinned_node_id,omitempty"`    // set once at pairing time, never updated silently
 	PrestoBackPinnedPublicKey string `json:"prestoback_pinned_public_key,omitempty"` // base64, set once at pairing time
 	PrestoBackPushCredential  string `json:"prestoback_push_credential,omitempty"`   // issued at pairing time, sent on every push
+
+	// AppendOnly opts a mount/sftp/s3 target OUT of PruneRemote's
+	// retention deletes entirely — see config.RemoteTarget.AppendOnly's
+	// doc comment (config.go) for the full rationale; this is that same
+	// flag's copy on the engine-side struct that PruneRemote actually
+	// operates on, translated at the server layer (toBackupTarget) the
+	// same way every other config.RemoteTarget -> backup.RemoteTarget
+	// field already is.
+	AppendOnly bool `json:"append_only,omitempty"`
 }
 
 // RemoteFile describes one archive found on a remote target.
@@ -427,8 +436,19 @@ func ListRemoteFiles(t RemoteTarget, appID string) ([]RemoteFile, error) {
 // ListBackups and PruneBackups use locally, so a slug on the remote means
 // the same thing it means on disk — this is deliberately not a separate
 // parser that could drift from the local one.
-func PruneRemote(t RemoteTarget, appID string, retain int) error {
+func PruneRemote(t RemoteTarget, appID string, retain int, policy *RetentionPolicy) error {
 	if t.Kind == "prestoback" {
+		return nil
+	}
+	if t.AppendOnly {
+		// This target is opted out of deletion entirely — see
+		// RemoteTarget.AppendOnly's doc comment (config.go). New backups
+		// still push normally (PushFile doesn't consult this flag at
+		// all); only the retention/prune path is short-circuited here,
+		// which is deliberately the ONLY place in this codebase that
+		// deletes from a mount/sftp/s3 target on PrestoBack's own
+		// initiative. A no-op return, not an error — declining to prune
+		// isn't a failure, it's the feature working as intended.
 		return nil
 	}
 	if retain <= 0 {
@@ -463,17 +483,41 @@ func PruneRemote(t RemoteTarget, appID string, retain int) error {
 	}
 
 	var lastErr error
-	prune := func(group map[string][]named) {
+	// applyPolicy, when non-nil, applies GFS selection instead of a flat
+	// retain count — same "regular backups only, pre-restore snapshots
+	// stay flat-count" split PruneBackups uses locally (engine.go), for
+	// the same reason: a weekly/monthly bucketed policy doesn't make
+	// sense for a short-lived undo buffer around one restore action.
+	prune := func(group map[string][]named, applyPolicy bool) {
 		for _, list := range group {
-			if len(list) <= retain {
-				continue
-			}
 			// Newest-first, same ordering ListBackups produces locally —
 			// ListRemoteFiles carries ModTime for every kind (mount:
 			// os.FileInfo; sftp: fs.FileInfo; s3: LastModified), so this is
 			// consistent across backends.
 			sort.Slice(list, func(i, j int) bool { return list[i].ModTime.After(list[j].ModTime) })
-			for _, f := range list[retain:] {
+
+			var toRemove []named
+			if applyPolicy && policy != nil {
+				ts := make([]time.Time, len(list))
+				for i, f := range list {
+					ts[i] = f.ModTime
+				}
+				keep := selectGFSKeep(ts, *policy)
+				if len(keep) == 0 {
+					if len(list) > retain {
+						toRemove = list[retain:]
+					}
+				} else {
+					for i, f := range list {
+						if !keep[i] {
+							toRemove = append(toRemove, f)
+						}
+					}
+				}
+			} else if len(list) > retain {
+				toRemove = list[retain:]
+			}
+			for _, f := range toRemove {
 				if err := deleteRemoteFile(t, f.Path); err != nil {
 					lastErr = fmt.Errorf("delete %s: %w", f.Name, err)
 					continue
@@ -481,8 +525,8 @@ func PruneRemote(t RemoteTarget, appID string, retain int) error {
 			}
 		}
 	}
-	prune(bySlug)
-	prune(preRestoreBySlug)
+	prune(bySlug, true)
+	prune(preRestoreBySlug, false)
 	return lastErr
 }
 

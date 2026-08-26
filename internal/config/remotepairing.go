@@ -59,8 +59,8 @@ import (
 
 const (
 	remotePairingSecretBytes  = 32              // 256 bits — brute-forcing this over the network is infeasible, same size as GenerateAPIKey
-	remotePairingTTL          = 5 * time.Minute  // matches pairing.go's device-pairing TTL
-	remotePairingClaimRate    = 20               // same brute-force guard pairing.go's pairingClaimRate applies
+	remotePairingTTL          = 5 * time.Minute // matches pairing.go's device-pairing TTL
+	remotePairingClaimRate    = 20              // same brute-force guard pairing.go's pairingClaimRate applies
 	remoteChallengeNonceBytes = 32
 )
 
@@ -344,6 +344,21 @@ type RemotePusher struct {
 	CredentialHash  string     `json:"credential_hash"`   // HashAPIKey(credential) — the raw credential is shown to the pusher exactly once, at pairing time, same as every other issued credential in this package
 	CreatedAt       time.Time  `json:"created_at"`
 	LastUsed        *time.Time `json:"last_used,omitempty"`
+	// AppendOnly, when true, makes this RECEIVER refuse to prune/delete
+	// anything already accepted from this pusher — new pushes still land
+	// normally, but pruneReceivedBackups (remotepairing_handlers.go)
+	// short-circuits before removing anything. This is set here, on the
+	// receiver's own record of the pusher, deliberately NOT as something
+	// the pusher's push request could ever influence — an append-only
+	// guarantee that the sender could quietly turn off by including a
+	// flag in its own request wouldn't be a guarantee at all. Mirrors
+	// Borg's `--append-only` SSH-side restriction and Kopia's S3
+	// Object-Lock support: the same idea (a receiver-enforced retention
+	// floor that survives a compromised or malicious sender), applied to
+	// PrestoBack's own instance-to-instance transport. See
+	// RemoteTarget.AppendOnly (config.go) for the equivalent flag on the
+	// PUSHER side, which governs mount/sftp/s3 targets the same way.
+	AppendOnly bool `json:"append_only,omitempty"`
 }
 
 // shortNodeIDFragment returns just the first 4-hex-char chunk of a chunked
@@ -495,6 +510,24 @@ func (c *Config) RenameRemotePusher(id, name string) error {
 		return fmt.Errorf("remote pusher '%s' not found", id)
 	}
 	rp.Name = name
+	c.remotePushers[id] = rp
+	c.mu.Unlock()
+	return c.Save()
+}
+
+// SetRemotePusherAppendOnly turns append-only retention (see
+// RemotePusher.AppendOnly's doc comment) on or off for one paired pusher.
+// Admin-gated at the HTTP layer (adminForWrites), same as every other
+// mutation to the pusher registry — a receiver's own admin is the only
+// party who should ever be able to loosen this once set.
+func (c *Config) SetRemotePusherAppendOnly(id string, appendOnly bool) error {
+	c.mu.Lock()
+	rp, ok := c.remotePushers[id]
+	if !ok {
+		c.mu.Unlock()
+		return fmt.Errorf("remote pusher '%s' not found", id)
+	}
+	rp.AppendOnly = appendOnly
 	c.remotePushers[id] = rp
 	c.mu.Unlock()
 	return c.Save()

@@ -225,7 +225,17 @@ func (s *Server) handleRemoteReceiveBackup(w http.ResponseWriter, r *http.Reques
 	// own (see pruneReceivedBackups) — only archives trigger a prune pass,
 	// keeping a manifest push itself cheap and side-effect-light.
 	if strings.HasSuffix(name, ".tar.gz") {
-		pruneReceivedBackups(dir, defaultReceivedRetain)
+		if rp.AppendOnly {
+			// Append-only pushers (see RemotePusher.AppendOnly's doc
+			// comment in remotepairing.go) never get pruned on receive —
+			// new archives keep landing, nothing already accepted is ever
+			// removed by this instance. Retention/cleanup for an
+			// append-only pusher is a deliberate, separate, manual action
+			// an admin takes here (e.g. via the received-backups list),
+			// never an automatic side effect of the next push arriving.
+		} else {
+			pruneReceivedBackups(dir, defaultReceivedRetain)
+		}
 		s.dispatchNotify(notify.Event{
 			Kind: "remote_receive_success", AppName: appID,
 			Detail: fmt.Sprintf("%s pushed %s (%s)", rp.Name, name, humanReceiveBytes(written)),
@@ -585,17 +595,26 @@ func (s *Server) handleRemotePusherByID(w http.ResponseWriter, r *http.Request) 
 	switch r.Method {
 	case http.MethodPut:
 		var req struct {
-			Name string `json:"name"`
+			Name       string `json:"name"`
+			AppendOnly *bool  `json:"append_only,omitempty"` // pointer — nil means "not included in this request", not "set to false"; lets a rename-only PUT leave the flag untouched
 		}
 		if err := parseJSON(r, &req); err != nil {
 			errOut(w, 400, err.Error())
 			return
 		}
-		if err := s.cfg.RenameRemotePusher(id, req.Name); err != nil {
-			errOut(w, 400, err.Error())
-			return
+		if req.Name != "" {
+			if err := s.cfg.RenameRemotePusher(id, req.Name); err != nil {
+				errOut(w, 400, err.Error())
+				return
+			}
 		}
-		respond(w, 200, map[string]string{"status": "renamed"})
+		if req.AppendOnly != nil {
+			if err := s.cfg.SetRemotePusherAppendOnly(id, *req.AppendOnly); err != nil {
+				errOut(w, 400, err.Error())
+				return
+			}
+		}
+		respond(w, 200, map[string]string{"status": "updated"})
 
 	case http.MethodDelete:
 		if err := s.cfg.DeleteRemotePusher(id); err != nil {

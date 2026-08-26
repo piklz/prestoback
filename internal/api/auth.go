@@ -247,6 +247,16 @@ func (s *Server) authJWT(next http.HandlerFunc) http.HandlerFunc {
 		if token == "" {
 			token = r.URL.Query().Get("token")
 		}
+		// HttpOnly session cookie — the fallback SSE/downloadBackup/a
+		// reloaded page now actually rely on (see sessionCookieName's doc
+		// comment above). Lowest priority: an explicit header or query
+		// param always wins if a caller sent one, same "most specific
+		// wins" precedence used for everything else in this function.
+		if token == "" {
+			if cookie, err := r.Cookie(sessionCookieName); err == nil {
+				token = cookie.Value
+			}
+		}
 		if token != "" {
 			if s.cfg.IsTokenRevoked(token) {
 				errOut(w, 401, "token has been revoked — please log in again")
@@ -319,6 +329,7 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := s.issueToken(req.Username, roleAdmin)
+	setSessionCookie(w, r, token, time.Now().Add(jwtTTL))
 	respond(w, 201, map[string]any{
 		"token":    token,
 		"username": req.Username,
@@ -366,6 +377,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		if cookie, err := r.Cookie(trustedDeviceCookieName); err == nil {
 			if s.cfg.ValidateTrustedDevice(user.Username, cookie.Value) {
 				token := s.issueToken(user.Username, user.Role)
+				setSessionCookie(w, r, token, time.Now().Add(jwtTTL))
 				respond(w, 200, map[string]any{
 					"token":    token,
 					"username": user.Username,
@@ -390,6 +402,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := s.issueToken(user.Username, user.Role)
+	setSessionCookie(w, r, token, time.Now().Add(jwtTTL))
 	respond(w, 200, map[string]any{
 		"token":    token,
 		"username": user.Username,
@@ -409,6 +422,46 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 // than a token that only ever grants what a plain password already would.
 
 const trustedDeviceCookieName = "prestoback_trust"
+
+// ── Session cookie (HttpOnly mirror of the bearer JWT) ──────────────────────
+//
+// The JWT itself is still returned in every login/setup/mfa-verify JSON
+// response and still accepted via the Authorization header — existing
+// scripts, the mobile app, and any client that stores it deliberately
+// keep working unchanged. What's new is that the SAME token is ALSO set
+// as an HttpOnly cookie, and authJWT (below) accepts it from there as a
+// fallback. The frontend (index.html) now leans on the cookie rather than
+// keeping the raw token in localStorage — see authSave/checkAuthAndInit
+// there — closing the gap this codebase already recognized and fixed for
+// the trusted-device token (see that cookie's own doc comment just
+// above): a token only JavaScript can read is a token any XSS bug can
+// steal, whereas an HttpOnly cookie never reaches page script at all,
+// even if a future dependency or a copy-pasted snippet introduces one.
+//
+// This is additive, not a breaking change: authJWT still checks the
+// Authorization header FIRST, so nothing that already sends a Bearer
+// token is affected either way.
+const sessionCookieName = "prestoback_session"
+
+func setSessionCookie(w http.ResponseWriter, r *http.Request, token string, expiresAt time.Time) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		Expires:  expiresAt,
+		HttpOnly: true,
+		Secure:   isRequestSecure(r),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookieName, Value: "", Path: "/",
+		Expires: time.Unix(0, 0), MaxAge: -1,
+		HttpOnly: true, Secure: isRequestSecure(r), SameSite: http.SameSiteLaxMode,
+	})
+}
 
 // isRequestSecure reports whether this request arrived over a connection
 // that was actually encrypted end-to-end from the browser's point of view
@@ -465,7 +518,15 @@ func (s *Server) handleAuthMFAVerify(w http.ResponseWriter, r *http.Request) {
 		// code is exactly the kind of thing a timing side-channel or rapid
 		// brute force should not get an edge on.
 		time.Sleep(400 * time.Millisecond)
-		errOut(w, 401, err.Error())
+		// A lockout message reads as "too many failed codes — try again in
+		// ..." (see mfa.go's checkMFALockout) — surfaced as 429 so the UI
+		// can show it the same way it already shows a password lockout,
+		// rather than a generic "invalid code" 401.
+		status := 401
+		if strings.Contains(err.Error(), "too many failed codes") {
+			status = 429
+		}
+		errOut(w, status, err.Error())
 		return
 	}
 	if req.RememberDevice {
@@ -480,6 +541,7 @@ func (s *Server) handleAuthMFAVerify(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	token := s.issueToken(username, role)
+	setSessionCookie(w, r, token, time.Now().Add(jwtTTL))
 	respond(w, 200, map[string]any{
 		"token":    token,
 		"username": username,
@@ -690,7 +752,13 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	bearer := r.Header.Get("Authorization")
 	if strings.HasPrefix(bearer, "Bearer ") {
 		s.cfg.RevokeToken(strings.TrimPrefix(bearer, "Bearer "))
+	} else if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
+		// Session carried only by the cookie (the new default posture —
+		// see sessionCookieName's doc comment) still needs to hit the
+		// revocation list, same as a header-carried token would.
+		s.cfg.RevokeToken(cookie.Value)
 	}
+	clearSessionCookie(w, r)
 	respond(w, 200, map[string]string{"status": "logged out"})
 }
 

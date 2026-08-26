@@ -18,6 +18,19 @@ const (
 	EventPushFail       EventType = "push_fail"
 	EventPullSuccess    EventType = "pull_success"
 	EventPullFail       EventType = "pull_fail"
+	// EventRestoreCheckPass / EventRestoreCheckFail record a scheduled,
+	// unattended restorability check (see server.go's
+	// runRestoreHealthCheck) — running RestorePreview against each app's
+	// newest backup on a fixed cadence, so "the archive exists" and "the
+	// archive would actually restore cleanly" get verified on a
+	// schedule rather than the first time anyone finds out being an
+	// actual emergency. Fail means the archive couldn't be opened/
+	// decrypted/parsed at all, or the preview surfaced a real structural
+	// problem (RestorePreview.TypeConflicts > 0) — not merely that the
+	// live volume has drifted from the backup, which is completely
+	// normal and expected between backup runs.
+	EventRestoreCheckPass EventType = "restore_check_pass"
+	EventRestoreCheckFail EventType = "restore_check_fail"
 )
 
 type Entry struct {

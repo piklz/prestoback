@@ -359,6 +359,80 @@ func (c *Config) VerifyAndConsumeBackupCode(username, code string) bool {
 	return true
 }
 
+// ── Second-factor lockout ────────────────────────────────────────────────
+//
+// internal/api/auth.go already rate-limits repeated PASSWORD guesses
+// (checkLoginLockout / recordLoginFailure) — 5 failures locks a username
+// out for 5 minutes. That protects the password itself, but it does
+// nothing for the second factor: if an attacker already has a valid
+// password (reused/leaked elsewhere), every login attempt passes the
+// password check and clears the password-lockout counter, so they get an
+// unthrottled string of TOTP guesses — one per login round trip, ~2.5/sec
+// given the 400ms delay handleAuthMFAVerify already applies on a wrong
+// code. Against a 6-digit (1,000,000) code space that's a brute-forceable
+// window of a few days, which is exactly the scenario a second factor is
+// supposed to close off.
+//
+// This mirrors checkLoginLockout's shape exactly (same threshold/window
+// order of magnitude) but is tracked independently, keyed by the ACCOUNT
+// the code was being verified for (not by pending-login token, since
+// those are single-use and would let an attacker just mint a fresh one
+// every guess) — so a string of wrong codes against one account locks
+// out further second-factor attempts for that account specifically,
+// regardless of how many different pending-login tokens or source IPs
+// they're minted from.
+type mfaLockoutState struct {
+	failures    int
+	lockedUntil time.Time
+}
+
+const (
+	maxMFAAttempts     = 5
+	mfaLockoutDuration = 5 * time.Minute
+)
+
+// checkMFALockout returns a non-empty message if username is currently
+// locked out of second-factor verification. Caller must NOT hold c.mu.
+func (c *Config) checkMFALockout(username string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st, ok := c.mfaAttempts[strings.ToLower(username)]
+	if !ok {
+		return ""
+	}
+	if time.Now().Before(st.lockedUntil) {
+		remaining := time.Until(st.lockedUntil).Round(time.Second)
+		return fmt.Sprintf("too many failed codes — try again in %s", remaining)
+	}
+	return ""
+}
+
+// recordMFAFailure increments the failure count for username and locks it
+// out once maxMFAAttempts is reached. Caller must NOT hold c.mu.
+func (c *Config) recordMFAFailure(username string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := strings.ToLower(username)
+	st, ok := c.mfaAttempts[key]
+	if !ok {
+		st = &mfaLockoutState{}
+		c.mfaAttempts[key] = st
+	}
+	st.failures++
+	if st.failures >= maxMFAAttempts {
+		st.lockedUntil = time.Now().Add(mfaLockoutDuration)
+	}
+}
+
+// recordMFASuccess clears any failure history for username — a fresh
+// start after a legitimate second-factor verification, same as
+// recordLoginSuccess does for the password lockout.
+func (c *Config) recordMFASuccess(username string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.mfaAttempts, strings.ToLower(username))
+}
+
 // ── Two-step login (password, then second factor) ──────────────────────────
 
 // sweepExpiredMFALogins mirrors sweepExpiredPairings — same lazy,
@@ -416,12 +490,19 @@ func (c *Config) CompleteMFALogin(token, code string) (username, role string, er
 		return "", "", fmt.Errorf("MFA is no longer enabled for this account — please log in again")
 	}
 
+	if msg := c.checkMFALockout(p.Username); msg != "" {
+		return "", "", fmt.Errorf("%s", msg)
+	}
+
 	if VerifyTOTP(u.MFASecret, code) {
+		c.recordMFASuccess(p.Username)
 		return p.Username, p.Role, nil
 	}
 	if c.VerifyAndConsumeBackupCode(p.Username, code) {
+		c.recordMFASuccess(p.Username)
 		return p.Username, p.Role, nil
 	}
+	c.recordMFAFailure(p.Username)
 	return "", "", fmt.Errorf("invalid code")
 }
 

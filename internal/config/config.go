@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -55,18 +56,50 @@ type VolumeConfig struct {
 	Enabled  bool     `json:"enabled"` // false = skip this volume in backups
 }
 
+// RetentionPolicy is a grandfather-father-son retention scheme — the
+// same shape Kopia/Borg/most serious backup tools offer, and the #1 gap
+// flagged against them in the 2026-08-25 audit: a flat "keep N" count
+// (AppConfig.Retain) can't express "I want a backup for every day this
+// week, but only one per week going back a couple months, and one per
+// month beyond that" — the actual shape of how people think about
+// backup history. Kept as a separate, optional struct rather than
+// changing what Retain means: nil (the default) means "keep using the
+// flat Retain count," so every existing app config keeps behaving
+// exactly as it does today with zero migration needed.
+//
+// Selection algorithm (selectGFSKeep, engine.go): a backup is kept if it
+// is the NEWEST backup within its calendar day, for the Daily most
+// recent such days; independently, the newest within its ISO week, for
+// the Weekly most recent such weeks; independently, the newest within
+// its calendar month, for the Monthly most recent such months. A backup
+// can qualify under more than one tier at once (the newest backup
+// overall is almost always the daily/weekly/monthly "son" for all three
+// simultaneously) — the kept set is the union, not additive counting.
+type RetentionPolicy struct {
+	Daily   int `json:"daily"`
+	Weekly  int `json:"weekly"`
+	Monthly int `json:"monthly"`
+}
+
 // AppConfig represents a single application with one or more volumes to back up.
 //
 // Migration: the old single-path schema (Path/Excludes) is still read from disk
 // for existing entries, then promoted to Volumes on first load.
 type AppConfig struct {
-	ID            string         `json:"id"`
-	Name          string         `json:"name"`
-	Retain        int            `json:"retain"`
-	Schedule      Schedule       `json:"schedule"`
-	Pinned        bool           `json:"pinned"`
-	ContainerName string         `json:"container_name,omitempty"`
-	Volumes       []VolumeConfig `json:"volumes"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Retain int    `json:"retain"`
+	// RetentionPolicy, when non-nil, replaces the flat Retain-count
+	// pruning in PruneBackups/PruneRemote with grandfather-father-son
+	// selection — see RetentionPolicy's own doc comment above. Retain is
+	// still read/written as before (kept as the fallback and as what a
+	// plain "keep last N" UI continues to edit); this field is strictly
+	// additive.
+	RetentionPolicy *RetentionPolicy `json:"retention_policy,omitempty"`
+	Schedule        Schedule         `json:"schedule"`
+	Pinned          bool             `json:"pinned"`
+	ContainerName   string           `json:"container_name,omitempty"`
+	Volumes         []VolumeConfig   `json:"volumes"`
 
 	// CreatedAt fixes app ordering. apps is a Go map (see Config below),
 	// and map iteration order is deliberately randomized by the runtime —
@@ -96,6 +129,40 @@ type AppConfig struct {
 	// db.sqlite3.bak → db.sqlite3 or run pg_restore). Empty for apps that
 	// don't use a pre-backup dump command.
 	PostRestoreHint string `json:"post_restore_hint,omitempty"`
+
+	// RawSyncPath, when set, opts this app into ALSO maintaining a plain,
+	// uncompressed mirror of every volume's live files at
+	// <RawSyncPath>/<volume-slug>/ on every backup run — in addition to,
+	// never instead of, the normal encrypted/compressed tar.gz archive
+	// (PruneBackups/retention/remote-push all keep working exactly as
+	// they do today; this is a side effect bolted onto backupVolumeLocked,
+	// not a replacement backup mode).
+	//
+	// Why this exists: PrestoBack's own archives are opaque to any
+	// external dedup/snapshot tool (Kopia, restic, Duplicati) — a
+	// tar.gz's bytes change completely between runs even when the
+	// underlying files barely did, so pointing one of those tools AT a
+	// PrestoBack archive gets none of its dedup benefit. Those tools all
+	// want a real, on-disk file tree to diff against their own repository
+	// — this gives them one. The mirror itself is produced by
+	// SyncRawTree (see engine.go): changed/new files are copied,
+	// unchanged files are hardlinked from the previous mirror pass (so
+	// mtime/inode churn stays minimal — most snapshot tools, Kopia
+	// included, use exactly that signal to skip re-reading a file's
+	// content), and files removed from the source are removed from the
+	// mirror too, so the mirror always reflects "what's really there
+	// right now," not an ever-growing pile of history (the history is
+	// what Kopia's own snapshot repository is for).
+	//
+	// Typical use: point RawSyncPath at a bind mount shared with a
+	// separately-run Kopia container (e.g. backed by SeaweedFS as its
+	// blob store), whose own snapshot policy watches that same path.
+	// PrestoBack's tar.gz stays the fast, self-contained "restore this
+	// one app right now" safety net; Kopia's repository becomes the
+	// long-horizon, deduplicated, space-efficient history across every
+	// app sharing one RawSyncPath tree. Left empty (the default), no
+	// mirror is maintained and nothing changes from today's behavior.
+	RawSyncPath string `json:"raw_sync_path,omitempty"`
 
 	// LinkedContainers names additional containers (by exact Docker name,
 	// not service name) to quiesce alongside this app's own matched
@@ -198,11 +265,11 @@ type NotifyConfig struct {
 	WebhookURL     string `json:"webhook_url,omitempty"`
 	WebhookEnabled bool   `json:"webhook_enabled"`
 
-	OnBackupSuccess  bool `json:"on_backup_success"`
-	OnBackupFail     bool `json:"on_backup_fail"`
-	OnRestoreSuccess bool `json:"on_restore_success"`
-	OnRestoreFail    bool `json:"on_restore_fail"`
-	OnRemoteReceive  bool `json:"on_remote_receive"`
+	OnBackupSuccess          bool `json:"on_backup_success"`
+	OnBackupFail             bool `json:"on_backup_fail"`
+	OnRestoreSuccess         bool `json:"on_restore_success"`
+	OnRestoreFail            bool `json:"on_restore_fail"`
+	OnRemoteReceive          bool `json:"on_remote_receive"`
 	OnSchedulePausedReminder bool `json:"on_schedule_paused_reminder"`
 }
 
@@ -276,6 +343,24 @@ type RemoteTarget struct {
 	PrestoBackPinnedNodeID    string `json:"prestoback_pinned_node_id,omitempty"`
 	PrestoBackPinnedPublicKey string `json:"prestoback_pinned_public_key,omitempty"`
 	PrestoBackPushCredential  string `json:"prestoback_push_credential,omitempty"`
+
+	// AppendOnly opts a mount/sftp/s3 target OUT of PruneRemote's
+	// retention deletes entirely (see internal/backup/remote.go) — new
+	// archives keep pushing, nothing already written to this target is
+	// ever removed by PrestoBack itself. This is the same idea as Borg's
+	// `--append-only` and Kopia's S3 Object-Lock support: a ransomware
+	// attacker (or a compromised admin session) who can reach this
+	// instance's normal backup flow still can't wipe out prior
+	// generations on a target marked this way — only a human explicitly
+	// unchecking this box, or acting directly on the storage backend
+	// itself (e.g. an S3 bucket's own Object Lock, which this flag does
+	// NOT configure on its own — see the S3 target's own field comment),
+	// can. Does not apply to Kind == "prestoback"; that transport has its
+	// own, receiver-enforced equivalent — see RemotePusher.AppendOnly in
+	// remotepairing.go, which is the flag that actually matters there
+	// since a pusher's own copy of this struct is exactly what an
+	// attacker with pusher-side access would be trying to flip back off.
+	AppendOnly bool `json:"append_only,omitempty"`
 }
 
 // RemoteConfig holds every configured push destination. Push is additive to
@@ -348,16 +433,16 @@ type PairedKey struct {
 
 // disk is the on-disk JSON shape.
 type disk struct {
-	APIKey       string           `json:"api_key"`
-	Apps         []AppConfig      `json:"apps"`
-	Notify       NotifyConfig     `json:"notify"`
-	Users        []User           `json:"users,omitempty"`
-	Encryption   EncryptionConfig `json:"encryption,omitempty"`
-	Remote       RemoteConfig     `json:"remote,omitempty"`
-	PairedKeys   []PairedKey      `json:"paired_keys,omitempty"`
-	NodeIdentity *NodeIdentity    `json:"node_identity,omitempty"`
-	RemotePushers []RemotePusher  `json:"remote_pushers,omitempty"`
-	TrustedDevices []TrustedDevice `json:"trusted_devices,omitempty"`
+	APIKey         string           `json:"api_key"`
+	Apps           []AppConfig      `json:"apps"`
+	Notify         NotifyConfig     `json:"notify"`
+	Users          []User           `json:"users,omitempty"`
+	Encryption     EncryptionConfig `json:"encryption,omitempty"`
+	Remote         RemoteConfig     `json:"remote,omitempty"`
+	PairedKeys     []PairedKey      `json:"paired_keys,omitempty"`
+	NodeIdentity   *NodeIdentity    `json:"node_identity,omitempty"`
+	RemotePushers  []RemotePusher   `json:"remote_pushers,omitempty"`
+	TrustedDevices []TrustedDevice  `json:"trusted_devices,omitempty"`
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -422,6 +507,18 @@ type Config struct {
 	// a real, long-lived authorization a user should be able to see and
 	// revoke, not an ephemeral handshake.
 	trustedDevices map[string]TrustedDevice
+
+	// mfaAttempts tracks failed second-factor verifications per username,
+	// independent of the password-login lockout in internal/api/auth.go.
+	// Without this, an attacker who already has a valid password (leaked/
+	// reused elsewhere) could guess a 6-digit TOTP code indefinitely —
+	// each guess just costs one more password-verified login round trip,
+	// which the password lockout doesn't rate-limit at all since the
+	// password itself is correct every time. Deliberately not persisted,
+	// same short-lived-in-memory posture as every other lockout/pending
+	// map in this struct — see mfa.go's lockout section for the actual
+	// threshold/duration and reasoning.
+	mfaAttempts map[string]*mfaLockoutState
 }
 
 func Load(dataDir string) (*Config, error) {
@@ -429,16 +526,17 @@ func Load(dataDir string) (*Config, error) {
 		return nil, err
 	}
 	c := &Config{
-		DataDir:       dataDir,
-		apps:          make(map[string]AppConfig),
-		users:         make(map[string]User),
-		revokedTokens: make(map[string]struct{}),
-		pairedKeys:    make(map[string]PairedKey),
-		pending:       make(map[string]*pendingPairing),
-		mfaPending:    make(map[string]*pendingMFALogin),
-		remotePending: make(map[string]*pendingRemotePairing),
-		remotePushers: make(map[string]RemotePusher),
+		DataDir:        dataDir,
+		apps:           make(map[string]AppConfig),
+		users:          make(map[string]User),
+		revokedTokens:  make(map[string]struct{}),
+		pairedKeys:     make(map[string]PairedKey),
+		pending:        make(map[string]*pendingPairing),
+		mfaPending:     make(map[string]*pendingMFALogin),
+		remotePending:  make(map[string]*pendingRemotePairing),
+		remotePushers:  make(map[string]RemotePusher),
 		trustedDevices: make(map[string]TrustedDevice),
+		mfaAttempts:    make(map[string]*mfaLockoutState),
 	}
 	path := filepath.Join(dataDir, "config.json")
 	data, err := os.ReadFile(path)
@@ -846,6 +944,54 @@ func (c *Config) SetEncryption(e EncryptionConfig) {
 	c.encryption = e
 	c.mu.Unlock()
 	_ = c.Save()
+}
+
+// recoveryPassphraseAlphabet is Crockford Base32 minus the usual
+// look-alike ambiguity concerns — no 0/O, 1/I/L, or U (Crockford's own
+// reasoning: U is dropped to avoid accidentally spelling something
+// obscene when a random string happens to line up). The point isn't
+// compactness, it's that a human transcribing this from a screen to a
+// sticky note or a password manager by hand doesn't have to squint at
+// which character a given glyph actually was.
+const recoveryPassphraseAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+// GenerateRecoveryPassphrase produces a fresh, cryptographically random
+// passphrase for backup encryption — crypto/rand throughout, same
+// entropy source apikey.go's GenerateAPIKey uses, not math/rand or
+// anything derived from user input. 24 characters from a 32-symbol
+// alphabet is ~120 bits of entropy, chunked into groups of 4 (the same
+// cosmetic convention NodeID (nodeidentity.go) already uses for a
+// long value a human might need to read back or transcribe) purely for
+// readability — the chunking carries no security meaning of its own.
+//
+// This exists because EncryptionConfig.Passphrase is the ONLY thing
+// standing between a lost/corrupted config.json and every encrypted
+// archive PrestoBack has ever written becoming permanently
+// undecipherable (see EncryptionConfig's own doc comment on the
+// plaintext-storage tradeoff) — a user-chosen passphrase is often
+// weaker than it needs to be for something with that much riding on it,
+// and typing one in yourself gives you no natural moment to actually
+// write it down anywhere else. A generated passphrase is returned to
+// the caller (handleEncryption) exactly once, at creation time, for
+// display in a "write this down now" UI — the same one-time-reveal
+// pattern ClaimPairing (pairing.go) and API key regeneration already
+// use for exactly this reason: it's the only value in this codebase
+// that's genuinely both irreplaceable and never meant to be re-shown.
+func GenerateRecoveryPassphrase() (string, error) {
+	const length = 24
+	const groupSize = 4
+	b := make([]byte, length)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("config: crypto/rand unavailable: %w", err)
+	}
+	var out strings.Builder
+	for i, r := range b {
+		out.WriteByte(recoveryPassphraseAlphabet[int(r)%len(recoveryPassphraseAlphabet)])
+		if (i+1)%groupSize == 0 && i != length-1 {
+			out.WriteByte('-')
+		}
+	}
+	return out.String(), nil
 }
 
 // ── Remote ────────────────────────────────────────────────────────────────────

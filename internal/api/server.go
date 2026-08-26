@@ -7,10 +7,10 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"reflect"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -111,6 +111,24 @@ func NewServer(cfg *config.Config, image, selfName, restartNote string) *Server 
 	}
 	s.routes()
 	s.loadSchedules()
+	// Weekly, unattended restorability check — see runRestoreHealthCheck's
+	// doc comment. A fixed system-level job (not tied to any one app.ID,
+	// so it's registered here directly rather than through
+	// syncSchedule/loadSchedules, which only ever manage per-app jobs)
+	// running Sunday 03:00 — off-hours, and deliberately NOT the same
+	// time any app's own backup is likely scheduled, since this reads
+	// each app's live volume path and a concurrent backup on the same
+	// path is harmless but pointless extra I/O contention to invite.
+	s.sched.Upsert(scheduler.Job{
+		ID:       "system:restore-health-check",
+		CronExpr: "0 3 * * 0",
+		Fn: func() {
+			if s.inMaintenance() {
+				return
+			}
+			s.runRestoreHealthCheck()
+		},
+	})
 	go s.broadcastUpdates()
 	go s.runTelegramBot()
 	go s.diskMonitorLoop()
@@ -120,6 +138,61 @@ func NewServer(cfg *config.Config, image, selfName, restartNote string) *Server 
 	return s
 }
 
+// securityHeaders wraps every response (API and the static SPA alike)
+// with a small set of defense-in-depth headers that cost nothing and
+// were simply never added:
+//
+//   - X-Content-Type-Options: nosniff — stops a browser from
+//     second-guessing a response's declared Content-Type (e.g. treating
+//     an uploaded/served file as HTML/JS because it "looks like" one),
+//     which is how a file that was never meant to execute sometimes ends
+//     up executing.
+//   - X-Frame-Options: DENY (+ frame-ancestors in the CSP below, for
+//     browsers that honor CSP over the older header) — PrestoBack has no
+//     legitimate reason to ever be embedded in another site's iframe, so
+//     there's no reason to allow the clickjacking surface that comes
+//     with permitting it.
+//   - Content-Security-Policy — scoped to 'self' since the whole SPA is
+//     one embedded bundle (see embed.go) that doesn't load anything from
+//     a third-party origin. This is real defense-in-depth for the
+//     session-cookie change in auth.go: even if a future XSS bug did get
+//     script running on the page, a same-origin CSP blocks it from
+//     phoning out to an attacker-controlled origin with whatever it
+//     manages to read. script-src/style-src still allow 'unsafe-inline'
+//     for now — index.html's single-file SPA relies heavily on inline
+//     <script> and inline onclick=/onchange= handlers throughout, and
+//     dropping 'unsafe-inline' outright would break the whole UI, not
+//     just tighten it. Removing it is a real follow-up worth doing
+//     (externalize the script, replace inline handlers with
+//     addEventListener, add a per-request nonce) — it's the difference
+//     between "blocks exfiltration to other origins" (what this gives
+//     today) and "blocks the injected script from running at all" (what
+//     a nonce-based policy would add) — just a larger, separate change
+//     from this pass.
+//   - Referrer-Policy: same-origin — an admin dashboard's URLs (backup
+//     names, app IDs) have no business leaking into a Referer header on
+//     any outbound navigation.
+//
+// Deliberately NOT adding Strict-Transport-Security here: PrestoBack's
+// documented default posture is plain HTTP on the LAN (see
+// docker-compose.yml) — unconditionally sending HSTS would tell browsers
+// to *refuse* plain HTTP to this host for the max-age window, which would
+// break the default deployment outright for anyone without a
+// TLS-terminating reverse proxy in front. A proxy that does terminate TLS
+// is the right place to add HSTS, the same way isRequestSecure() already
+// treats "was this actually HTTPS" as something only the request itself
+// (or X-Forwarded-Proto) can answer, never assumed globally.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'")
+		h.Set("Referrer-Policy", "same-origin")
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (s *Server) Run(port int) error {
 	key := s.cfg.APIKey()
 	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -127,7 +200,7 @@ func (s *Server) Run(port int) error {
 	masked := key[:8] + "..." + key[len(key)-4:]
 	log.Printf("  API Key: %s (full key in /data/config.json — use for external integrations)", masked)
 	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-	return http.ListenAndServe(fmt.Sprintf(":%d", port), s.mux)
+	return http.ListenAndServe(fmt.Sprintf(":%d", port), securityHeaders(s.mux))
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -175,14 +248,16 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/container-health", s.authJWT(s.handleContainerHealth))
 	s.mux.HandleFunc("/api/container-control", s.authJWT(s.handleContainerControl))
 	s.mux.HandleFunc("/api/containers/lifecycle", s.adminForWrites(s.handleContainerControlLifecycle))
-	s.mux.HandleFunc("/api/containers/update", s.adminForWrites(s.handleContainerQuickUpdate)) // pull+recreate one container by name, no registered app required — see its doc comment
+	s.mux.HandleFunc("/api/containers/update", s.adminForWrites(s.handleContainerQuickUpdate))        // pull+recreate one container by name, no registered app required — see its doc comment
 	s.mux.HandleFunc("/api/containers/update-all", s.adminForWrites(s.handleContainerQuickUpdateAll)) // same, for every currently-updatable unmanaged container at once
 	s.mux.HandleFunc("/api/history", s.authJWT(s.handleHistory))
 	s.mux.HandleFunc("/api/apikey", s.authJWT(s.handleAPIKey)) // masked fingerprint only, never the live key
 	s.mux.HandleFunc("/api/pairing/status", s.authJWT(s.handlePairingStatus))
 	s.mux.HandleFunc("/api/update/check", s.authJWT(s.handleUpdateCheck))
-	s.mux.HandleFunc("/api/updates/check", s.authJWT(s.handleUpdatesCheck)) // per-app registry check — distinct from /api/update/check (PrestoBack's own self-update)
-	s.mux.HandleFunc("/api/updates/batch", s.adminForWrites(s.handleUpdateBatch)) // update every non-pinned app sharing a batch anchor — see AppUpdateReport.BatchAnchor
+	s.mux.HandleFunc("/api/updates/check", s.authJWT(s.handleUpdatesCheck))                        // per-app registry check — distinct from /api/update/check (PrestoBack's own self-update)
+	s.mux.HandleFunc("/api/restore-health/check", s.adminForWrites(s.handleRestoreHealthCheckNow)) // manual trigger for the weekly unattended restorability check (runRestoreHealthCheck)
+	s.mux.HandleFunc("/api/rawsync/check", s.authJWT(s.handleRawSyncCheck))                        // reachability/writability probe for AppConfig.RawSyncPath, before saving it
+	s.mux.HandleFunc("/api/updates/batch", s.adminForWrites(s.handleUpdateBatch))                  // update every non-pinned app sharing a batch anchor — see AppUpdateReport.BatchAnchor
 	s.mux.HandleFunc("/api/cron/preview", s.authJWT(s.handleCronPreview))
 
 	// Auth-required — admin-only for any write (GET still allowed for viewer);
@@ -480,7 +555,8 @@ func (s *Server) handleEncryption(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		var req struct {
 			Enabled    bool   `json:"enabled"`
-			Passphrase string `json:"passphrase"` // empty = "leave the existing stored passphrase unchanged"
+			Passphrase string `json:"passphrase"`         // empty = "leave the existing stored passphrase unchanged" (ignored entirely if Generate is true)
+			Generate   bool   `json:"generate,omitempty"` // server generates a fresh high-entropy passphrase instead — see GenerateRecoveryPassphrase's doc comment
 		}
 		if err := parseJSON(r, &req); err != nil {
 			errOut(w, 400, err.Error())
@@ -488,7 +564,16 @@ func (s *Server) handleEncryption(w http.ResponseWriter, r *http.Request) {
 		}
 		cur := s.cfg.GetEncryption()
 		next := config.EncryptionConfig{Enabled: req.Enabled, Passphrase: cur.Passphrase}
-		if req.Passphrase != "" {
+		var generated string
+		if req.Generate {
+			g, genErr := config.GenerateRecoveryPassphrase()
+			if genErr != nil {
+				errOut(w, 500, "could not generate passphrase: "+genErr.Error())
+				return
+			}
+			generated = g
+			next.Passphrase = g
+		} else if req.Passphrase != "" {
 			next.Passphrase = req.Passphrase
 		}
 		if next.Enabled && next.Passphrase == "" {
@@ -496,7 +581,18 @@ func (s *Server) handleEncryption(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.cfg.SetEncryption(next)
-		respond(w, 200, EncryptionSettingsView{Enabled: next.Enabled, PassphraseIsSet: next.Passphrase != ""})
+		resp := map[string]any{"enabled": next.Enabled, "passphrase_is_set": next.Passphrase != ""}
+		if generated != "" {
+			// The ONE response that ever carries the raw passphrase back —
+			// see GenerateRecoveryPassphrase's doc comment for why this is
+			// deliberately the same exception ClaimPairing/API-key
+			// regeneration already make elsewhere in this codebase. Every
+			// other read of encryption settings (the GET case above, and
+			// this same PUT when req.Generate is false) stays fully
+			// redacted, same as always.
+			resp["generated_passphrase"] = generated
+		}
+		respond(w, 200, resp)
 	default:
 		errOut(w, 405, "method not allowed")
 	}
@@ -546,9 +642,11 @@ type RemoteTargetView struct {
 	// see nodeidentity.go) so it's safe to echo back, unlike every *IsSet
 	// field above. PrestoBackPushCredential is a real credential and is
 	// redacted the same way SFTPPassword/S3SecretKey are.
-	PrestoBackURL                string `json:"prestoback_url,omitempty"`
-	PrestoBackPinnedNodeID       string `json:"prestoback_pinned_node_id,omitempty"`
-	PrestoBackPushCredentialIsSet bool  `json:"prestoback_push_credential_is_set"`
+	PrestoBackURL                 string `json:"prestoback_url,omitempty"`
+	PrestoBackPinnedNodeID        string `json:"prestoback_pinned_node_id,omitempty"`
+	PrestoBackPushCredentialIsSet bool   `json:"prestoback_push_credential_is_set"`
+
+	AppendOnly bool `json:"append_only,omitempty"`
 }
 
 // RemoteConfigView is the redacted GET/PUT response wrapper.
@@ -560,24 +658,25 @@ type RemoteConfigView struct {
 func redactRemoteTarget(t config.RemoteTarget) RemoteTargetView {
 	return RemoteTargetView{
 		Name: t.Name, Kind: t.Kind,
-		MountPath:               t.MountPath,
-		SFTPHost:                t.SFTPHost,
-		SFTPPort:                t.SFTPPort,
-		SFTPUser:                t.SFTPUser,
-		SFTPPasswordIsSet:       t.SFTPPassword != "",
-		SFTPPrivateKeyPath:      t.SFTPPrivateKeyPath,
-		SFTPPrivateKeyPassIsSet: t.SFTPPrivateKeyPass != "",
-		SFTPKnownHostsPath:      t.SFTPKnownHostsPath,
-		SFTPBaseDir:             t.SFTPBaseDir,
-		S3Endpoint:              t.S3Endpoint,
-		S3Bucket:                t.S3Bucket,
-		S3AccessKey:             t.S3AccessKey,
-		S3SecretKeyIsSet:        t.S3SecretKey != "",
-		S3Region:                t.S3Region,
-		S3BaseDir:               t.S3BaseDir,
+		MountPath:                     t.MountPath,
+		SFTPHost:                      t.SFTPHost,
+		SFTPPort:                      t.SFTPPort,
+		SFTPUser:                      t.SFTPUser,
+		SFTPPasswordIsSet:             t.SFTPPassword != "",
+		SFTPPrivateKeyPath:            t.SFTPPrivateKeyPath,
+		SFTPPrivateKeyPassIsSet:       t.SFTPPrivateKeyPass != "",
+		SFTPKnownHostsPath:            t.SFTPKnownHostsPath,
+		SFTPBaseDir:                   t.SFTPBaseDir,
+		S3Endpoint:                    t.S3Endpoint,
+		S3Bucket:                      t.S3Bucket,
+		S3AccessKey:                   t.S3AccessKey,
+		S3SecretKeyIsSet:              t.S3SecretKey != "",
+		S3Region:                      t.S3Region,
+		S3BaseDir:                     t.S3BaseDir,
 		PrestoBackURL:                 t.PrestoBackURL,
 		PrestoBackPinnedNodeID:        t.PrestoBackPinnedNodeID,
 		PrestoBackPushCredentialIsSet: t.PrestoBackPushCredential != "",
+		AppendOnly:                    t.AppendOnly,
 	}
 }
 
@@ -770,6 +869,7 @@ func toBackupTarget(t config.RemoteTarget) backup.RemoteTarget {
 		PrestoBackPinnedNodeID:    t.PrestoBackPinnedNodeID,
 		PrestoBackPinnedPublicKey: t.PrestoBackPinnedPublicKey,
 		PrestoBackPushCredential:  t.PrestoBackPushCredential,
+		AppendOnly:                t.AppendOnly,
 	}
 }
 
@@ -2167,6 +2267,23 @@ func (s *Server) checkDiskAndAlert() {
 	}
 }
 
+// pruneBackupsForApp dispatches to PruneBackupsGFS when app has a
+// RetentionPolicy configured, or the plain flat-count PruneBackups
+// otherwise — the one place that translation happens, so every prune
+// call site (the scheduler, the manual "prune now" endpoint, and the
+// post-backup prune below) automatically honors a GFS policy the moment
+// one is set, with no per-call-site changes needed.
+func (s *Server) pruneBackupsForApp(app config.AppConfig) error {
+	if app.RetentionPolicy != nil {
+		return s.engine.PruneBackupsGFS(app.ID, app.Retain, backup.RetentionPolicy{
+			Daily:   app.RetentionPolicy.Daily,
+			Weekly:  app.RetentionPolicy.Weekly,
+			Monthly: app.RetentionPolicy.Monthly,
+		})
+	}
+	return s.engine.PruneBackups(app.ID, app.Retain)
+}
+
 // runPruneAll removes backups beyond each app's retain count and reports results.
 func (s *Server) runPruneAll(tgCfg notify.TelegramConfig) {
 	apps := s.cfg.ListApps()
@@ -2176,7 +2293,7 @@ func (s *Server) runPruneAll(tgCfg notify.TelegramConfig) {
 	totalRemoved := 0
 	for _, app := range apps {
 		before, _ := s.engine.ListBackups(app.ID)
-		if err := s.engine.PruneBackups(app.ID, app.Retain); err != nil {
+		if err := s.pruneBackupsForApp(app); err != nil {
 			sb.WriteString(fmt.Sprintf("❌ `%s`: %s\n", notify.EscapeMD(app.Name), notify.EscapeMD(err.Error())))
 			continue
 		}
@@ -2903,7 +3020,7 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 				log.Printf("[backup] panic recovered for app %s: %v", app.ID, rec)
 			}
 		}()
-		metas, err = s.engine.BackupVolumes(app.ID, app.Name, targets, passphrase)
+		metas, err = s.engine.BackupVolumes(app.ID, app.Name, targets, passphrase, app.RawSyncPath)
 	}()
 
 	dur := time.Since(start).Milliseconds()
@@ -2928,7 +3045,7 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 		s.dispatchNotify(notify.Event{Kind: "backup_fail", AppName: app.Name, Detail: detail, IsError: true,
 			Force: isLargeOp(totalSize, dur)})
 		// Still prune what succeeded
-		_ = s.engine.PruneBackups(app.ID, app.Retain)
+		_ = s.pruneBackupsForApp(app)
 	} else {
 		var totalSize int64
 		for _, m := range metas {
@@ -2941,7 +3058,7 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 		})
 		s.dispatchNotify(notify.Event{Kind: "backup_success", AppName: app.Name, Detail: detail,
 			Force: isLargeOp(totalSize, dur)})
-		_ = s.engine.PruneBackups(app.ID, app.Retain)
+		_ = s.pruneBackupsForApp(app)
 	}
 
 	// ── Manifest ────────────────────────────────────────────────────────────
@@ -2954,7 +3071,13 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 		// Gated on the manifest write succeeding: a remote holding archives
 		// with no manifest to describe them is a worse state than just not
 		// pushing this run at all — see pushToRemotes's doc comment.
-		s.pushToRemotes(app.ID, app.Name, app.Retain, metas, manifestPath, emit)
+		var gfsPolicy *backup.RetentionPolicy
+		if app.RetentionPolicy != nil {
+			gfsPolicy = &backup.RetentionPolicy{
+				Daily: app.RetentionPolicy.Daily, Weekly: app.RetentionPolicy.Weekly, Monthly: app.RetentionPolicy.Monthly,
+			}
+		}
+		s.pushToRemotes(app.ID, app.Name, app.Retain, gfsPolicy, metas, manifestPath, emit)
 	}
 
 	emit("━━━ Backup complete ━━━")
@@ -2970,7 +3093,7 @@ func (s *Server) runBackup(app config.AppConfig, scheduled bool) {
 // local failure just means a partial remote push, mirroring exactly what
 // happened locally — never "pretend nothing failed" and never "refuse to
 // push what did succeed."
-func (s *Server) pushToRemotes(appID, appName string, retain int, metas []backup.BackupMeta, manifestPath string, emit func(string)) {
+func (s *Server) pushToRemotes(appID, appName string, retain int, policy *backup.RetentionPolicy, metas []backup.BackupMeta, manifestPath string, emit func(string)) {
 	rc := s.cfg.GetRemote()
 	if !rc.Enabled || len(rc.Targets) == 0 {
 		return
@@ -3016,7 +3139,7 @@ func (s *Server) pushToRemotes(appID, appName string, retain int, metas []backup
 		// posture as the local s.engine.PruneBackups calls elsewhere: a
 		// prune hiccup shouldn't be reported as a push failure, since the
 		// push itself already succeeded.
-		if err := backup.PruneRemote(target, appID, retain); err != nil {
+		if err := backup.PruneRemote(target, appID, retain, policy); err != nil {
 			log.Printf("[remote] prune warning for %s on %s: %v", appID, t.Name, err)
 		}
 	}
@@ -3837,6 +3960,146 @@ func (s *Server) handleCronPreview(w http.ResponseWriter, r *http.Request) {
 		"description": description,
 		"next_runs":   nextRuns,
 	})
+}
+
+// handleRestoreHealthCheckNow is the manual "run it now" trigger for the
+// weekly restorability check (runRestoreHealthCheck) — same posture as
+// the self-update/prune Telegram commands: kick off the (potentially
+// slow, one-preview-per-app-volume) work in the background and return
+// immediately, rather than holding the HTTP request open for however
+// long a full pass over every app takes. Results land in the History
+// page (EventRestoreCheckPass/Fail) and, on a real failure, a
+// notification — same as the scheduled run — there's nothing further
+// this response could usefully wait for and return.
+func (s *Server) handleRestoreHealthCheckNow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	go s.runRestoreHealthCheck()
+	respond(w, 202, map[string]string{"status": "restore health check started — see History for results"})
+}
+
+// handleRawSyncCheck probes an AppConfig.RawSyncPath candidate for
+// existence/writability — see CheckRawSyncPath (engine.go). Read-only
+// with respect to config (doesn't save anything), same "test before you
+// commit" role testExistingRemoteTarget plays for remote targets.
+func (s *Server) handleRawSyncCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := parseJSON(r, &req); err != nil {
+		errOut(w, 400, err.Error())
+		return
+	}
+	if err := backup.CheckRawSyncPath(req.Path); err != nil {
+		respond(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	respond(w, 200, map[string]any{"ok": true})
+}
+
+// ── Restore health checks ────────────────────────────────────────────────────
+//
+// runRestoreHealthCheck runs an UNATTENDED restorability check against
+// every app's newest backup per volume — see EventRestoreCheckPass/Fail's
+// doc comment (history.go) for what this proves and why it's worth
+// having on a schedule rather than only ever finding out at actual
+// restore time. Read-only throughout: PreviewRestore never writes
+// anything (see restorepreview.go's own doc comment), so this is safe to
+// run against live, in-use volumes on a schedule without any
+// coordination with the backup/restore engine's own locking.
+func (s *Server) runRestoreHealthCheck() {
+	encCfg := s.cfg.GetEncryption()
+	for _, app := range s.cfg.ListApps() {
+		if app.Pinned {
+			continue // paused apps have nothing current worth checking
+		}
+		metas, err := s.engine.ListBackups(app.ID)
+		if err != nil {
+			log.Printf("[restore-check] could not list backups for %s: %v", app.Name, err)
+			continue
+		}
+		// Newest non-prerestore backup per volume slug — metas is already
+		// newest-first (ListBackups' own sort), so the first match per
+		// slug is what we want.
+		latest := map[string]backup.BackupMeta{}
+		for _, m := range metas {
+			if m.PreRestore || m.Status != backup.StatusSuccess {
+				continue
+			}
+			if _, ok := latest[m.VolumeSlug]; !ok {
+				latest[m.VolumeSlug] = m
+			}
+		}
+		for _, vol := range app.Volumes {
+			if !vol.Enabled {
+				continue
+			}
+			m, ok := latest[vol.Slug]
+			if !ok {
+				continue // nothing successful to check yet — not a failure, just nothing to report
+			}
+			s.checkOneRestoreHealth(app, vol, m, encCfg)
+		}
+	}
+}
+
+func (s *Server) checkOneRestoreHealth(app config.AppConfig, vol config.VolumeConfig, m backup.BackupMeta, encCfg config.EncryptionConfig) {
+	archivePath := m.FilePath
+	if m.Encrypted {
+		if encCfg.Passphrase == "" {
+			// Same documented tradeoff GetEncryption's comment already
+			// covers: an encrypted app with no stored passphrase can't be
+			// checked unattended, same as it can't be auto-backed-up
+			// unattended. Not a failure of the archive itself — skip
+			// rather than report a false alarm.
+			log.Printf("[restore-check] skipping %s/%s — encrypted, no stored passphrase to check unattended", app.Name, vol.Slug)
+			return
+		}
+		decPath, decErr := backup.DecryptArchiveToTempForPreview(archivePath, encCfg.Passphrase)
+		if decErr != nil {
+			s.recordRestoreHealth(app, vol, m, false, fmt.Sprintf("could not decrypt: %v", decErr))
+			return
+		}
+		defer os.Remove(decPath)
+		archivePath = decPath
+	}
+
+	preview, err := backup.PreviewRestore(archivePath, vol.Path)
+	if err != nil {
+		s.recordRestoreHealth(app, vol, m, false, fmt.Sprintf("archive unreadable: %v", err))
+		return
+	}
+	if preview.TypeConflicts > 0 {
+		s.recordRestoreHealth(app, vol, m, false,
+			fmt.Sprintf("%d entries would conflict with what's on disk (e.g. archive has a directory where a file now exists) — inspect before relying on this backup", preview.TypeConflicts))
+		return
+	}
+	s.recordRestoreHealth(app, vol, m, true,
+		fmt.Sprintf("%d entries checked, %d unchanged since backup, %d would update", preview.TotalEntries, preview.Unchanged, preview.WillAdd+preview.WillModify))
+}
+
+func (s *Server) recordRestoreHealth(app config.AppConfig, vol config.VolumeConfig, m backup.BackupMeta, ok bool, detail string) {
+	event := history.EventRestoreCheckPass
+	if !ok {
+		event = history.EventRestoreCheckFail
+		log.Printf("[restore-check] FAILED %s/%s (backup %s): %s", app.Name, vol.Slug, m.ID, detail)
+	}
+	s.hist.Append(history.Entry{
+		Event: event, AppID: app.ID, AppName: app.Name,
+		Detail: fmt.Sprintf("%s: %s", vol.Slug, detail),
+	})
+	if !ok {
+		s.dispatchNotify(notify.Event{
+			Kind: "restore_check_fail", AppName: app.Name,
+			Detail: fmt.Sprintf("%s: %s", vol.Slug, detail), IsError: true,
+		})
+	}
 }
 
 // ── Scheduler ─────────────────────────────────────────────────────────────────
@@ -5496,21 +5759,21 @@ func isLargeOp(sizeBytes, durationMs int64) bool {
 func (s *Server) dispatchNotify(ev notify.Event) {
 	nc := s.cfg.GetNotify()
 	notify.Dispatch(notify.Config{
-		TelegramToken:    nc.TelegramToken,
-		TelegramChatID:   nc.TelegramChatID,
-		TelegramEnabled:  nc.TelegramEnabled,
-		DiscordURL:       nc.DiscordURL,
-		DiscordEnabled:   nc.DiscordEnabled,
-		NtfyURL:          nc.NtfyURL,
-		NtfyToken:        nc.NtfyToken,
-		NtfyEnabled:      nc.NtfyEnabled,
-		WebhookURL:       nc.WebhookURL,
-		WebhookEnabled:   nc.WebhookEnabled,
-		OnBackupSuccess:  nc.OnBackupSuccess,
-		OnBackupFail:     nc.OnBackupFail,
-		OnRestoreSuccess: nc.OnRestoreSuccess,
-		OnRestoreFail:    nc.OnRestoreFail,
-		OnRemoteReceive:  nc.OnRemoteReceive,
+		TelegramToken:            nc.TelegramToken,
+		TelegramChatID:           nc.TelegramChatID,
+		TelegramEnabled:          nc.TelegramEnabled,
+		DiscordURL:               nc.DiscordURL,
+		DiscordEnabled:           nc.DiscordEnabled,
+		NtfyURL:                  nc.NtfyURL,
+		NtfyToken:                nc.NtfyToken,
+		NtfyEnabled:              nc.NtfyEnabled,
+		WebhookURL:               nc.WebhookURL,
+		WebhookEnabled:           nc.WebhookEnabled,
+		OnBackupSuccess:          nc.OnBackupSuccess,
+		OnBackupFail:             nc.OnBackupFail,
+		OnRestoreSuccess:         nc.OnRestoreSuccess,
+		OnRestoreFail:            nc.OnRestoreFail,
+		OnRemoteReceive:          nc.OnRemoteReceive,
 		OnSchedulePausedReminder: nc.OnSchedulePausedReminder,
 	}, ev)
 }
