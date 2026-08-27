@@ -859,24 +859,58 @@ select.fi{cursor:pointer}
       <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">Encrypts new backup archives at rest (AES-256-CTR + HMAC-SHA256). The passphrase below is used automatically for scheduled backups — but <strong>restoring always asks for it again</strong>, never uses this stored copy silently. Per-app overrides are on each app's Edit screen.</div></div>
       <div class="fg"><div class="ftog" onclick="togEncryption()"><div class="ftog-sw" id="tog-encryption"><div class="ftog-kn"></div></div><div class="ftog-lbl">Encrypt new backups by default</div></div></div>
       <div class="fg"><label class="fl">Passphrase</label><input class="fi" type="password" id="enc-passphrase" placeholder="Leave blank to keep the existing passphrase"><div class="fh" id="enc-passphrase-hint"></div></div>
-      <div class="fg"><button class="btn btn-g btn-sm" type="button" onclick="generateEncryptionPassphrase()">🎲 Generate a strong passphrase instead</button><div class="fh">Creates a random ~120-bit passphrase server-side and shows it to you exactly once, like a wallet's recovery phrase — worth using instead of typing your own if you don't already have a password manager habit for this.</div></div>
-      <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">There's no recovery if you lose this passphrase — encrypted archives become permanently unreadable. Store it somewhere other than this Pi.</div></div>
+      <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">There's no recovery if you lose this passphrase and haven't set up a recovery phrase below — encrypted archives become permanently unreadable.</div></div>
       <button class="btn btn-p" onclick="saveEncryption()">Save encryption settings</button>
+    </div></div>
+
+    <div class="card"><div class="ch"><div class="ct">Recovery Phrase</div></div><div class="cb">
+      <div class="info-b"><svg width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg><div class="info-t">A separate, independent secret — like Bitwarden's or Google's account recovery — that can reveal your passphrase above if you ever lose it. It does <strong>not</strong> replace your passphrase and isn't used day-to-day; write it down once and store it somewhere different from wherever you keep the passphrase itself.</div></div>
+      <div id="enc-recovery-status" style="font-size:12.5px;color:var(--txt2);margin-bottom:10px"></div>
+      <div id="enc-recovery-stale-warn" class="warn-b" style="display:none"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">You've changed your passphrase since this recovery phrase was generated — it will reveal the <em>old</em> one, not your current passphrase. Regenerate it below.</div></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-g btn-sm" type="button" onclick="openRecoveryGenerate()">🔑 Generate recovery phrase</button>
+        <button class="btn btn-g btn-sm" type="button" onclick="openRecoveryReveal()">🔓 I lost my passphrase — recover it</button>
+      </div>
     </div></div>
   </div>
 </div>
 
-<!-- One-time passphrase reveal — shown only immediately after generateEncryptionPassphrase(), never re-openable, never stores the value anywhere but this one JS variable for the duration this is on screen. -->
-<div class="overlay hidden" id="m-passphrase-reveal">
+<!-- Recovery phrase: generate (requires current password, since this supersedes any previous recovery phrase) -->
+<div class="overlay hidden" id="m-recovery-generate">
+  <div class="modal">
+    <div class="mh"><div class="mt">Generate a recovery phrase</div><button class="btn btn-g btn-ic" onclick="CM('m-recovery-generate')">✕</button></div>
+    <div class="mb">
+      <div class="fh" style="margin-bottom:10px">This protects your <strong>current</strong> passphrase as of right now. Confirm your account password to continue.</div>
+      <div class="fg"><label class="fl">Your account password</label><input class="fi" type="password" id="rg-password"></div>
+      <button class="btn btn-p" onclick="submitRecoveryGenerate()">Generate</button>
+    </div>
+  </div>
+</div>
+
+<!-- One-time recovery-phrase reveal — shown only immediately after submitRecoveryGenerate(), never re-openable, never stores the value anywhere but this one JS variable for the duration this is on screen. -->
+<div class="overlay hidden" id="m-recovery-reveal-result">
   <div class="modal">
     <div class="mh"><div class="mt">🔑 Write this down now</div></div>
     <div class="mb">
-      <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">This is shown <strong>once</strong>, right now. PrestoBack does not store it anywhere you can come back and view later — only its effect (the ability to decrypt future archives) does. Copy it into a password manager or write it down before closing this box.</div></div>
-      <div style="font-family:var(--mono);font-size:15px;text-align:center;letter-spacing:1px;background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:14px;margin:12px 0;word-break:break-all;user-select:all" id="passphrase-reveal-value"></div>
+      <div class="warn-b"><svg width="15" height="15" fill="none" stroke="var(--amber)" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><div class="warn-t">This is shown <strong>once</strong>, right now, and is never stored anywhere PrestoBack can show it to you again. Store it somewhere <strong>separate</strong> from your passphrase — a password manager, a safe, a printed sheet.</div></div>
+      <div style="font-family:var(--mono);font-size:15px;text-align:center;letter-spacing:1px;background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:14px;margin:12px 0;word-break:break-all;user-select:all" id="recovery-phrase-value"></div>
       <div style="display:flex;gap:8px;justify-content:flex-end">
-        <button class="btn btn-g btn-sm" onclick="copyRevealedPassphrase()">📋 Copy</button>
-        <button class="btn btn-p" onclick="closePassphraseReveal()">I've saved it — close</button>
+        <button class="btn btn-g btn-sm" onclick="copyRevealedRecoveryPhrase()">📋 Copy</button>
+        <button class="btn btn-p" onclick="closeRecoveryGenerateResult()">I've saved it — close</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- Recovery phrase: reveal the protected passphrase using the recovery phrase -->
+<div class="overlay hidden" id="m-recovery-reveal">
+  <div class="modal">
+    <div class="mh"><div class="mt">Recover your passphrase</div><button class="btn btn-g btn-ic" onclick="CM('m-recovery-reveal')">✕</button></div>
+    <div class="mb">
+      <div class="fg"><label class="fl">Your account password</label><input class="fi" type="password" id="rr-password"></div>
+      <div class="fg"><label class="fl">Recovery phrase</label><input class="fi" id="rr-phrase" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"></div>
+      <button class="btn btn-p" onclick="submitRecoveryReveal()">Recover passphrase</button>
+      <div id="rr-result" style="margin-top:12px"></div>
     </div>
   </div>
 </div>
@@ -4726,6 +4760,10 @@ async function loadEncryption() {
     document.getElementById('enc-passphrase-hint').textContent = S_encPassSet
       ? 'A passphrase is already set. Leave blank to keep it, or enter a new one to replace it.'
       : 'No passphrase set yet — required before turning encryption on.';
+    document.getElementById('enc-recovery-status').textContent = e.recovery_is_set
+      ? 'A recovery phrase is set up.'
+      : 'No recovery phrase set up yet — if you lose your passphrase, encrypted backups become unrecoverable.';
+    document.getElementById('enc-recovery-stale-warn').style.display = e.recovery_possibly_stale ? '' : 'none';
   } catch {}
 }
 function togEncryption() { setTog('tog-encryption', !document.getElementById('tog-encryption').classList.contains('on')); }
@@ -4741,37 +4779,63 @@ async function saveEncryption() {
     S_encPassSet = !!r.passphrase_is_set;
     document.getElementById('enc-passphrase').value = '';
     toast('Encryption settings saved','success');
+    loadEncryption();
   } catch(e) { toast(e.message,'error'); }
 }
 
-// S_revealedPassphrase lives ONLY in this JS variable, only for as long
+// ── Recovery phrase ──────────────────────────────────────────────────────
+// A recovery phrase is a SEPARATE credential from the passphrase above —
+// it exists only to reveal the passphrase later if it's lost, never used
+// day-to-day. See config.GenerateEncryptionRecovery's doc comment for the
+// full design. S_revealedRecoveryPhrase lives ONLY in memory for as long
 // as the reveal modal is open — never localStorage, never sent anywhere
-// but the one PUT that generated it. See GenerateRecoveryPassphrase's
-// doc comment (config.go) and handleEncryption's PUT case (server.go)
-// for why the server treats this as the one deliberate exception to
-// "never echo a secret back."
-let S_revealedPassphrase = '';
-async function generateEncryptionPassphrase() {
-  if (!confirm('This replaces any passphrase currently set (or about to be typed above) with a fresh, randomly generated one, shown to you exactly once. Continue?')) return;
+// but shown once right after generation.
+function openRecoveryGenerate() {
+  document.getElementById('rg-password').value = '';
+  OM('m-recovery-generate');
+}
+let S_revealedRecoveryPhrase = '';
+async function submitRecoveryGenerate() {
+  const password = gv('rg-password');
+  if (!password) { toast('Enter your account password','error'); return; }
   try {
-    const enabled = document.getElementById('tog-encryption').classList.contains('on');
-    const r = await api('/api/encryption', {method:'PUT', body: JSON.stringify({enabled, generate: true})});
-    S_encPassSet = !!r.passphrase_is_set;
-    document.getElementById('enc-passphrase').value = '';
-    S_revealedPassphrase = r.generated_passphrase || '';
-    document.getElementById('passphrase-reveal-value').textContent = S_revealedPassphrase;
-    OM('m-passphrase-reveal');
+    const r = await api('/api/encryption/recovery/generate', {method:'POST', body: JSON.stringify({password})});
+    S_revealedRecoveryPhrase = r.recovery_phrase || '';
+    document.getElementById('recovery-phrase-value').textContent = S_revealedRecoveryPhrase;
+    CM('m-recovery-generate');
+    OM('m-recovery-reveal-result');
   } catch(e) { toast(e.message,'error'); }
 }
-async function copyRevealedPassphrase() {
-  try { await navigator.clipboard.writeText(S_revealedPassphrase); toast('Copied — now put it somewhere durable','success'); }
+async function copyRevealedRecoveryPhrase() {
+  try { await navigator.clipboard.writeText(S_revealedRecoveryPhrase); toast('Copied — store it somewhere separate from your passphrase','success'); }
   catch { toast('Copy failed — select the text manually','error'); }
 }
-function closePassphraseReveal() {
-  S_revealedPassphrase = '';
-  document.getElementById('passphrase-reveal-value').textContent = '';
-  CM('m-passphrase-reveal');
+function closeRecoveryGenerateResult() {
+  S_revealedRecoveryPhrase = '';
+  document.getElementById('recovery-phrase-value').textContent = '';
+  CM('m-recovery-reveal-result');
   loadEncryption();
+}
+
+function openRecoveryReveal() {
+  document.getElementById('rr-password').value = '';
+  document.getElementById('rr-phrase').value = '';
+  document.getElementById('rr-result').innerHTML = '';
+  OM('m-recovery-reveal');
+}
+async function submitRecoveryReveal() {
+  const password = gv('rr-password'), recovery_phrase = gv('rr-phrase');
+  const resultEl = document.getElementById('rr-result');
+  if (!password || !recovery_phrase) { toast('Fill in both fields','error'); return; }
+  try {
+    const r = await api('/api/encryption/recovery/reveal', {method:'POST', body: JSON.stringify({password, recovery_phrase})});
+    const staleNote = r.stale
+      ? '<div class="warn-b" style="margin-top:8px"><div class="warn-t">This was the passphrase at the time the recovery phrase was generated — you\'ve since changed your live passphrase, so this may not decrypt your most recent backups. It will still work for anything backed up before that change.</div></div>'
+      : '';
+    resultEl.innerHTML = `<div style="font-family:var(--mono);font-size:15px;text-align:center;letter-spacing:1px;background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:14px;word-break:break-all;user-select:all">${escHtml(r.passphrase)}</div>${staleNote}`;
+  } catch(e) {
+    resultEl.innerHTML = `<div style="color:var(--red)">${escHtml(e.message)}</div>`;
+  }
 }
 
 // ════════════════════ Remote backup targets ════════════════════

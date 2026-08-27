@@ -1,7 +1,12 @@
 package config
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -294,6 +299,19 @@ type NotifyConfig struct {
 type EncryptionConfig struct {
 	Enabled    bool   `json:"enabled"`
 	Passphrase string `json:"passphrase,omitempty"`
+	// PassphraseUpdatedAt tracks when Passphrase last actually changed —
+	// used only to detect recovery-phrase staleness (RecoveryPossiblyStale)
+	// below. Not touched on a write that doesn't change the value (e.g.
+	// toggling Enabled alone) — see SetEncryption.
+	PassphraseUpdatedAt *time.Time `json:"passphrase_updated_at,omitempty"`
+
+	// Recovery: an independent secret that can reveal Passphrase above if
+	// it's ever lost — see the "Encryption recovery phrase" section
+	// further down this file for the full design and why this is
+	// deliberately NOT the same thing as a generated passphrase.
+	RecoverySalt    string     `json:"recovery_salt,omitempty"`
+	RecoveryWrapped string     `json:"recovery_wrapped,omitempty"` // hex: iv || ciphertext || hmac
+	RecoverySetAt   *time.Time `json:"recovery_set_at,omitempty"`
 }
 
 // RemoteTarget is one configured off-box backup destination. Mirrors
@@ -941,43 +959,61 @@ func (c *Config) GetEncryption() EncryptionConfig {
 
 func (c *Config) SetEncryption(e EncryptionConfig) {
 	c.mu.Lock()
+	if e.Passphrase != c.encryption.Passphrase {
+		// Track when the live passphrase last changed — this is what lets
+		// RecoveryPossiblyStale (below) tell the admin "the recovery
+		// phrase you generated no longer matches what's actually
+		// protecting new backups," without needing to unwrap anything to
+		// find out.
+		now := time.Now()
+		e.PassphraseUpdatedAt = &now
+	} else {
+		e.PassphraseUpdatedAt = c.encryption.PassphraseUpdatedAt
+	}
 	c.encryption = e
 	c.mu.Unlock()
 	_ = c.Save()
 }
 
-// recoveryPassphraseAlphabet is Crockford Base32 minus the usual
-// look-alike ambiguity concerns — no 0/O, 1/I/L, or U (Crockford's own
-// reasoning: U is dropped to avoid accidentally spelling something
-// obscene when a random string happens to line up). The point isn't
-// compactness, it's that a human transcribing this from a screen to a
-// sticky note or a password manager by hand doesn't have to squint at
-// which character a given glyph actually was.
-const recoveryPassphraseAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-
-// GenerateRecoveryPassphrase produces a fresh, cryptographically random
-// passphrase for backup encryption — crypto/rand throughout, same
-// entropy source apikey.go's GenerateAPIKey uses, not math/rand or
-// anything derived from user input. 24 characters from a 32-symbol
-// alphabet is ~120 bits of entropy, chunked into groups of 4 (the same
-// cosmetic convention NodeID (nodeidentity.go) already uses for a
-// long value a human might need to read back or transcribe) purely for
-// readability — the chunking carries no security meaning of its own.
+// ── Encryption recovery phrase ──────────────────────────────────────────────
 //
-// This exists because EncryptionConfig.Passphrase is the ONLY thing
-// standing between a lost/corrupted config.json and every encrypted
-// archive PrestoBack has ever written becoming permanently
-// undecipherable (see EncryptionConfig's own doc comment on the
-// plaintext-storage tradeoff) — a user-chosen passphrase is often
-// weaker than it needs to be for something with that much riding on it,
-// and typing one in yourself gives you no natural moment to actually
-// write it down anywhere else. A generated passphrase is returned to
-// the caller (handleEncryption) exactly once, at creation time, for
-// display in a "write this down now" UI — the same one-time-reveal
-// pattern ClaimPairing (pairing.go) and API key regeneration already
-// use for exactly this reason: it's the only value in this codebase
-// that's genuinely both irreplaceable and never meant to be re-shown.
-func GenerateRecoveryPassphrase() (string, error) {
+// This is deliberately NOT "generate a strong passphrase for me" (that
+// would just be a password generator wired to the passphrase field, and
+// isn't what a recovery phrase is). A recovery phrase is a SECOND,
+// INDEPENDENT credential — same idea as Bitwarden's account recovery
+// process, or a disk-encryption "recovery key" alongside your normal
+// unlock password: it exists purely to reveal the real passphrase later
+// if that's ever lost, and is meant to be written down and stored
+// somewhere durable and SEPARATE from wherever the day-to-day passphrase
+// lives — so losing one doesn't automatically mean losing both.
+//
+// Mechanism: GenerateEncryptionRecovery takes a snapshot of the CURRENT
+// EncryptionConfig.Passphrase and encrypts it (PBKDF2-HMAC-SHA256 key
+// derivation, AES-256-CTR + HMAC-SHA256 authentication — the identical
+// construction backupcrypto.go already uses for archives, reimplemented
+// here directly rather than imported, since this operates on a few bytes
+// of passphrase rather than a multi-GB stream and pulling in a
+// stream-oriented API buys nothing at this size) under a key derived
+// from a freshly generated recovery phrase. The wrapped blob is stored;
+// the raw recovery phrase is returned to the caller exactly once and
+// never stored anywhere, matching the ClaimPairing/API-key-regeneration
+// precedent elsewhere in this package.
+//
+// Staleness: because the raw recovery phrase is never retained, this
+// server has no way to automatically re-wrap a NEW passphrase if the
+// admin changes it later — the recovery phrase can only ever reveal the
+// passphrase as it stood at generation time. RecoveryPossiblyStale
+// surfaces exactly that by comparing timestamps, so the UI can prompt
+// "regenerate your recovery phrase" rather than let it silently go
+// stale and fail someone at the worst possible moment.
+
+const recoveryPhraseAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ" // Crockford Base32 minus ambiguous glyphs — see NodeID's chunking comment (nodeidentity.go) for the same rationale
+
+// GenerateRecoverySeedPhrase returns a fresh ~120-bit random phrase (24
+// chars from a 32-symbol alphabet, chunked in groups of 4 for
+// readability). Used as the wrapping key for the recovery mechanism
+// below — never as a passphrase substitute.
+func GenerateRecoverySeedPhrase() (string, error) {
 	const length = 24
 	const groupSize = 4
 	b := make([]byte, length)
@@ -986,12 +1022,194 @@ func GenerateRecoveryPassphrase() (string, error) {
 	}
 	var out strings.Builder
 	for i, r := range b {
-		out.WriteByte(recoveryPassphraseAlphabet[int(r)%len(recoveryPassphraseAlphabet)])
+		out.WriteByte(recoveryPhraseAlphabet[int(r)%len(recoveryPhraseAlphabet)])
 		if (i+1)%groupSize == 0 && i != length-1 {
 			out.WriteByte('-')
 		}
 	}
 	return out.String(), nil
+}
+
+// GenerateEncryptionRecovery generates a new recovery phrase, wraps the
+// CURRENT passphrase under it, stores the wrapped blob, and returns the
+// raw phrase for one-time display. Errors if encryption isn't enabled or
+// no passphrase is set yet — there is nothing meaningful to protect.
+func (c *Config) GenerateEncryptionRecovery() (phrase string, err error) {
+	c.mu.Lock()
+	cur := c.encryption
+	c.mu.Unlock()
+	if cur.Passphrase == "" {
+		return "", fmt.Errorf("no passphrase is set yet — set one before generating a recovery phrase")
+	}
+
+	phrase, err = GenerateRecoverySeedPhrase()
+	if err != nil {
+		return "", err
+	}
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", fmt.Errorf("config: crypto/rand unavailable: %w", err)
+	}
+	wrapped, err := wrapSecret([]byte(cur.Passphrase), phrase, salt)
+	if err != nil {
+		return "", err
+	}
+
+	c.mu.Lock()
+	now := time.Now()
+	c.encryption.RecoverySalt = hex.EncodeToString(salt)
+	c.encryption.RecoveryWrapped = hex.EncodeToString(wrapped)
+	c.encryption.RecoverySetAt = &now
+	c.mu.Unlock()
+	if err := c.Save(); err != nil {
+		return "", err
+	}
+	return phrase, nil
+}
+
+// RecoverEncryptionPassphrase unwraps the passphrase a previously
+// generated recovery phrase protects. stale reports whether the LIVE
+// passphrase has changed since this recovery phrase was generated — the
+// unwrapped value is still returned in that case (it's real, it just may
+// no longer be what's protecting new backups), so the caller can decide
+// what to do with it rather than have it silently withheld.
+func (c *Config) RecoverEncryptionPassphrase(recoveryPhrase string) (passphrase string, stale bool, err error) {
+	c.mu.RLock()
+	cur := c.encryption
+	c.mu.RUnlock()
+	if cur.RecoveryWrapped == "" || cur.RecoverySalt == "" {
+		return "", false, fmt.Errorf("no recovery phrase has been generated")
+	}
+	salt, err := hex.DecodeString(cur.RecoverySalt)
+	if err != nil {
+		return "", false, fmt.Errorf("stored recovery data is corrupt: %w", err)
+	}
+	wrapped, err := hex.DecodeString(cur.RecoveryWrapped)
+	if err != nil {
+		return "", false, fmt.Errorf("stored recovery data is corrupt: %w", err)
+	}
+	plain, err := unwrapSecret(wrapped, recoveryPhrase, salt)
+	if err != nil {
+		return "", false, fmt.Errorf("incorrect recovery phrase")
+	}
+	recovered := string(plain)
+	stale = recovered != cur.Passphrase
+	return recovered, stale, nil
+}
+
+// RecoveryPossiblyStale reports whether the current passphrase has
+// changed since the recovery phrase was last generated — a cheap,
+// timestamp-only check the GET /api/encryption endpoint can surface
+// without unwrapping anything, so the UI can nudge "regenerate your
+// recovery phrase" before it's actually needed rather than only
+// discovering the mismatch during a real recovery attempt.
+func (c *Config) RecoveryPossiblyStale() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	e := c.encryption
+	if e.RecoverySetAt == nil || e.PassphraseUpdatedAt == nil {
+		return false
+	}
+	return e.PassphraseUpdatedAt.After(*e.RecoverySetAt)
+}
+
+// wrapSecret / unwrapSecret — small-blob sibling of backupcrypto.go's
+// EncryptStream/DecryptStream: identical construction (PBKDF2-HMAC-
+// SHA256 key derivation into separate AES and HMAC subkeys, AES-256-CTR
+// for encryption, HMAC-SHA256 for authentication, encrypt-then-MAC), but
+// operating on an in-memory []byte rather than a stream, since what's
+// being wrapped here is a passphrase (bytes, not gigabytes). Output
+// layout: iv (16 bytes) || ciphertext || hmac (32 bytes) — the caller
+// supplies and stores salt separately since GenerateEncryptionRecovery
+// needs it before Save() is called.
+func wrapSecret(plaintext []byte, passphrase string, salt []byte) ([]byte, error) {
+	aesKey, hmacKey := deriveWrapKeys(passphrase, salt)
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, err
+	}
+	iv := make([]byte, aes.BlockSize)
+	if _, err := rand.Read(iv); err != nil {
+		return nil, err
+	}
+	ciphertext := make([]byte, len(plaintext))
+	cipher.NewCTR(block, iv).XORKeyStream(ciphertext, plaintext)
+
+	mac := hmac.New(sha256.New, hmacKey)
+	mac.Write(iv)
+	mac.Write(ciphertext)
+	tag := mac.Sum(nil)
+
+	out := make([]byte, 0, len(iv)+len(ciphertext)+len(tag))
+	out = append(out, iv...)
+	out = append(out, ciphertext...)
+	out = append(out, tag...)
+	return out, nil
+}
+
+func unwrapSecret(blob []byte, passphrase string, salt []byte) ([]byte, error) {
+	if len(blob) < aes.BlockSize+sha256.Size {
+		return nil, fmt.Errorf("wrapped data too short")
+	}
+	iv := blob[:aes.BlockSize]
+	tag := blob[len(blob)-sha256.Size:]
+	ciphertext := blob[aes.BlockSize : len(blob)-sha256.Size]
+
+	aesKey, hmacKey := deriveWrapKeys(passphrase, salt)
+	mac := hmac.New(sha256.New, hmacKey)
+	mac.Write(iv)
+	mac.Write(ciphertext)
+	if !hmac.Equal(mac.Sum(nil), tag) {
+		return nil, fmt.Errorf("authentication failed — wrong recovery phrase or corrupted data")
+	}
+
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, err
+	}
+	plaintext := make([]byte, len(ciphertext))
+	cipher.NewCTR(block, iv).XORKeyStream(plaintext, ciphertext)
+	return plaintext, nil
+}
+
+// deriveWrapKeys mirrors backupcrypto.go's deriveKeys exactly (same
+// iteration count, same split of one PBKDF2 pass into two subkeys) —
+// duplicated rather than imported for the same reason wrapSecret/
+// unwrapSecret are implemented locally: package config does not import
+// package backup (server.go, in package api, is the one place that
+// glues the two together), and this is a small enough primitive that
+// duplicating it here is simpler and safer than introducing a new
+// cross-package dependency for it.
+func deriveWrapKeys(passphrase string, salt []byte) (aesKey, hmacKey []byte) {
+	const iterations = 200_000
+	out := pbkdf2HMACSHA256([]byte(passphrase), salt, iterations, 64)
+	return out[:32], out[32:]
+}
+
+func pbkdf2HMACSHA256(password, salt []byte, iterations, keyLen int) []byte {
+	prf := hmac.New(sha256.New, password)
+	hashLen := prf.Size()
+	numBlocks := (keyLen + hashLen - 1) / hashLen
+	var dk []byte
+	for block := 1; block <= numBlocks; block++ {
+		blockIndex := []byte{byte(block >> 24), byte(block >> 16), byte(block >> 8), byte(block)}
+		prf.Reset()
+		prf.Write(salt)
+		prf.Write(blockIndex)
+		u := prf.Sum(nil)
+		result := make([]byte, len(u))
+		copy(result, u)
+		for i := 2; i <= iterations; i++ {
+			prf.Reset()
+			prf.Write(u)
+			u = prf.Sum(nil)
+			for j := range result {
+				result[j] ^= u[j]
+			}
+		}
+		dk = append(dk, result...)
+	}
+	return dk[:keyLen]
 }
 
 // ── Remote ────────────────────────────────────────────────────────────────────

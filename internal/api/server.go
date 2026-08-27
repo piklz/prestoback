@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/pi/prestoback/internal/backup"
 	"github.com/pi/prestoback/internal/config"
 	"github.com/pi/prestoback/internal/history"
@@ -272,6 +274,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/notify", s.adminForWrites(s.handleNotify))
 	s.mux.HandleFunc("/api/notify/test", s.adminForWrites(s.handleNotifyTest))
 	s.mux.HandleFunc("/api/encryption", s.adminForWrites(s.handleEncryption))
+	s.mux.HandleFunc("/api/encryption/recovery/generate", s.authJWT(s.handleEncryptionRecoveryGenerate)) // password-gated inside the handler itself, same pattern as MFA disable
+	s.mux.HandleFunc("/api/encryption/recovery/reveal", s.authJWT(s.handleEncryptionRecoveryReveal))     // same
 	s.mux.HandleFunc("/api/remote", s.adminForWrites(s.handleRemote))
 	s.mux.HandleFunc("/api/remote/test", s.adminForWrites(s.handleRemoteTest))
 	s.mux.HandleFunc("/api/remote/pairing/start", s.adminForWrites(s.handleRemotePairingStart))
@@ -537,43 +541,50 @@ func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 // EncryptionSettingsView is what GET /api/encryption returns. Same
 // redact-with-*_is_set-flags treatment NotifyConfigView and
 // RemoteTargetView give their secrets: a GET response can end up in
-// browser history or a dev-tools network tab, and this passphrase is the
-// decryption key for every encrypted archive on the box.
 type EncryptionSettingsView struct {
-	Enabled         bool `json:"enabled"`
-	PassphraseIsSet bool `json:"passphrase_is_set"`
+	Enabled               bool `json:"enabled"`
+	PassphraseIsSet       bool `json:"passphrase_is_set"`
+	RecoveryIsSet         bool `json:"recovery_is_set"`
+	RecoveryPossiblyStale bool `json:"recovery_possibly_stale,omitempty"`
 }
 
 // handleEncryption is the global encryption settings endpoint (on/off +
 // passphrase). Per-app overrides use the existing /api/apps/{id} update
 // path — AppConfig.Encrypted is just another field on that struct.
+//
+// This does NOT generate anything on the admin's behalf — the passphrase
+// is always exactly what the admin typed. Generating an independent
+// recovery credential is a separate, deliberate action; see
+// handleEncryptionRecoveryGenerate/Reveal below.
 func (s *Server) handleEncryption(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		e := s.cfg.GetEncryption()
-		respond(w, 200, EncryptionSettingsView{Enabled: e.Enabled, PassphraseIsSet: e.Passphrase != ""})
+		respond(w, 200, EncryptionSettingsView{
+			Enabled: e.Enabled, PassphraseIsSet: e.Passphrase != "",
+			RecoveryIsSet:         e.RecoveryWrapped != "",
+			RecoveryPossiblyStale: s.cfg.RecoveryPossiblyStale(),
+		})
 	case http.MethodPut:
 		var req struct {
 			Enabled    bool   `json:"enabled"`
-			Passphrase string `json:"passphrase"`         // empty = "leave the existing stored passphrase unchanged" (ignored entirely if Generate is true)
-			Generate   bool   `json:"generate,omitempty"` // server generates a fresh high-entropy passphrase instead — see GenerateRecoveryPassphrase's doc comment
+			Passphrase string `json:"passphrase"` // empty = "leave the existing stored passphrase unchanged"
 		}
 		if err := parseJSON(r, &req); err != nil {
 			errOut(w, 400, err.Error())
 			return
 		}
 		cur := s.cfg.GetEncryption()
-		next := config.EncryptionConfig{Enabled: req.Enabled, Passphrase: cur.Passphrase}
-		var generated string
-		if req.Generate {
-			g, genErr := config.GenerateRecoveryPassphrase()
-			if genErr != nil {
-				errOut(w, 500, "could not generate passphrase: "+genErr.Error())
-				return
-			}
-			generated = g
-			next.Passphrase = g
-		} else if req.Passphrase != "" {
+		// Start from the full current config (not a bare struct literal)
+		// so recovery fields — RecoverySalt/RecoveryWrapped/RecoverySetAt/
+		// PassphraseUpdatedAt — survive an Enabled/Passphrase-only update
+		// instead of being silently dropped. SetEncryption is what
+		// actually manages PassphraseUpdatedAt (bumping it only when
+		// Passphrase truly changes); this handler just needs to not erase
+		// what's already there.
+		next := cur
+		next.Enabled = req.Enabled
+		if req.Passphrase != "" {
 			next.Passphrase = req.Passphrase
 		}
 		if next.Enabled && next.Passphrase == "" {
@@ -581,21 +592,86 @@ func (s *Server) handleEncryption(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.cfg.SetEncryption(next)
-		resp := map[string]any{"enabled": next.Enabled, "passphrase_is_set": next.Passphrase != ""}
-		if generated != "" {
-			// The ONE response that ever carries the raw passphrase back —
-			// see GenerateRecoveryPassphrase's doc comment for why this is
-			// deliberately the same exception ClaimPairing/API-key
-			// regeneration already make elsewhere in this codebase. Every
-			// other read of encryption settings (the GET case above, and
-			// this same PUT when req.Generate is false) stays fully
-			// redacted, same as always.
-			resp["generated_passphrase"] = generated
-		}
-		respond(w, 200, resp)
+		respond(w, 200, EncryptionSettingsView{
+			Enabled: next.Enabled, PassphraseIsSet: next.Passphrase != "",
+			RecoveryIsSet:         cur.RecoveryWrapped != "",
+			RecoveryPossiblyStale: s.cfg.RecoveryPossiblyStale(),
+		})
 	default:
 		errOut(w, 405, "method not allowed")
 	}
+}
+
+// handleEncryptionRecoveryGenerate mints a fresh recovery phrase for the
+// CURRENT passphrase and returns it exactly once — see
+// Config.GenerateEncryptionRecovery's doc comment (config.go) for the
+// full design. Requires the admin's current password, same "prove you
+// still are who you say you are before this reveals something
+// permanent-feeling" gate handleAuthMFADisable already uses — generating
+// a new recovery phrase silently supersedes any previous one, so it's
+// worth the same friction as disabling MFA.
+func (s *Server) handleEncryptionRecoveryGenerate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := parseJSON(r, &req); err != nil {
+		errOut(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	username := r.Header.Get("X-Auth-User")
+	user, ok := s.cfg.GetUser(username)
+	if !ok || bcrypt.CompareHashAndPassword([]byte(user.Hash), []byte(req.Password)) != nil {
+		time.Sleep(400 * time.Millisecond)
+		errOut(w, 401, "incorrect password")
+		return
+	}
+	phrase, err := s.cfg.GenerateEncryptionRecovery()
+	if err != nil {
+		errOut(w, 400, err.Error())
+		return
+	}
+	// The ONE response that ever carries the raw recovery phrase — see
+	// GenerateEncryptionRecovery's doc comment for why this is the same
+	// one-time-reveal exception ClaimPairing/API-key regeneration already
+	// make elsewhere in this codebase.
+	respond(w, 200, map[string]string{"recovery_phrase": phrase})
+}
+
+// handleEncryptionRecoveryReveal unwraps a recovery phrase back into the
+// passphrase it protects — the actual "I lost my passphrase, help" flow.
+// Also password-gated: this reveals a live secret, same posture as
+// generating one.
+func (s *Server) handleEncryptionRecoveryReveal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	var req struct {
+		Password       string `json:"password"`
+		RecoveryPhrase string `json:"recovery_phrase"`
+	}
+	if err := parseJSON(r, &req); err != nil {
+		errOut(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	username := r.Header.Get("X-Auth-User")
+	user, ok := s.cfg.GetUser(username)
+	if !ok || bcrypt.CompareHashAndPassword([]byte(user.Hash), []byte(req.Password)) != nil {
+		time.Sleep(400 * time.Millisecond)
+		errOut(w, 401, "incorrect password")
+		return
+	}
+	passphrase, stale, err := s.cfg.RecoverEncryptionPassphrase(req.RecoveryPhrase)
+	if err != nil {
+		time.Sleep(400 * time.Millisecond)
+		errOut(w, 401, err.Error())
+		return
+	}
+	respond(w, 200, map[string]any{"passphrase": passphrase, "stale": stale})
 }
 
 // RemoteTargetView is the redacted shape returned by GET/PUT /api/remote.
