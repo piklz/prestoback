@@ -409,6 +409,67 @@ func HealthAndExitFromStatus(status string) (health string, exitCode int) {
 	return health, exitCode
 }
 
+// ContainerHealth is what internal/api's health-transition monitor needs
+// beyond the bare "healthy"/"unhealthy" string HealthAndExitFromStatus
+// already gets for free out of `docker ps` — the actual reason a
+// healthcheck is failing, straight from Docker's own record of it. This
+// costs one extra `docker inspect` per container, so unlike
+// HealthAndExitFromStatus (which every routine poll uses, at `docker ps`
+// scale), this is only ever called for the small number of containers
+// that just crossed a health-state edge and need an explanation attached
+// to the alert.
+type ContainerHealth struct {
+	Status        string `json:"status"`         // "healthy" | "unhealthy" | "starting" | ""
+	FailingStreak int    `json:"failing_streak"` // consecutive failed probes
+	LastOutput    string `json:"last_output"`    // stdout+stderr of the most recent healthcheck probe, as Docker itself ran it
+}
+
+// InspectContainerHealth reads a container's `State.Health` block —
+// Docker's own probe history, including the most recent probe's raw
+// output (e.g. "timed out starting health check for container ...", or
+// whatever the healthcheck command itself printed before failing). This
+// is the "why", as opposed to HealthAndExitFromStatus's "what".
+func InspectContainerHealth(nameOrID string) (ContainerHealth, error) {
+	out, err := exec.Command("docker", "inspect", "--format", "{{json .State.Health}}", nameOrID).Output()
+	if err != nil {
+		return ContainerHealth{}, err
+	}
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed == "" || trimmed == "null" {
+		return ContainerHealth{}, nil // no healthcheck configured — not an error, just nothing to report
+	}
+	var raw struct {
+		Status        string `json:"Status"`
+		FailingStreak int    `json:"FailingStreak"`
+		Log           []struct {
+			Output   string `json:"Output"`
+			ExitCode int    `json:"ExitCode"`
+		} `json:"Log"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return ContainerHealth{}, err
+	}
+	h := ContainerHealth{Status: raw.Status, FailingStreak: raw.FailingStreak}
+	if n := len(raw.Log); n > 0 {
+		h.LastOutput = strings.TrimSpace(raw.Log[n-1].Output)
+	}
+	return h, nil
+}
+
+// ContainerLogTail returns the last `lines` lines of a container's
+// combined stdout+stderr — the "what was it doing right before this"
+// context attached to a health-transition alert. Deliberately uses
+// `docker logs --tail`, not the Docker API's log-reading, so this needs
+// nothing beyond the same `docker` CLI + socket every other function in
+// this file already depends on.
+func ContainerLogTail(nameOrID string, lines int) (string, error) {
+	if lines <= 0 {
+		lines = 50
+	}
+	out, err := exec.Command("docker", "logs", "--tail", strconv.Itoa(lines), nameOrID).CombinedOutput()
+	return string(out), err
+}
+
 // PauseContainers freezes all running containers via SIGSTOP (docker pause),
 // returning the set that was actually paused so the caller knows what to
 // resume afterward. Unlike StopContainers, nothing exits and nothing is

@@ -92,6 +92,12 @@ type Server struct {
 	// resolve the same container from two different app entries.
 	updateMu      sync.Mutex
 	updateRunning bool
+
+	// containerHealth tracks the last known health state per container
+	// name, across the whole host (not just registered apps) — see
+	// healthmonitor.go. Guarded by stateMu, same as every other
+	// poll-loop state map on this struct.
+	containerHealth map[string]*containerHealthState
 }
 
 func NewServer(cfg *config.Config, image, selfName, restartNote string) *Server {
@@ -110,6 +116,7 @@ func NewServer(cfg *config.Config, image, selfName, restartNote string) *Server 
 		updateAlertSent: make(map[string]bool),
 		dismissBatches:  make(map[string][]string),
 		restartNote:     restartNote,
+		containerHealth: make(map[string]*containerHealthState),
 	}
 	s.routes()
 	s.loadSchedules()
@@ -137,6 +144,7 @@ func NewServer(cfg *config.Config, image, selfName, restartNote string) *Server 
 	go s.updateCheckLoop()
 	go s.selfUpdateCheckLoop()
 	go s.pausedScheduleReminderLoop()
+	go s.containerHealthMonitorLoop()
 	return s
 }
 
@@ -4228,6 +4236,7 @@ func prestoBackBotCommands() []notify.BotCommand {
 		{Command: "disk", Description: "Backup directory disk usage (free / used / total)"},
 		{Command: "next", Description: "Upcoming scheduled backup times across all apps"},
 		{Command: "check", Description: "Check for image updates now (registry check, no downloads)"},
+		{Command: "health", Description: "Show any containers currently unhealthy on this host"},
 		{Command: "start", Description: "Start a stopped container — /start <name>"},
 		{Command: "stop", Description: "Stop a running container — /stop <name>"},
 		{Command: "restart", Description: "Restart a container — /restart <name>"},
@@ -4765,6 +4774,9 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 	case "/restart":
 		s.handleContainerLifecycle(tgCfg, arg, "restart")
 
+	case "/health":
+		s.handleHealthCommand(tgCfg)
+
 	case "/pause":
 		s.handleContainerLifecycle(tgCfg, arg, "pause")
 
@@ -4927,6 +4939,7 @@ func (s *Server) handleTelegramCommand(nc config.NotifyConfig, msg *notify.Teleg
 			"💾 /disk — backup directory disk usage\n" +
 			"⏰ /next — upcoming scheduled backup times\n" +
 			"🔍 /check — check for image updates now \\(registry check, no downloads\\)\n" +
+			"🩺 /health — any containers currently unhealthy on this host\n" +
 			"⏸ /schedpause \\<name\\> — disable an app's backup schedule\n" +
 			"▶ /schedresume \\<name\\> — re\\-enable an app's backup schedule\n" +
 			"🔧 /maintenance \\<2h/1d/1w/on/off\\> — freeze all schedules temporarily\n\n" +
@@ -5024,6 +5037,9 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 		}
 		_ = notify.SendRaw(tgCfg, fmt.Sprintf("▶ Backup started for `%s`", notify.EscapeMD(app.Name)))
 		go s.runBackup(app, false)
+
+	case "health":
+		s.handleHealthCallback(tgCfg, parts)
 
 	case "update":
 		if parts[1] == "all" {
@@ -5851,6 +5867,7 @@ func (s *Server) dispatchNotify(ev notify.Event) {
 		OnRestoreFail:            nc.OnRestoreFail,
 		OnRemoteReceive:          nc.OnRemoteReceive,
 		OnSchedulePausedReminder: nc.OnSchedulePausedReminder,
+		OnContainerHealth:        nc.OnContainerHealth,
 	}, ev)
 }
 

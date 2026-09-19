@@ -276,6 +276,15 @@ type NotifyConfig struct {
 	OnRestoreFail            bool `json:"on_restore_fail"`
 	OnRemoteReceive          bool `json:"on_remote_receive"`
 	OnSchedulePausedReminder bool `json:"on_schedule_paused_reminder"`
+	// OnContainerHealth controls host-wide "a container just went
+	// unhealthy / came back healthy" alerts — see
+	// internal/api/healthmonitor.go. Distinct from every toggle above:
+	// those are all about PrestoBack's OWN actions (a backup that ran,
+	// a restore, a push); this is about OTHER containers on the host
+	// doing something PrestoBack didn't cause and can't predict, closer
+	// in spirit to a dedicated watchdog like Docksentry than to anything
+	// else this file already models.
+	OnContainerHealth bool `json:"on_container_health"`
 }
 
 // EncryptionConfig holds the global default for backup-archive encryption.

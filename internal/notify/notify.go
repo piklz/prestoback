@@ -59,6 +59,10 @@ func (e Event) Title() string {
 		return "Rejected a push from a paired instance"
 	case "schedule_paused_reminder":
 		return "Backup schedule still paused"
+	case "container_healthy":
+		return "Container recovered"
+	case "container_unhealthy":
+		return "Container turned unhealthy"
 	default:
 		return "PrestoBack event"
 	}
@@ -398,6 +402,14 @@ type Config struct {
 	// actually RAN; this is about one that DIDN'T, on purpose, possibly
 	// forgotten about).
 	OnSchedulePausedReminder bool
+	// OnContainerHealth mirrors config.NotifyConfig.OnContainerHealth —
+	// see healthmonitor.go. Covers both edges: a container turning
+	// unhealthy (sent via the richer, button-equipped path in
+	// healthmonitor.go, bypassing Dispatch entirely for Telegram/Discord
+	// — see that file's sendContainerUnhealthyAlert) and a container
+	// recovering (sent through this normal Dispatch path instead, since
+	// "healthy again" needs no buttons and no bespoke formatting).
+	OnContainerHealth bool
 }
 
 // Dispatch fires all enabled notification channels for the given event.
@@ -420,6 +432,8 @@ func Dispatch(cfg Config, ev Event) {
 			wantsNotify = cfg.OnRemoteReceive
 		case "schedule_paused_reminder":
 			wantsNotify = cfg.OnSchedulePausedReminder
+		case "container_healthy":
+			wantsNotify = cfg.OnContainerHealth
 		default:
 			wantsNotify = true
 		}
