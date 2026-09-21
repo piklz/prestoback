@@ -1355,23 +1355,24 @@ func pullTimeoutFor(sizeBytes int64) time.Duration {
 	return total
 }
 
-// ContainerPullTimeout resolves c's current image and returns the same
-// size-scaled timeout UpdateContainer will use internally for its own pull
-// step (see pullTimeoutFor). Exported so orchestration code (the /update-all
-// loop in server.go) can size its own outer supervisory deadline to agree
-// with what's actually happening inside UpdateContainer, instead of a
-// separate hardcoded number that can — and did — fire before the real,
-// size-aware pull timeout ever gets a chance to.
+// ContainerPullTimeout resolves c's current image and returns the total
+// worst-case time UpdateContainer's pull step could now take internally
+// — up to 3 attempts at pullTimeoutFor's duration each, plus the
+// withRetry backoff delays between them (5s+15s=20s; the 3rd attempt's
+// failure doesn't wait afterward) — so the caller's own outer watchdog
+// (updateOneContainerWithWatchdog, server.go) stays sized to what can
+// actually happen now that the pull step retries internally, instead of
+// firing on attempt 2 or 3 before they ever got a chance to run.
 func ContainerPullTimeout(c ContainerInfo) time.Duration {
 	out, err := exec.Command("docker", "inspect", "--format={{.Config.Image}}", c.ID).Output()
 	if err != nil {
-		return pullTimeout
+		return pullTimeout*3 + 20*time.Second
 	}
 	image := strings.TrimSpace(string(out))
 	if image == "" {
-		return pullTimeout
+		return pullTimeout*3 + 20*time.Second
 	}
-	return pullTimeoutFor(estimateDownloadSize(image))
+	return pullTimeoutFor(estimateDownloadSize(image))*3 + 20*time.Second
 }
 
 // UpdateContainer pulls the latest image for c and recreates the container.
@@ -1405,14 +1406,40 @@ func UpdateContainer(c ContainerInfo, composeFile string, emit func(string)) Con
 	} else {
 		emit(fmt.Sprintf("Pulling %s… (timeout %s)", res.Image, timeout))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	pullOut, err := exec.CommandContext(ctx, "docker", "pull", res.Image).CombinedOutput()
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			res.Err = fmt.Sprintf("pull timed out after %s", timeout)
+	// 3 attempts — see withRetry's doc comment (updater.go). A registry
+	// pull failing on a TLS handshake timeout is exactly the kind of
+	// transient, load-dependent failure a resource-contended host
+	// produces, and this is the one pull path in the whole app-update
+	// flow that previously had zero retries at all: a single bad moment
+	// meant the whole update attempt failed outright, every time. Each
+	// attempt gets its own fresh context/deadline (a context can't be
+	// reused once it fires) sized the same way a single attempt always
+	// was — see ContainerPullTimeout's doc comment for how the caller's
+	// own watchdog timeout stays coordinated with this now taking up to
+	// 3x as long in the worst case.
+	var pullOut []byte
+	attempt := 0
+	timedOut := false
+	pullErr := withRetry(3, func() error {
+		attempt++
+		if attempt > 1 {
+			emit(fmt.Sprintf("Retrying pull for %s (attempt %d/3)…", res.Image, attempt))
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, "docker", "pull", res.Image).CombinedOutput()
+		pullOut = out
+		if err != nil {
+			timedOut = ctx.Err() == context.DeadlineExceeded
+			return fmt.Errorf("%s", stripDockerOutput(string(out)))
+		}
+		return nil
+	})
+	if pullErr != nil {
+		if timedOut {
+			res.Err = fmt.Sprintf("pull timed out after %s (tried %d times)", timeout, attempt)
 		} else {
-			res.Err = "pull failed: " + stripDockerOutput(string(pullOut))
+			res.Err = fmt.Sprintf("pull failed after %d attempts: %s", attempt, pullErr.Error())
 		}
 		return res
 	}
