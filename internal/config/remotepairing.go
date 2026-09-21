@@ -475,6 +475,46 @@ func (c *Config) ListRemotePushers() []RemotePusher {
 	return out
 }
 
+// ImportRemotePushers restores paired-pusher records from a
+// Config.ExportRemotes export — see that method's doc comment
+// (config.go) for the incident that motivated this. Matches by
+// PusherNodeID (the actual identity — a Name is just a label and two
+// different real pushers could share one); a node already present is
+// left alone rather than overwritten, same non-destructive-merge
+// posture ImportRemoteTargets uses. Preserves the imported record's
+// EXACT CredentialHash rather than issuing a new one — if the pusher
+// side genuinely still holds its original raw credential (it was never
+// lost, only this receiver's record of it was), restoring the matching
+// hash here means push access resumes working immediately with no
+// re-pairing needed at all; if the pusher's own credential is ALSO
+// gone, the restored record is still useful as a visible "this used to
+// be paired" entry that can be revoked or replaced deliberately, rather
+// than the pairing simply vanishing without a trace.
+func (c *Config) ImportRemotePushers(pushers []RemotePusher) (added, skipped int) {
+	c.mu.Lock()
+	existing := make(map[string]bool, len(c.remotePushers))
+	for _, rp := range c.remotePushers {
+		existing[rp.PusherNodeID] = true
+	}
+	for _, rp := range pushers {
+		if existing[rp.PusherNodeID] {
+			skipped++
+			continue
+		}
+		if rp.ID == "" {
+			rp.ID = generateRemotePusherID()
+		}
+		c.remotePushers[rp.ID] = rp
+		existing[rp.PusherNodeID] = true
+		added++
+	}
+	c.mu.Unlock()
+	if added > 0 {
+		_ = c.Save()
+	}
+	return added, skipped
+}
+
 // DeleteRemotePusher revokes a pusher's access immediately — the very
 // next push attempt using its credential fails. Same "nothing else to
 // revoke" reasoning DeletePairedKey documents: push credentials aren't

@@ -23,6 +23,7 @@ package api
 //     every other mutating endpoint in this codebase.
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -518,6 +519,7 @@ type RemotePusherView struct {
 	PusherNodeID string     `json:"pusher_node_id"`
 	CreatedAt    time.Time  `json:"created_at"`
 	LastUsed     *time.Time `json:"last_used,omitempty"`
+	AppendOnly   bool       `json:"append_only,omitempty"`
 }
 
 func (s *Server) handleRemotePushers(w http.ResponseWriter, r *http.Request) {
@@ -532,9 +534,60 @@ func (s *Server) handleRemotePushers(w http.ResponseWriter, r *http.Request) {
 		if fileTime := s.newestReceivedFileTime(rp.ID); fileTime != nil && (lastUsed == nil || fileTime.After(*lastUsed)) {
 			lastUsed = fileTime
 		}
-		out[i] = RemotePusherView{ID: rp.ID, Name: rp.Name, PusherNodeID: rp.PusherNodeID, CreatedAt: rp.CreatedAt, LastUsed: lastUsed}
+		out[i] = RemotePusherView{ID: rp.ID, Name: rp.Name, PusherNodeID: rp.PusherNodeID, CreatedAt: rp.CreatedAt, LastUsed: lastUsed, AppendOnly: rp.AppendOnly}
 	}
 	respond(w, 200, out)
+}
+
+// handleConfigExportRemotes returns the current remote-target config and
+// paired-pusher list verbatim, INCLUDING credentials — see
+// Config.ExportRemotes' doc comment for exactly why this exists and how
+// sensitive the result is. Served as a real file download (Content-
+// Disposition) rather than a bare JSON response so the browser prompts
+// to save it, the same "this is meant to leave the browser and go
+// somewhere durable" framing the encryption recovery-phrase reveal
+// already uses for an equally sensitive one-shot value.
+func (s *Server) handleConfigExportRemotes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	export := s.cfg.ExportRemotes()
+	data, err := json.MarshalIndent(export, "", "  ")
+	if err != nil {
+		errOut(w, 500, err.Error())
+		return
+	}
+	filename := fmt.Sprintf("prestoback-remotes-%s.json", time.Now().UTC().Format("20060102-150405"))
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+filename+"\"")
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(data)
+}
+
+// handleConfigImportRemotes restores remote targets and paired pushers
+// from a previous export — see Config.ImportRemoteTargets/
+// ImportRemotePushers for the exact (non-destructive, merge-by-identity)
+// semantics. Reports what actually happened rather than a bare "ok",
+// since "how many were skipped as already-present" is genuinely useful
+// information after a disaster-recovery import.
+func (s *Server) handleConfigImportRemotes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	var export config.RemoteExport
+	if err := parseJSON(r, &export); err != nil {
+		errOut(w, 400, "invalid export file: "+err.Error())
+		return
+	}
+	targetsAdded, targetsSkipped := s.cfg.ImportRemoteTargets(export.Remote.Targets, export.Remote.Enabled)
+	pushersAdded, pushersSkipped := s.cfg.ImportRemotePushers(export.RemotePushers)
+	respond(w, 200, map[string]any{
+		"targets_added":   targetsAdded,
+		"targets_skipped": targetsSkipped,
+		"pushers_added":   pushersAdded,
+		"pushers_skipped": pushersSkipped,
+	})
 }
 
 // newestReceivedFileTime scans every app subdirectory this pusher has ever

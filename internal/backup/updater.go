@@ -19,6 +19,40 @@ type UpdateResult struct {
 	Error   string `json:"error,omitempty"`
 }
 
+// withRetry retries fn up to attempts times with exponential-ish backoff
+// (5s, 15s, 30s), stopping at the first success. Every registry-facing
+// operation in this file (docker pull, the bearer-token handshake, the
+// manifest HEAD) talks to an external network endpoint over TLS, and on
+// a resource-contended host (several containers, several apps' backups
+// all competing for CPU/network at once — the exact "Pi4 heavy with apps
+// right now" scenario) a single TLS handshake timing out once is common
+// and usually transient, not a real, persistent failure. Before this,
+// every one of these calls was a single attempt with no retry at all —
+// one slow moment and the whole update-check or self-update simply
+// failed, when trying again 5-15 seconds later would very likely have
+// succeeded. lastErr is returned if every attempt fails, so the final
+// error message is still the real, most-recent failure reason, not a
+// generic "gave up" placeholder.
+func withRetry(attempts int, fn func() error) error {
+	delays := []time.Duration{5 * time.Second, 15 * time.Second, 30 * time.Second}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if err := fn(); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if i < attempts-1 {
+			d := 30 * time.Second
+			if i < len(delays) {
+				d = delays[i]
+			}
+			time.Sleep(d)
+		}
+	}
+	return lastErr
+}
+
 // composeInfo holds Compose metadata from container labels.
 // Set only when the container was started by Docker Compose.
 type composeInfo struct {
@@ -56,9 +90,26 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 	emit(UpdateResult{Stage: "pulling", Message: "Pulling " + image + "…"})
 
 	// ── Step 1: pull ──────────────────────────────────────────────────────────
-	out, err := exec.Command("docker", "pull", image).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("docker pull failed: %w\n%s", err, out)
+	// 3 attempts — see withRetry's doc comment. A pull failure specifically
+	// (rather than every OTHER step in this function) is exactly where a
+	// resource-starved host's network stack is most likely to show a
+	// transient TLS handshake timeout, and it's also the one step where
+	// retrying is completely free of side effects — nothing has touched
+	// the running container yet.
+	attempt := 0
+	pullErr := withRetry(3, func() error {
+		attempt++
+		if attempt > 1 {
+			emit(UpdateResult{Stage: "pulling", Message: fmt.Sprintf("Retrying pull (attempt %d/3)…", attempt)})
+		}
+		out, err := exec.Command("docker", "pull", image).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("docker pull failed: %w\n%s", err, out)
+		}
+		return nil
+	})
+	if pullErr != nil {
+		return pullErr
 	}
 	emit(UpdateResult{Stage: "pulling", Message: "Image pulled ✓"})
 
@@ -503,7 +554,15 @@ func doCheckForUpdate(image string) (bool, string, string, error) {
 		// digest in RepoDigests to compare. Still fetch the remote digest so the
 		// UI can show the user that a registry version exists and let them pull.
 		log.Printf("[updater] no RepoDigests for %s (locally built) — fetching remote digest anyway", image)
-		remoteDigest, err := headRegistryDigest(image)
+		var remoteDigest string
+		err := withRetry(3, func() error {
+			d, err := headRegistryDigest(image)
+			if err != nil {
+				return err
+			}
+			remoteDigest = d
+			return nil
+		})
 		if err != nil {
 			return false, "local-build", "", fmt.Errorf("registry check failed: %w", err)
 		}
@@ -513,7 +572,19 @@ func doCheckForUpdate(image string) (bool, string, string, error) {
 	log.Printf("[updater] local  digest: %.19s", localDigest)
 
 	// ── Step 2: remote digest via registry HEAD (no download) ─────────────────
-	remoteDigest, err := headRegistryDigest(image)
+	// 3 attempts — see withRetry's doc comment. A registry check is exactly
+	// the kind of call that's cheap to retry (a HEAD request, not a pull)
+	// and exactly the kind that was failing outright on a single transient
+	// timeout before this.
+	var remoteDigest string
+	err = withRetry(3, func() error {
+		d, err := headRegistryDigest(image)
+		if err != nil {
+			return err
+		}
+		remoteDigest = d
+		return nil
+	})
 	if err != nil {
 		return false, localDigest, "", fmt.Errorf("registry check failed: %w", err)
 	}

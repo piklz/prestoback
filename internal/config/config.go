@@ -710,6 +710,101 @@ func (c *Config) save() error {
 	return os.Rename(tmp, filepath.Join(c.DataDir, "config.json"))
 }
 
+// ── Pre-risky-operation snapshots ────────────────────────────────────────────
+//
+// SnapshotBeforeRiskyOp copies the CURRENT on-disk config.json to
+// <DataDir>/config-backups/config-<label>-<timestamp>.json before
+// something that could go wrong in a way ordinary error handling can't
+// protect against — specifically, self-update swapping the running
+// container for a different image build. That's exactly the scenario a
+// real incident traced back to: a self-update landed on a much older
+// build (via a stale `:latest` tag that had drifted far behind active
+// development) whose config schema didn't recognize several fields this
+// version writes (remote pairings, users, encryption settings, ...) —
+// and that older binary's own unconditional startup Save() silently
+// discarded every field it didn't understand, the moment it booted.
+//
+// This snapshot can't stop that from happening (an old binary's own
+// behavior isn't something a NEWER version's code can reach into and
+// fix), but it turns an otherwise-unrecoverable loss into "restore
+// config-backups/config-before-selfupdate-*.json and you're back" — the
+// snapshot is taken from THIS (still-current, still-correct) process
+// before anything risky happens, so it always reflects the last known-
+// good state right up to the moment of the swap.
+//
+// Deliberately a plain file copy, not routed through save()/Save() —
+// this must capture EXACTLY what's on disk right now, not whatever this
+// process's in-memory state would currently reserialize to (which,
+// especially mid-startup or mid-migration, isn't guaranteed to be
+// identical). Rotation keeps at most snapshotRetainCount files across
+// ALL labels combined — this is a safety net for one risky moment, not
+// a general-purpose backup history (that's what the actual backup
+// archives are for).
+const snapshotRetainCount = 5
+
+func (c *Config) SnapshotBeforeRiskyOp(label string) error {
+	src := filepath.Join(c.DataDir, "config.json")
+	data, err := os.ReadFile(src)
+	if os.IsNotExist(err) {
+		return nil // nothing to snapshot yet (fresh install) — not an error
+	}
+	if err != nil {
+		return fmt.Errorf("read config.json for snapshot: %w", err)
+	}
+
+	dir := filepath.Join(c.DataDir, "config-backups")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("create config-backups dir: %w", err)
+	}
+	safeLabel := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
+			return r
+		}
+		return '-'
+	}, label)
+	name := fmt.Sprintf("config-%s-%s.json", safeLabel, time.Now().UTC().Format("20060102-150405"))
+	dest := filepath.Join(dir, name)
+	if err := os.WriteFile(dest, data, 0600); err != nil {
+		return fmt.Errorf("write snapshot: %w", err)
+	}
+
+	rotateConfigSnapshots(dir)
+	return nil
+}
+
+// rotateConfigSnapshots keeps only the snapshotRetainCount most recent
+// files in dir, oldest deleted first. Best-effort — a failure here
+// leaves an extra file lying around, which is a cosmetic annoyance, not
+// a reason to fail the snapshot that already succeeded.
+func rotateConfigSnapshots(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type fileInfo struct {
+		name    string
+		modTime time.Time
+	}
+	var files []fileInfo
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, fileInfo{name: e.Name(), modTime: info.ModTime()})
+	}
+	if len(files) <= snapshotRetainCount {
+		return
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
+	for _, f := range files[:len(files)-snapshotRetainCount] {
+		_ = os.Remove(filepath.Join(dir, f.name))
+	}
+}
+
 // ── API key ───────────────────────────────────────────────────────────────────
 
 // APIKey returns the raw master key. Used only where the raw value is
@@ -1234,6 +1329,94 @@ func (c *Config) SetRemote(r RemoteConfig) error {
 	c.remote = r
 	c.mu.Unlock()
 	return c.Save()
+}
+
+// ── Remote-target export/import ─────────────────────────────────────────────
+//
+// Motivated directly by a real incident: a self-update landed on a much
+// older image build (a stale `:latest` tag that had drifted far behind
+// active development), and that older binary's own, incompatible config
+// schema silently discarded every remote target and paired pusher the
+// moment it started up and ran its normal first-boot Save(). Config.json
+// itself is a single point of failure for exactly this kind of thing —
+// SnapshotBeforeRiskyOp (above) guards the moment a risky operation
+// happens, but a plain, human-readable export the user can save
+// somewhere else entirely (a password manager, a note, a second device)
+// is worth having independently of that, and is what was actually asked
+// for.
+//
+// Deliberately scoped to remote targets + paired pushers, not the whole
+// config — those are the pieces that are painful to reconstruct by hand
+// (credentials, node identities, pinned fingerprints) as opposed to
+// something like app definitions or notification settings, which are
+// mostly just re-typing text into a form.
+type RemoteExport struct {
+	ExportedAt    time.Time      `json:"exported_at"`
+	PrestobackVer string         `json:"prestoback_version"`
+	Remote        RemoteConfig   `json:"remote"`
+	RemotePushers []RemotePusher `json:"remote_pushers,omitempty"`
+}
+
+// ExportRemotes snapshots the current remote-target config and paired
+// pushers verbatim — INCLUDING credentials (SFTP passwords, S3 secret
+// keys, prestoback push credentials, paired-pusher credential hashes).
+// This is exactly as sensitive as config.json itself for this slice of
+// it; treat the exported file that way (the HTTP handler requires the
+// same admin auth every other remote-target read/write already does —
+// see server.go's handleConfigExportRemotes).
+func (c *Config) ExportRemotes() RemoteExport {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	pushers := make([]RemotePusher, 0, len(c.remotePushers))
+	for _, rp := range c.remotePushers {
+		pushers = append(pushers, rp)
+	}
+	return RemoteExport{
+		ExportedAt:    time.Now().UTC(),
+		PrestobackVer: Version,
+		Remote:        c.remote,
+		RemotePushers: pushers,
+	}
+}
+
+// ImportRemoteTargets merges targets into the existing remote-target
+// list, matching by Name. A target whose name already exists is left
+// alone — imported does NOT mean "restore to exactly this," it means
+// "add back whatever's missing," so anything reconfigured since the
+// export (including a deliberate replacement with the same name) is
+// never silently clobbered. Returns counts for the caller to report.
+func (c *Config) ImportRemoteTargets(targets []RemoteTarget, wasEnabled bool) (added, skipped int) {
+	c.mu.Lock()
+	existing := make(map[string]bool, len(c.remote.Targets))
+	for _, t := range c.remote.Targets {
+		existing[t.Name] = true
+	}
+	for _, t := range targets {
+		if existing[t.Name] {
+			skipped++
+			continue
+		}
+		c.remote.Targets = append(c.remote.Targets, t)
+		existing[t.Name] = true
+		added++
+	}
+	if added > 0 && wasEnabled && !c.remote.Enabled {
+		// Restoring targets that were part of an enabled remote-backup
+		// setup and leaving the whole feature toggled off would mean
+		// scheduled pushes silently stay dark until someone happens to
+		// notice — the one part of "restore what was lost" that's worth
+		// doing proactively rather than requiring a second manual step.
+		// Only ever flips this ON, and only when the export itself had
+		// it on — never forces it on if the export was captured with it
+		// off, and never turns it off either way. Same merge-don't-
+		// clobber posture as everything else here.
+		c.remote.Enabled = true
+	}
+	c.mu.Unlock()
+	if added > 0 {
+		_ = c.Save()
+	}
+	return added, skipped
 }
 
 // ── Misc ──────────────────────────────────────────────────────────────────────

@@ -1018,6 +1018,16 @@ select.fi{cursor:pointer}
         <span class="fh" id="rt-dirty-note" style="display:none;color:#e0a030">● Unsaved changes — click Save to persist them</span>
       </div>
 
+      <div style="border-top:1px solid var(--bd);margin:14px 0;padding-top:14px">
+        <div class="fl" style="margin-bottom:6px">Backup &amp; restore this config</div>
+        <div class="fh" style="margin-bottom:10px">Save your remote targets and paired devices (including credentials) to a file you keep somewhere durable — a password manager, a second device — independent of this Pi's own config.json. If a self-update or anything else ever wipes these out, import the file back and they're restored.</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <button class="btn btn-g btn-sm" onclick="exportRemoteConfig()">⬇ Export</button>
+          <button class="btn btn-g btn-sm" onclick="document.getElementById('rt-import-file').click()">⬆ Import</button>
+          <input type="file" id="rt-import-file" accept="application/json" style="display:none" onchange="importRemoteConfig(this.files[0])">
+        </div>
+      </div>
+
       <div style="border-top:1px solid var(--line);padding-top:14px;margin-top:8px">
         <div class="rt-form-toggle" onclick="toggleRtFormCollapse()">
           <div class="fl" style="margin-bottom:0" id="rt-form-title">Add a target</div>
@@ -5330,6 +5340,42 @@ async function saveRemote() {
     toast('Remote backup settings saved','success');
     sweepRemoteReachability();
   } catch(e) { toast(e.message,'error'); }
+}
+
+// exportRemoteConfig triggers a real file download of every remote
+// target + paired pusher, credentials included — see
+// Config.ExportRemotes' doc comment (config.go) for why this exists.
+// A plain navigation (not a fetch+blob dance) is enough: the session
+// cookie authenticates it automatically the same way it authenticates
+// any other same-origin request, and the server sets
+// Content-Disposition so the browser prompts to save rather than
+// navigating away from the app.
+function exportRemoteConfig() {
+  window.location.href = '/api/config/export/remotes';
+}
+
+async function importRemoteConfig(file) {
+  const input = document.getElementById('rt-import-file');
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const r = await api('/api/config/import/remotes', {method:'POST', body: text});
+    const parts = [];
+    if (r.targets_added) parts.push(`${r.targets_added} target${r.targets_added!==1?'s':''} restored`);
+    if (r.pushers_added) parts.push(`${r.pushers_added} paired device${r.pushers_added!==1?'s':''} restored`);
+    const skipped = (r.targets_skipped||0) + (r.pushers_skipped||0);
+    if (skipped) parts.push(`${skipped} already present, skipped`);
+    toast(parts.length ? parts.join(' · ') : 'Nothing new to import — everything in that file is already present', 'success');
+    if (r.targets_added || r.pushers_added) {
+      S_remoteLoaded = false; // force a real reload rather than trust in-memory state after an out-of-band change
+      loadRemote();
+      loadPrestoBackPushers();
+    }
+  } catch(e) {
+    toast('Import failed: ' + e.message, 'error');
+  } finally {
+    input.value = ''; // allow re-selecting the same file if they try again
+  }
 }
 
 // ════════════════════ Security ════════════════════

@@ -290,6 +290,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/remote/pairing/nodeid", s.authJWT(s.handleRemoteNodeID)) // read-only, any authenticated role — no pairing session minted
 	s.mux.HandleFunc("/api/remote/pairing/pair", s.adminForWrites(s.handleRemotePairAsPusher))
 	s.mux.HandleFunc("/api/remote/pushers", s.adminForWrites(s.handleRemotePushers))
+	s.mux.HandleFunc("/api/config/export/remotes", s.adminForWrites(s.handleConfigExportRemotes))
+	s.mux.HandleFunc("/api/config/import/remotes", s.adminForWrites(s.handleConfigImportRemotes))
 	s.mux.HandleFunc("/api/remote/pushers/", s.adminForWrites(s.handleRemotePusherByID))
 	s.mux.HandleFunc("/api/remote/received", s.adminForWrites(s.handleReceivedBackupsList))
 	s.mux.HandleFunc("/api/remote/received/", s.adminForWrites(s.handleReceivedBackupDelete))
@@ -4017,6 +4019,15 @@ func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 	}
 	respond(w, 202, map[string]string{"status": "update started"})
 	go func() {
+		// See Config.SnapshotBeforeRiskyOp's doc comment — this is the
+		// safety net for exactly the incident that motivated it. Failure
+		// to snapshot is logged but never blocks the update itself; the
+		// update proceeding is still strictly better than refusing it
+		// over a backup step that couldn't run (e.g. a full disk, which
+		// the update itself might actually be trying to address).
+		if err := s.cfg.SnapshotBeforeRiskyOp("before-selfupdate"); err != nil {
+			log.Printf("[self-update] config snapshot failed (continuing anyway): %v", err)
+		}
 		if err := backup.SelfUpdate(s.image, s.selfName, s.engine.AnyRunning, s.engine.EmitUpdate); err != nil {
 			log.Printf("self-update error: %v", err)
 			s.engine.EmitUpdate(backup.UpdateResult{Stage: "error", Message: "Update failed", Error: err.Error()})
@@ -5210,6 +5221,9 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 			}
 			_ = notify.SendRaw(tgCfg, "🔄 Pulling and restarting now\\. PrestoBack will briefly go offline — you'll get a message once it's back\\.")
 			go func() {
+				if err := s.cfg.SnapshotBeforeRiskyOp("before-selfupdate"); err != nil {
+					log.Printf("[self-update] config snapshot failed (continuing anyway): %v", err)
+				}
 				if err := backup.SelfUpdate(s.image, s.selfName, s.engine.AnyRunning, s.engine.EmitUpdate); err != nil {
 					log.Printf("[bot] selfupdate apply: %v", err)
 					_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Self\\-update failed: `%s`", notify.EscapeMD(err.Error())))
