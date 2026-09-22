@@ -76,6 +76,7 @@ func DiscoverApps(selfName, volumesDir string, registeredPaths map[string]string
 	seen := map[string]bool{}
 
 	dockerResults := discoverFromDocker(selfName, hostToContainer, registeredPaths, seen)
+	dockerResults = consolidateSiblingMounts(dockerResults, registeredPaths)
 	results = append(results, dockerResults...)
 
 	if volumesDir != "" {
@@ -117,6 +118,108 @@ func DiscoverApps(selfName, volumesDir string, registeredPaths map[string]string
 	}
 
 	return results
+}
+
+// consolidateSiblingMounts folds multiple bind-mount-per-DiscoveredApp
+// entries for the SAME container into one, when their paths are all
+// direct siblings under one shared parent directory — e.g. a container
+// bind-mounting /volumes/nostalgiatv-server/data, .../config, and
+// .../logos as three SEPARATE mounts produces three flat DiscoveredApp
+// entries from discoverFromDocker's own per-bind loop, one per mount,
+// all confusingly named "Nostalgiatv-server" with no indication they're
+// really one app. What almost everyone actually wants as the obvious
+// first choice is "back up the whole app" — exactly the shape
+// enrichWithSubDirs plus the frontend's "Backup entire folder" / "Or
+// choose specific sub-folders instead" toggle already provides for a
+// SINGLE discovered path; this just makes sure multi-mount containers
+// get folded into that same single-entry shape instead of fragmenting.
+//
+// This works from the docker-discovered paths alone — it doesn't need
+// --volumes configured at all, unlike DiscoverApps' own parent/child
+// "Reconcile" step above, which only fires when a SEPARATE volumes_dir
+// scan happens to also surface the shared parent as its own result (and
+// in practice usually doesn't: discoverFromDir's "Docker already covers
+// everything inside" check skips adding the parent in exactly this
+// situation, so that reconciliation never even gets a chance to run).
+//
+// Conservative on purpose: only consolidates when EVERY mount for that
+// container shares the exact same immediate parent directory (so
+// data/config/logos as direct siblings triggers it; a deeper or
+// inconsistent layout doesn't, and falls back to the existing flat
+// per-mount behavior rather than guessing wrong), and skips a container
+// entirely if any of its individual mounts is already registered as its
+// own app — that's a sign of a deliberate existing per-subfolder setup,
+// not something to silently collapse into a new suggestion.
+func consolidateSiblingMounts(results []DiscoveredApp, registeredPaths map[string]string) []DiscoveredApp {
+	byContainer := map[string][]int{}
+	for i, r := range results {
+		if r.Source != "docker" || r.LabelHinted {
+			// LabelHinted means an explicit com.prestoback.path label —
+			// that's already a single, deliberately-chosen path; nothing
+			// to consolidate.
+			continue
+		}
+		byContainer[r.ContainerName] = append(byContainer[r.ContainerName], i)
+	}
+
+	toRemove := map[int]bool{}
+	var synthesized []DiscoveredApp
+	for containerName, idxs := range byContainer {
+		if len(idxs) < 2 {
+			continue
+		}
+		anyRegistered := false
+		for _, i := range idxs {
+			if results[i].AlreadyRegistered {
+				anyRegistered = true
+				break
+			}
+		}
+		if anyRegistered {
+			continue
+		}
+		parent := filepath.Dir(results[idxs[0]].Path)
+		allSameParent := true
+		for _, i := range idxs[1:] {
+			if filepath.Dir(results[i].Path) != parent {
+				allSameParent = false
+				break
+			}
+		}
+		if !allSameParent || parent == "." || parent == "/" {
+			continue
+		}
+		info, err := os.Stat(parent)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+
+		first := results[idxs[0]]
+		consolidated := DiscoveredApp{
+			Name: first.Name, Path: parent, ContainerName: containerName,
+			Image: first.Image, Running: first.Running, Source: "docker",
+			Accessible: true, ComposeDeps: first.ComposeDeps,
+		}
+		if registeredAs := registeredPaths[parent]; registeredAs != "" {
+			consolidated.AlreadyRegistered = true
+			consolidated.RegisteredAs = registeredAs
+		}
+		synthesized = append(synthesized, consolidated)
+		for _, i := range idxs {
+			toRemove[i] = true
+		}
+		log.Printf("[discover] consolidated %d bind mounts for %s under shared parent %s", len(idxs), containerName, parent)
+	}
+	if len(toRemove) == 0 {
+		return results
+	}
+	out := make([]DiscoveredApp, 0, len(results)-len(toRemove)+len(synthesized))
+	for i, r := range results {
+		if !toRemove[i] {
+			out = append(out, r)
+		}
+	}
+	return append(out, synthesized...)
 }
 
 // enrichWithSubDirs performs a single-level shallow scan of the discovered

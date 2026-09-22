@@ -31,6 +31,18 @@ const (
 	// normal and expected between backup runs.
 	EventRestoreCheckPass EventType = "restore_check_pass"
 	EventRestoreCheckFail EventType = "restore_check_fail"
+
+	// EventContainerUnhealthy / EventContainerHealthy / EventContainerFlapping
+	// mirror the Telegram/Discord alerts healthmonitor.go already sends —
+	// logged here too so the History page in the UI shows the exact same
+	// health-transition events without needing a second, Telegram-only
+	// place to look. AppID is the container's NAME (not a registered
+	// PrestoBack app ID — this monitor is host-wide, see
+	// containerHealthMonitorLoop's own doc comment) reused as the join key
+	// the History page already renders on.
+	EventContainerUnhealthy EventType = "container_unhealthy"
+	EventContainerHealthy   EventType = "container_healthy"
+	EventContainerFlapping  EventType = "container_flapping"
 )
 
 type Entry struct {

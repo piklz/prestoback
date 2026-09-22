@@ -274,6 +274,63 @@ func buildSelfUpdateMessage(p *PendingSelfUpdate) string {
 	return sb.String()
 }
 
+// buildSelfUpdateAnnouncementMessage builds the ONE-TIME "just updated"
+// recap shown right after a self-update-triggered restart — what changed
+// between fromVersion (the version this instance was running immediately
+// before the swap — see main.go's checkPreviousSelfUpdate) and
+// config.Version (what's running now). Deliberately SHORT: commit
+// headlines / release titles only, capped, plus one link — the same
+// "brief recap + one link to read more" shape a dedicated watchdog like
+// Docksentry already uses for its own update announcements, as opposed
+// to this file's own much more detailed /changelog output.
+//
+// Falls back to a plain "back online" line (no error surfaced to the
+// user) if PRESTOBACK_GITHUB_REPO isn't configured or the fetch fails —
+// a working instance that can't currently reach GitHub for notes still
+// deserves to say it's back up, just without the extra detail.
+func (s *Server) buildSelfUpdateAnnouncementMessage(fromVersion string) string {
+	header := fmt.Sprintf("🚀 *PrestoBack updated:* `%s` → `%s`", notify.EscapeMD(fromVersion), notify.EscapeMD(config.Version))
+	repo := githubRepo()
+	if repo == "" {
+		return header
+	}
+
+	branch, baseSHA, isDev := backup.DevTrackInfo(s.image, fromVersion)
+	var releases []GithubRelease
+	var err error
+	if isDev {
+		releases, err = backup.FetchCommitsSince(repo, branch, baseSHA)
+	} else {
+		releases, err = backup.FetchReleasesSince(repo, fromVersion)
+	}
+	if err != nil {
+		log.Printf("[selfupdate] post-update changelog fetch failed (dev=%v branch=%q): %v", isDev, branch, err)
+		return header
+	}
+	if len(releases) == 0 {
+		return header
+	}
+
+	const maxLines = 6
+	var sb strings.Builder
+	sb.WriteString(header + "\n\n")
+	for i, r := range releases {
+		if i >= maxLines {
+			sb.WriteString(fmt.Sprintf("_…and %d more_\n", len(releases)-maxLines))
+			break
+		}
+		sb.WriteString("• " + notify.EscapeMD(r.Name) + "\n")
+	}
+	if url := releases[0].HTMLURL; url != "" {
+		label := "Full notes"
+		if isDev {
+			label = "Full commit history"
+		}
+		sb.WriteString("\n" + telegramLink(label+" →", url))
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
 // changelogUnit names what a batch of PendingSelfUpdate.Releases actually
 // contains — real GitHub releases on the main track, or synthesized
 // commit entries on a dev/branch track (see backup.FetchCommitsSince) —

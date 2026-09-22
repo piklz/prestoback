@@ -6,11 +6,41 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/pi/prestoback/internal/config"
 )
+
+// SelfUpdateMarkerFile records the version this instance was running
+// immediately before a self-update swap — see SelfUpdate's call to
+// writeSelfUpdateMarker for why, and main.go's checkPreviousSelfUpdate
+// for how it's consumed exactly once on the next startup. Exported so
+// main.go (which reads it) and this file (which writes it) share one
+// literal rather than two copies that could drift apart.
+const SelfUpdateMarkerFile = ".last_selfupdate_from.json"
+
+type selfUpdateMarker struct {
+	FromVersion string    `json:"from_version"`
+	At          time.Time `json:"at"`
+}
+
+func writeSelfUpdateMarker(dataDir string) {
+	if dataDir == "" {
+		return
+	}
+	data, err := json.Marshal(selfUpdateMarker{FromVersion: config.Version, At: time.Now().UTC()})
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, SelfUpdateMarkerFile), data, 0644); err != nil {
+		log.Printf("[updater] could not write self-update marker (continuing anyway): %v", err)
+	}
+}
 
 // UpdateResult is sent over SSE during a self-update.
 type UpdateResult struct {
@@ -86,7 +116,7 @@ func getComposeInfo(c containerInspect) *composeInfo {
 //     use" conflict caused by Compose's restart policy recreating the container
 //     between our docker rm and docker run.
 //     - Standalone: docker stop → docker rm → docker run (original behaviour)
-func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateResult)) error {
+func SelfUpdate(dataDir, image, selfName string, isRunning func() bool, emit func(UpdateResult)) error {
 	emit(UpdateResult{Stage: "pulling", Message: "Pulling " + image + "…"})
 
 	// ── Step 1: pull ──────────────────────────────────────────────────────────
@@ -112,6 +142,19 @@ func SelfUpdate(image, selfName string, isRunning func() bool, emit func(UpdateR
 		return pullErr
 	}
 	emit(UpdateResult{Stage: "pulling", Message: "Image pulled ✓"})
+
+	// Record what version we're updating FROM before committing to the
+	// actual swap below — this is the one piece of information the NEXT
+	// process (the new binary, after it restarts) has no other way to
+	// know, since by the time it boots config.Version already reads as
+	// the NEW version. main.go's checkPreviousSelfUpdate reads and clears
+	// this on the next startup, the same read-once-then-delete pattern
+	// its checkPreviousShutdown sibling already uses for the restart-
+	// reason marker. Purely for the "here's what changed" announcement
+	// (server.go's runTelegramBot) — best-effort, a write failure here
+	// just means that one announcement is plain instead of detailed, not
+	// a reason to abort an update that's already pulled successfully.
+	writeSelfUpdateMarker(dataDir)
 
 	// ── Step 2: drain ─────────────────────────────────────────────────────────
 	emit(UpdateResult{Stage: "draining", Message: "Waiting for active jobs to finish…"})

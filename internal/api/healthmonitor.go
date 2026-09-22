@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/pi/prestoback/internal/backup"
+	"github.com/pi/prestoback/internal/history"
 	"github.com/pi/prestoback/internal/notify"
 )
 
@@ -155,6 +156,13 @@ func (s *Server) sendContainerUnhealthyAlert(name string) {
 	detail, _ := backup.InspectContainerHealth(name)
 	logs, _ := backup.ContainerLogTail(name, healthLogTailLines)
 
+	// Logged to History unconditionally — independent of the
+	// OnContainerHealth notify toggle below, which only governs outbound
+	// Telegram/Discord/etc alerts. The History page (and anything else
+	// reading /api/history) should show these transitions regardless of
+	// whether the user has chat notifications turned on for them.
+	s.hist.Append(history.Entry{Event: history.EventContainerUnhealthy, AppID: name, AppName: name, Detail: detail.LastOutput})
+
 	nc := s.cfg.GetNotify()
 	if !nc.OnContainerHealth {
 		return
@@ -207,6 +215,11 @@ func (s *Server) sendContainerUnhealthyAlert(name string) {
 }
 
 func (s *Server) sendContainerFlappingAlert(name string, edgeCount int) {
+	s.hist.Append(history.Entry{
+		Event: history.EventContainerFlapping, AppID: name, AppName: name,
+		Detail: fmt.Sprintf("unhealthy %d times in the last %s", edgeCount, formatDuration(healthFlapWindow)),
+	})
+
 	nc := s.cfg.GetNotify()
 	if !nc.OnContainerHealth {
 		return
@@ -227,6 +240,7 @@ func (s *Server) sendContainerHealthyAgain(name, downFor string) {
 	if downFor != "" {
 		detail = fmt.Sprintf("%s is healthy again — was down for %s", name, downFor)
 	}
+	s.hist.Append(history.Entry{Event: history.EventContainerHealthy, AppID: name, AppName: name, Detail: detail})
 	s.dispatchNotify(notify.Event{Kind: "container_healthy", AppName: name, Detail: detail})
 }
 

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/pi/prestoback/internal/api"
+	"github.com/pi/prestoback/internal/backup"
 	"github.com/pi/prestoback/internal/config"
 )
 
@@ -37,6 +38,7 @@ func main() {
 	// os.Exit), it just leaves a note for the next startup to find.
 	restartNote := checkPreviousShutdown(*dataDir)
 	installShutdownMarker(*dataDir)
+	selfUpdateFromVersion := checkPreviousSelfUpdate(*dataDir)
 
 	cfg, err := config.Load(*dataDir)
 	if err != nil {
@@ -75,7 +77,7 @@ func main() {
 	// Runs silently — if the container doesn't exist this is a no-op.
 	_ = exec.Command("docker", "rm", "-f", "prestoback-updater").Run()
 
-	srv := api.NewServer(cfg, image, selfName, restartNote)
+	srv := api.NewServer(cfg, image, selfName, restartNote, selfUpdateFromVersion)
 	if err := srv.Run(*port); err != nil {
 		log.Fatal(err)
 	}
@@ -131,6 +133,31 @@ func checkPreviousShutdown(dataDir string) string {
 		"Restart followed %s — e.g. a host reboot, docker restart, or the Docker daemon restarting. PrestoBack did not restart itself.",
 		reason,
 	)
+}
+
+// checkPreviousSelfUpdate is checkPreviousShutdown's sibling for the OTHER
+// marker a previous process can leave behind: not "why did the process
+// stop" but "what version was running right before a self-update swapped
+// it out." Read-once-then-delete, same as its sibling — a leftover file
+// from a crash between the marker write and the actual restart just means
+// the next boot's announcement is skipped once, which is harmless. Returns
+// "" (no announcement) whenever there's nothing to report, including the
+// ordinary case of a plain restart that was never preceded by a
+// self-update at all.
+func checkPreviousSelfUpdate(dataDir string) string {
+	path := filepath.Join(dataDir, backup.SelfUpdateMarkerFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	_ = os.Remove(path)
+	var m struct {
+		FromVersion string `json:"from_version"`
+	}
+	if json.Unmarshal(data, &m) != nil {
+		return ""
+	}
+	return m.FromVersion
 }
 
 // installShutdownMarker traps SIGTERM/SIGINT and writes the marker above

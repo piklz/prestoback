@@ -78,6 +78,13 @@ type Server struct {
 	// "" for a normal start. Read once by runTelegramBot's startup message.
 	restartNote string
 
+	// selfUpdateFromVersion carries the version this instance was running
+	// immediately before a self-update swap, from main.go's
+	// checkPreviousSelfUpdate — "" for a normal start, or a restart that
+	// wasn't preceded by a self-update. Read once by runTelegramBot's
+	// startup message to build the "here's what changed" announcement.
+	selfUpdateFromVersion string
+
 	// updateMu serializes ALL container recreate operations (UpdateContainer /
 	// standaloneRecreate, via /update, /update all, the update-check button,
 	// and /stack pull). Without this, two overlapping update runs can race
@@ -100,23 +107,24 @@ type Server struct {
 	containerHealth map[string]*containerHealthState
 }
 
-func NewServer(cfg *config.Config, image, selfName, restartNote string) *Server {
+func NewServer(cfg *config.Config, image, selfName, restartNote, selfUpdateFromVersion string) *Server {
 	hist, _ := history.Load(cfg.HistoryFile())
 	sched := scheduler.New()
 
 	s := &Server{
-		cfg:             cfg,
-		engine:          backup.NewEngine(cfg.BackupDir()),
-		hist:            hist,
-		sched:           sched,
-		mux:             http.NewServeMux(),
-		image:           image,
-		selfName:        selfName,
-		sseClients:      make(map[chan backup.JobUpdate]struct{}),
-		updateAlertSent: make(map[string]bool),
-		dismissBatches:  make(map[string][]string),
-		restartNote:     restartNote,
-		containerHealth: make(map[string]*containerHealthState),
+		cfg:                   cfg,
+		engine:                backup.NewEngine(cfg.BackupDir()),
+		hist:                  hist,
+		sched:                 sched,
+		mux:                   http.NewServeMux(),
+		image:                 image,
+		selfName:              selfName,
+		sseClients:            make(map[chan backup.JobUpdate]struct{}),
+		updateAlertSent:       make(map[string]bool),
+		dismissBatches:        make(map[string][]string),
+		restartNote:           restartNote,
+		selfUpdateFromVersion: selfUpdateFromVersion,
+		containerHealth:       make(map[string]*containerHealthState),
 	}
 	s.routes()
 	s.loadSchedules()
@@ -4028,7 +4036,7 @@ func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 		if err := s.cfg.SnapshotBeforeRiskyOp("before-selfupdate"); err != nil {
 			log.Printf("[self-update] config snapshot failed (continuing anyway): %v", err)
 		}
-		if err := backup.SelfUpdate(s.image, s.selfName, s.engine.AnyRunning, s.engine.EmitUpdate); err != nil {
+		if err := backup.SelfUpdate(s.cfg.DataDir, s.image, s.selfName, s.engine.AnyRunning, s.engine.EmitUpdate); err != nil {
 			log.Printf("self-update error: %v", err)
 			s.engine.EmitUpdate(backup.UpdateResult{Stage: "error", Message: "Update failed", Error: err.Error()})
 		}
@@ -4273,12 +4281,25 @@ func (s *Server) runTelegramBot() {
 		time.Sleep(3 * time.Second) // wait for initial config to load
 		nc := s.cfg.GetNotify()
 		if nc.TelegramEnabled && nc.TelegramToken != "" && nc.TelegramChatID != "" {
-			msg := fmt.Sprintf("🟢 *PrestoBack online* — v%s\nType /help for available commands\\.", notify.EscapeMD(config.Version))
-			if s.restartNote != "" {
-				// Plain-text note escaped as a whole rather than hand-built with
-				// inline code spans — simpler than juggling MarkdownV2's nested
-				// escaping rules for a one-off informational line.
-				msg += "\n\n↺ " + notify.EscapeMD(s.restartNote)
+			var msg string
+			if s.selfUpdateFromVersion != "" {
+				// A self-update just happened — show what actually changed
+				// rather than the bare "online" line, matching the
+				// "updated vX → vY + brief notes + link" shape a dedicated
+				// watchdog like Docksentry already does for its own
+				// updates. Falls back to the plain online message inside
+				// buildSelfUpdateAnnouncementMessage if the changelog fetch
+				// itself fails — a working PrestoBack that can't currently
+				// reach GitHub still deserves to say it's back.
+				msg = s.buildSelfUpdateAnnouncementMessage(s.selfUpdateFromVersion)
+			} else {
+				msg = fmt.Sprintf("🟢 *PrestoBack online* — v%s\nType /help for available commands\\.", notify.EscapeMD(config.Version))
+				if s.restartNote != "" {
+					// Plain-text note escaped as a whole rather than hand-built with
+					// inline code spans — simpler than juggling MarkdownV2's nested
+					// escaping rules for a one-off informational line.
+					msg += "\n\n↺ " + notify.EscapeMD(s.restartNote)
+				}
 			}
 			_ = notify.SendRaw(
 				notify.TelegramConfig{Token: nc.TelegramToken, ChatID: nc.TelegramChatID},
@@ -5224,7 +5245,7 @@ func (s *Server) handleTelegramCallback(nc config.NotifyConfig, cb *notify.Teleg
 				if err := s.cfg.SnapshotBeforeRiskyOp("before-selfupdate"); err != nil {
 					log.Printf("[self-update] config snapshot failed (continuing anyway): %v", err)
 				}
-				if err := backup.SelfUpdate(s.image, s.selfName, s.engine.AnyRunning, s.engine.EmitUpdate); err != nil {
+				if err := backup.SelfUpdate(s.cfg.DataDir, s.image, s.selfName, s.engine.AnyRunning, s.engine.EmitUpdate); err != nil {
 					log.Printf("[bot] selfupdate apply: %v", err)
 					_ = notify.SendRaw(tgCfg, fmt.Sprintf("❌ Self\\-update failed: `%s`", notify.EscapeMD(err.Error())))
 					return
